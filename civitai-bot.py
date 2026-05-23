@@ -32,8 +32,8 @@ from typing import Any
 
 import requests
 import yaml
-from telegram import BotCommand, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -295,20 +295,112 @@ async def cmd_add(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_remove(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _check_auth(update):
         return
-    args = update.message.text.strip().split(maxsplit=1)
-    if len(args) < 2:
-        await update.message.reply_text("Usage: `/remove <username>`", parse_mode="Markdown")
-        return
-    username = args[1].strip()
+    await _show_remove_list(update.message, page=0)
+
+
+async def _show_remove_list(message, page: int = 0) -> None:
+    """Display paginated user list with remove buttons."""
     cfg = read_config()
     users = get_users(cfg)
-    if username not in users:
-        await update.message.reply_text(f"👤 @{username} is not in the watch list.")
+    if not users:
+        await message.reply_text("📭 监控列表是空的，先 `/add` 加几个吧", parse_mode="Markdown")
         return
-    users.remove(username)
-    cfg = set_users(cfg, users)
-    write_config(cfg)
-    await update.message.reply_text(f"✅ Removed @{username} from the watch list.")
+
+    per_page = 8
+    total_pages = (len(users) + per_page - 1) // per_page
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    end = start + per_page
+    page_users = users[start:end]
+
+    keyboard = []
+    for u in page_users:
+        keyboard.append([InlineKeyboardButton(f"❌ @{u}", callback_data=f"rem:{u}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ 上一页", callback_data=f"rem_pg:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("下一页 ▶", callback_data=f"rem_pg:{page + 1}"))
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton("🔒 关闭", callback_data="rem_cl")])
+
+    total_text = f"👥 共 {len(users)} 个监控对象" if total_pages <= 1 else f"👥 共 {len(users)} 个（第 {page + 1}/{total_pages} 页）"
+    await message.reply_text(
+        f"{total_text}\n点击按钮取消关注：",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def cmd_remove_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle remove button presses."""
+    if not await _check_auth(update):
+        return
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    # Close
+    if data == "rem_cl":
+        await query.edit_text("🔒 已关闭")
+        return
+
+    # Pagination
+    if data.startswith("rem_pg:"):
+        page = int(data.split(":", 1)[1])
+        cfg = read_config()
+        users = get_users(cfg)
+        await _render_remove_page(query, users, page)
+        return
+
+    # Remove user
+    if data.startswith("rem:"):
+        username = data.split(":", 1)[1]
+        cfg = read_config()
+        users = get_users(cfg)
+        if username not in users:
+            await query.edit_text(f"👤 @{username} 已不在监控列表中")
+            return
+        users.remove(username)
+        cfg = set_users(cfg, users)
+        write_config(cfg)
+
+        if users:
+            await query.edit_text(f"✅ 已取消关注 @{username}")
+            # Send updated list
+            await _show_remove_list(query.message, page=0)
+        else:
+            await query.edit_text(f"✅ 已取消关注 @{username}\n📭 监控列表已清空")
+
+
+async def _render_remove_page(query, users: list[str], page: int) -> None:
+    """Update the message with a fresh page of remove buttons."""
+    per_page = 8
+    total_pages = (len(users) + per_page - 1) // per_page
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    end = start + per_page
+    page_users = users[start:end]
+
+    keyboard = []
+    for u in page_users:
+        keyboard.append([InlineKeyboardButton(f"❌ @{u}", callback_data=f"rem:{u}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ 上一页", callback_data=f"rem_pg:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("下一页 ▶", callback_data=f"rem_pg:{page + 1}"))
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton("🔒 关闭", callback_data="rem_cl")])
+
+    total_text = f"👥 共 {len(users)} 个监控对象" if total_pages <= 1 else f"👥 共 {len(users)} 个（第 {page + 1}/{total_pages} 页）"
+    await query.edit_message_text(
+        f"{total_text}\n点击按钮取消关注：",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 async def cmd_list(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -665,6 +757,9 @@ def main() -> None:
     app.add_handler(CommandHandler("cleanup", cmd_cleanup))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("backfill", cmd_backfill))
+
+    # Remove button callbacks
+    app.add_handler(CallbackQueryHandler(cmd_remove_callback, pattern="^rem:"))
 
     log.info("Civitai Admin Bot starting...")
     app.run_polling(allowed_updates=["message"])
