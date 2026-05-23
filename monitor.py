@@ -212,9 +212,15 @@ def fetch_page(
     }
     if nsfw is not None:
         params["nsfw"] = "true" if nsfw else "false"
+    # NSFW content requires civitai.red + browsingLevel + cookies
+    if nsfw is True:
+        params["browsingLevel"] = 8
+        actual_base = "https://civitai.red/api/v1"
+    else:
+        actual_base = base_url
 
     try:
-        resp = safe_get(f"{base_url}/images", params=params)
+        resp = safe_get(f"{actual_base}/images", params=params)
         resp.raise_for_status()
         return resp.json().get("items", [])
     except requests.RequestException as e:

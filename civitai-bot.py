@@ -19,6 +19,7 @@ Run as a systemd service for 24/7 availability.
 
 from __future__ import annotations
 
+import http.cookiejar
 import json
 import logging
 import os
@@ -161,36 +162,51 @@ def parse_username_input(raw: str) -> str | None:
 def validate_username_exists(username: str) -> tuple[bool, str]:
     """Check if a Civitai username exists and has public content.
 
-    Makes two requests (SFW + NSFW) to handle both content types.
+    Since NSFW content moved to civitai.red, we query both domains
+    with cookies + browsingLevel to detect all content types.
     Returns (ok, message).
     """
+    # Try to load cookies for NSFW API access
+    s = requests.Session()
+    s.headers.update({"User-Agent": "CivitaiMonitor/2.0"})
+    cookies_path = SCRIPT_DIR / "civitai_cookies.txt"
+    if cookies_path.exists():
+        try:
+            cj = http.cookiejar.MozillaCookieJar(str(cookies_path))
+            cj.load(ignore_expires=True, ignore_discard=True)
+            s.cookies.update(cj)
+        except Exception:
+            pass
+
     has_sfw = False
     has_nsfw = False
     errors = []
+    apis = [("civitai.com", "https://civitai.com/api/v1/images"),
+            ("civitai.red", "https://civitai.red/api/v1/images")]
 
-    for nsfw_flag, label in [(False, "SFW"), (True, "NSFW")]:
-        try:
-            resp = requests.get(
-                f"{CIVITAI_API}/images",
-                params={"username": username, "limit": 5, "sort": "Newest",
-                        "nsfw": "true" if nsfw_flag else "false"},
-                headers={"User-Agent": "CivitaiMonitor/2.0"},
-                timeout=10,
-            )
-            if resp.status_code == 404:
-                return False, f"❌ 用户 @{username} 不存在（Civitai 返回 404）"
-            if resp.status_code == 403:
-                return False, f"❌ 无法验证 @{username}（被 API 拒绝，可能已封禁或限制访问）"
-            resp.raise_for_status()
-            data = resp.json()
-            items = data.get("items", [])
-            if items:
+    for api_name, api_url in apis:
+        for nsfw_flag, label in [(False, "SFW"), (True, "NSFW")]:
+            if not nsfw_flag and api_name != "civitai.com":
+                continue  # SFW only needed from civitai.com
+            try:
+                params: dict = {"username": username, "limit": 5, "sort": "Newest"}
                 if nsfw_flag:
-                    has_nsfw = True
-                else:
-                    has_sfw = True
-        except requests.RequestException as e:
-            errors.append(f"{label}: {e}")
+                    params["nsfw"] = "true"
+                    params["browsingLevel"] = 8
+                resp = s.get(api_url, params=params, timeout=10)
+                if resp.status_code == 404:
+                    return False, f"❌ 用户 @{username} 不存在（Civitai 返回 404）"
+                if resp.status_code == 403:
+                    return False, f"❌ 无法验证 @{username}（被 API 拒绝，可能已封禁或限制访问）"
+                resp.raise_for_status()
+                items = resp.json().get("items", [])
+                if items:
+                    if nsfw_flag:
+                        has_nsfw = True
+                    else:
+                        has_sfw = True
+            except requests.RequestException as e:
+                errors.append(f"{api_name}/{label}: {e}")
 
     if errors:
         return False, f"❌ 验证用户时出错: {'; '.join(errors)}"
