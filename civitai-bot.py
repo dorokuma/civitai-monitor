@@ -148,29 +148,39 @@ def parse_username_input(raw: str) -> str | None:
 def validate_username_exists(username: str) -> tuple[bool, str]:
     """Check if a Civitai username exists by calling the public API.
 
+    Makes TWO requests (SFW + NSFW) to get the full work count.
     Returns (ok, message).
     """
-    try:
-        resp = requests.get(
-            f"{CIVITAI_API}/images",
-            params={"username": username, "limit": 1, "sort": "Newest"},
-            headers={"User-Agent": "CivitaiMonitor/2.0"},
-            timeout=10,
-        )
-        if resp.status_code == 404:
-            return False, f"❌ 用户 @{username} 不存在（Civitai 返回 404）"
-        if resp.status_code == 403:
-            return False, f"❌ 无法验证 @{username}（被 API 拒绝，可能已封禁或限制访问）"
-        resp.raise_for_status()
-        data = resp.json()
-        items = data.get("items", [])
-        metadata = data.get("metadata", {})
-        total = metadata.get("totalItems", len(items))
-        if total == 0:
-            return False, f"❌ 用户 @{username} 存在但没有任何公开作品，无法监控"
-        return True, f"✅ 用户 @{username} 存在，共 {total} 个作品"
-    except requests.RequestException as e:
-        return False, f"❌ 验证用户时网络错误: {e}"
+    total_works = 0
+    errors = []
+
+    for nsfw_flag, label in [(False, "SFW"), (True, "NSFW")]:
+        try:
+            resp = requests.get(
+                f"{CIVITAI_API}/images",
+                params={"username": username, "limit": 1, "sort": "Newest",
+                        "nsfw": "true" if nsfw_flag else "false"},
+                headers={"User-Agent": "CivitaiMonitor/2.0"},
+                timeout=10,
+            )
+            if resp.status_code == 404:
+                return False, f"❌ 用户 @{username} 不存在（Civitai 返回 404）"
+            if resp.status_code == 403:
+                return False, f"❌ 无法验证 @{username}（被 API 拒绝，可能已封禁或限制访问）"
+            resp.raise_for_status()
+            data = resp.json()
+            metadata = data.get("metadata", {})
+            total_works += metadata.get("totalItems", len(data.get("items", [])))
+        except requests.RequestException as e:
+            errors.append(f"{label}: {e}")
+
+    if errors:
+        return False, f"❌ 验证用户时出错: {'; '.join(errors)}"
+
+    if total_works == 0:
+        return False, f"❌ 用户 @{username} 存在但没有任何公开作品，无法监控"
+
+    return True, f"✅ 用户 @{username} 存在，共 {total_works} 个作品（SFW + NSFW）"
 
 
 # ---------------------------------------------------------------------------
