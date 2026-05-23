@@ -38,7 +38,9 @@ nsfw: "both"
 video_enabled: true
 
 # Maximum video file size in MB. Videos exceeding this are skipped.
-max_video_size_mb: 500
+# Note: Telegram Bot API caps video uploads at ~50 MB; larger videos
+# will be sent as text-only links instead.
+max_video_size_mb: 1024
 
 # ---------------------------------------------------------------------------
 # Civitai API settings

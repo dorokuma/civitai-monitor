@@ -95,7 +95,7 @@ class MonitorConfig(BaseModel):
     data: DataConfig = Field(default_factory=DataConfig)
     http: HttpConfig = Field(default_factory=HttpConfig)
     video_enabled: bool = True
-    max_video_size_mb: int = 500
+    max_video_size_mb: int = 1024
 
 
 # ---------------------------------------------------------------------------
@@ -340,13 +340,7 @@ def send_to_telegram(
 
 
 def _send_telegram_video(api_base: str, chat_id: str, text: str, video_path: Path) -> bool:
-    """Send a video to Telegram. Falls back to text if video exceeds 50 MB limit."""
-    MAX_TG_VIDEO = 50 * 1024 * 1024
-    size = video_path.stat().st_size
-    if size > MAX_TG_VIDEO:
-        log.warning("Video %.1f MB exceeds Telegram 50 MB limit — sending text only",
-                     size / 1024 / 1024)
-        return _send_telegram_text(api_base, chat_id, text)
+    """Send a video to Telegram. Falls back to text on error (Telegram caps at 50 MB)."""
 
     try:
         with open(video_path, "rb") as f:
