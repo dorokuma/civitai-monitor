@@ -188,6 +188,8 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     mode = cfg.get("mode", "incremental")
     nsfw = cfg.get("nsfw", "both")
     keep_days = cfg.get("download", {}).get("keep_days", 7)
+    video = cfg.get("video_enabled", True)
+    max_video = cfg.get("max_video_size_mb", 1024)
 
     # Stats
     seen_count = 0
@@ -213,10 +215,11 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         mtime = mt.strftime("%Y-%m-%d %H:%M UTC")
 
     lines = [
-        f"👥 *Users:* {len(users)} — {' '.join('@' + u for u in users) if users else 'none'}",
-        f"⚙️  *Mode:* {mode} · *NSFW:* {nsfw} · *Keep:* {keep_days}d",
-        f"💾 *Cache:* {download_count} images ({size_str})",
-        f"📋 *Seen IDs:* {seen_count} (last update: {mtime})",
+        f"👥 *监控用户:* {len(users)} 个 — {' '.join('@' + u for u in users) if users else '无'}",
+        f"⚙️  *模式:* {mode} · *NSFW:* {nsfw} · *图片保留:* {keep_days}天",
+        f"🎥 *视频:* {'开启' if video else '关闭'} · 上限 {max_video}MB",
+        f"💾 *缓存:* {download_count} 张图片 ({size_str})",
+        f"📋 *已处理:* {seen_count} 个ID (最近更新: {mtime})",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
