@@ -2,10 +2,9 @@
 """
 Civitai User Gallery Monitor
 
-Monitors specified Civitai users for new image uploads.
-Supports two notification modes:
-  - Hermes mode (default): outputs JSON to stdout for Hermes cronjob agent
-  - Direct mode: sends to Telegram directly if bot credentials configured
+Monitors specified Civitai users on Civitai for new image uploads.
+Downloads full-resolution originals and pushes them to a Telegram
+channel via the Bot API.
 
 Usage:
   python3 monitor.py                          # uses config.yaml
@@ -187,7 +186,7 @@ def download_image(url: str, save_path: Path, timeout: int = 60) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Telegram direct push (Direct mode only)
+# Telegram push
 # ---------------------------------------------------------------------------
 
 
@@ -355,6 +354,15 @@ def main() -> None:
     # -- State --
     seen_ids = load_seen_ids(seen_file)
 
+    # -- Telegram credentials --
+    telegram_cfg = cfg.get("telegram", {})
+    bot_token: str = telegram_cfg.get("bot_token", "") or ""
+    chat_id: str = telegram_cfg.get("chat_id", "") or ""
+
+    if not bot_token or not chat_id:
+        log.error("telegram.bot_token and telegram.chat_id are required in config.yaml")
+        sys.exit(1)
+
     # -- Process each user --
     all_results: list[dict[str, Any]] = []
     all_new_ids: set[int] = set()
@@ -374,47 +382,26 @@ def main() -> None:
     if all_new_ids:
         save_seen_ids(seen_file, all_new_ids)
 
-    # -- Output / Notify --
-    notifier_cfg = cfg.get("notifier", {})
-    mode = notifier_cfg.get("mode", "hermes")
+    # -- Push to Telegram --
+    if not all_results:
+        log.info("No new images — nothing to push")
+        return
 
-    if mode == "direct":
-        # Direct Telegram push mode
-        bot_token = notifier_cfg.get("telegram_bot_token", "")
-        chat_id = notifier_cfg.get("telegram_chat_id", "")
+    for result in all_results:
+        lines = [
+            f"🖼 *New artwork by @{result['username']}*",
+            f"🔗 [View on Civitai]({result['civitai_url']})",
+            f"🕐 {result.get('created_at', 'unknown')}",
+        ]
+        text = "\n".join(lines)
 
-        if not bot_token or not chat_id:
-            log.error("Direct mode requires telegram_bot_token and telegram_chat_id")
-            print(json.dumps({"error": "Direct mode missing credentials"}))
-            sys.exit(1)
+        file_paths: list[Path] = []
+        if "image_path" in result:
+            file_paths.append(Path(result["image_path"]))
 
-        if not all_results:
-            log.info("No new images — nothing to push")
-            return
+        send_to_telegram(bot_token, chat_id, text, file_paths)
 
-        # Group results by user for cleaner messages
-        for result in all_results:
-            lines = [
-                f"🖼 *New artwork by @{result['username']}*",
-                f"🔗 [View on Civitai]({result['civitai_url']})",
-                f"🕐 {result.get('created_at', 'unknown')}",
-            ]
-            text = "\n".join(lines)
-
-            file_paths = []
-            if "image_path" in result:
-                file_paths.append(Path(result["image_path"]))
-
-            send_to_telegram(bot_token, chat_id, text, file_paths)
-
-        log.info("Pushed %d new images to Telegram", len(all_results))
-
-    else:
-        # Hermes mode (default) — output JSON to stdout
-        if not all_results:
-            return  # silent exit — nothing new
-
-        print(json.dumps(all_results, ensure_ascii=False, indent=2))
+    log.info("Pushed %d new images to Telegram", len(all_results))
 
 
 if __name__ == "__main__":

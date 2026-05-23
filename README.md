@@ -4,14 +4,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 Monitor specified Civitai users for new image uploads — automatically download
-full-resolution originals and push them to Telegram.
-
-Two operation modes:
-
-| Mode | How it works | Best for |
-|------|-------------|----------|
-| **Hermes** (default) | Script outputs JSON to stdout; a Hermes Agent cronjob reads it and delivers via `send_message` | Users who run [Hermes Agent](https://hermes-agent.nousresearch.com) |
-| **Direct** | Script calls Telegram Bot API directly | Standalone usage without Hermes |
+full-resolution originals and push them to a Telegram channel via the Bot API.
 
 ---
 
@@ -20,8 +13,7 @@ Two operation modes:
 - 🔍 Polls Civitai public API (no API key required)
 - 👥 Multi-user monitoring — watch any number of creators
 - 🖼 Auto-downloads **full-resolution originals** (replaces `width=*` with `width=original`)
-- 📦 **Hermes mode**: JSON output for LLM-driven cronjob agents
-- 🤖 **Direct mode**: built-in Telegram Bot push
+- 🤖 Pushes directly to Telegram via Bot API
 - 💾 Deduplication via `seen_ids.json` — never re-processes known images
 - 🛡 Graceful error handling with retries and back-off
 
@@ -41,7 +33,7 @@ pip install -r requirements.txt
 
 ```bash
 cp config.yaml.example config.yaml
-# Edit config.yaml — fill in at least the username(s)
+# Edit config.yaml — fill in the username, bot token, and chat ID
 ```
 
 Minimal `config.yaml`:
@@ -50,8 +42,9 @@ Minimal `config.yaml`:
 users:
   - name: "UserOne"
 
-notifier:
-  mode: "hermes"  # or "direct"
+telegram:
+  bot_token: "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+  chat_id: "-1001234567890"
 ```
 
 ### 3. Run
@@ -75,27 +68,21 @@ descriptive comments.  Key sections:
 | `users` | List of Civitai usernames to monitor |
 | `api` | API base URL, page size |
 | `download` | Output directory, URL size-suffix replacements |
-| `notifier` | Mode selection + Telegram credentials (direct mode) |
+| `telegram` | **Required** — bot token and chat/channel ID |
 | `data` | Paths for `seen_ids.json` and runtime data |
 
 ---
 
-## Hermes Cronjob Integration
+## Automating with Cron
 
-If you use [Hermes Agent](https://hermes-agent.nousresearch.com/docs), set up
-a cronjob that runs every N minutes:
+Run the script on a schedule to get automatic push notifications:
 
 ```bash
-# Create a cronjob with script mode
-hermes cron create \
-  --name "civitai-monitor" \
-  --schedule "*/10 * * * *" \
-  --script "~/civitai-monitor/monitor.py" \
-  --deliver "telegram:-1001234567890"
+# Every 10 minutes
+*/10 * * * * cd ~/civitai-monitor && python3 monitor.py >> monitor.log 2>&1
 ```
 
-The agent reads the script's JSON output and pushes new images as native
-Telegram photos with captions.
+Or use systemd timer — whatever fits your setup.
 
 ---
 
