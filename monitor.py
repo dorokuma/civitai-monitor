@@ -95,7 +95,7 @@ class MonitorConfig(BaseModel):
     data: DataConfig = Field(default_factory=DataConfig)
     http: HttpConfig = Field(default_factory=HttpConfig)
     video_enabled: bool = True
-    max_video_size_mb: int = 1024
+    max_video_size_mb: int = 500
 
 
 # ---------------------------------------------------------------------------
@@ -340,8 +340,6 @@ def send_to_telegram(
 
 
 def _send_telegram_video(api_base: str, chat_id: str, text: str, video_path: Path) -> bool:
-    """Send a video to Telegram. Falls back to text on error (Telegram caps at 50 MB)."""
-
     try:
         with open(video_path, "rb") as f:
             resp = requests.post(
@@ -428,7 +426,6 @@ def process_and_push(
         video_enabled
         and (
             item.get("type") == "video"
-            or str(item.get("url", "")).lower().endswith((".mp4", ".webm", ".mov"))
             or "video" in str(item.get("url", "")).lower()
         )
     )
@@ -458,10 +455,10 @@ def process_and_push(
     success = download_image(orig_url, filepath)
 
     text = (
-        f"🖼 *New artwork by @{username}*\n"
-        f"🔗 [View on Civitai]({civitai_url})\n"
-        f"🕐 {created_at}"
-    )
+            f"🖼 *New artwork by @{username}*\n"
+            f"🔗 [View on Civitai]({civitai_url})\n"
+            f"🕐 {created_at}"
+        )
     send_to_telegram(bot_token, chat_id, text, [filepath] if success else None)
     return success
 
@@ -530,7 +527,6 @@ def run_full(
     username: str,
     *,
     seen_ids: set[int],
-    seen_file: Path,
     nsfw_setting: str,
     output_dir: Path,
     size_suffixes: list[str],
@@ -540,6 +536,7 @@ def run_full(
     limit: int,
     video_enabled: bool,
     max_video_size_mb: int,
+    seen_file: Path,
 ) -> set[int]:
     """Walk every page of the user's gallery for the requested tracks.
 
@@ -665,7 +662,6 @@ def main() -> None:
             user_seen = run_full(
                 username,
                 seen_ids=seen_ids,
-                seen_file=seen_file,
                 nsfw_setting=cfg.nsfw,
                 output_dir=output_dir,
                 size_suffixes=cfg.download.size_suffixes,
@@ -675,6 +671,7 @@ def main() -> None:
                 limit=cfg.api.images_per_page,
                 video_enabled=cfg.video_enabled,
                 max_video_size_mb=cfg.max_video_size_mb,
+                seen_file=seen_file,
             )
         else:
             user_seen = run_incremental(
@@ -683,12 +680,12 @@ def main() -> None:
                 nsfw_setting=cfg.nsfw,
                 output_dir=output_dir,
                 size_suffixes=cfg.download.size_suffixes,
-                bot_token=cfg.telegram.bot_token,
-                chat_id=cfg.telegram.chat_id,
-                base_url=cfg.api.base_url,
-                limit=cfg.api.images_per_page,
-                video_enabled=cfg.video_enabled,
-                max_video_size_mb=cfg.max_video_size_mb,
+                bot_token=bot_token,
+                chat_id=chat_id,
+                base_url=base_url,
+                limit=limit,
+                video_enabled=video_enabled,
+                max_video_size_mb=max_video_size_mb,
             )
 
         consolidated_seen.update(user_seen)

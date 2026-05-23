@@ -19,9 +19,12 @@ Run as a systemd service for 24/7 availability.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -284,6 +287,15 @@ async def cmd_cleanup(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f.unlink()
             removed += 1
 
+    # Also clean videos subdirectory
+    video_dir = DOWNLOAD_DIR / "videos"
+    if video_dir.exists():
+        for f in video_dir.iterdir():
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                size_freed += f.stat().st_size
+                f.unlink()
+                removed += 1
+
     if removed:
         await update.message.reply_text(
             f"🧹 Cleaned {removed} cached images older than {days} days "
@@ -335,6 +347,7 @@ async def cmd_backfill(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Temporarily set mode to full, run, then restore
     cfg = read_config()
     orig_mode = cfg.get("mode", "incremental")
+    orig_users = cfg.get("users", [])
     cfg["mode"] = "full"
     cfg["users"] = [{"name": username}]
     write_config(cfg)
@@ -351,10 +364,9 @@ async def cmd_backfill(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             capture_output=True, text=True, timeout=7200, cwd=str(SCRIPT_DIR),
         )
         # Restore original config
-        cfg["mode"] = orig_mode
-        # Re-read to get current user list (in case it was modified during backfill)
         current_cfg = read_config()
         current_cfg["mode"] = orig_mode
+        current_cfg["users"] = orig_users
         write_config(current_cfg)
 
         if result.returncode != 0:
@@ -369,12 +381,16 @@ async def cmd_backfill(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="Markdown",
         )
     except subprocess.TimeoutExpired:
-        cfg["mode"] = orig_mode
-        write_config(cfg)
+        current_cfg = read_config()
+        current_cfg["mode"] = orig_mode
+        current_cfg["users"] = orig_users
+        write_config(current_cfg)
         await update.message.reply_text("⏱ Backfill timed out after 2 hours. Config restored.")
     except Exception as e:
-        cfg["mode"] = orig_mode
-        write_config(cfg)
+        current_cfg = read_config()
+        current_cfg["mode"] = orig_mode
+        current_cfg["users"] = orig_users
+        write_config(current_cfg)
         await update.message.reply_text(f"❌ Error: {e}. Config restored.")
 
 
