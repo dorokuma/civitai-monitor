@@ -13,6 +13,8 @@
 - 👥 多用户监控 — 可同时监控任意数量的创作者
 - 🖼 自动下载**最高分辨率原图**（自动将 `width=*` 替换为 `width=original`）
 - 🤖 通过 Telegram Bot API 直接推送
+- 🔀 **两种运行模式**：增量模式（适合定时任务）和全量回填模式
+- 🚦 **NSFW 过滤**：仅 SFW、仅 NSFW、或全部拉取
 - 💾 去重机制（`seen_ids.json`）— 不会重复处理已见过的图片
 - 🛡 优雅的错误处理，自动重试 + 指数退避
 
@@ -46,13 +48,27 @@ telegram:
   chat_id: "-1001234567890"
 ```
 
-### 3. 运行
+### 3. 增量模式运行（默认）
 
 ```bash
 python3 monitor.py
 ```
 
-首次运行会将所有抓取到的图片视为新作品。后续运行只会增量拉取上次轮询之后的新图片。
+只检查最新图片，后续运行只增量拉取新作品。
+
+### 4. 全量回填（首次拉取全部历史）
+
+```yaml
+# 在 config.yaml 中设置：
+mode: "full"
+nsfw: "both"
+```
+
+```bash
+python3 monitor.py
+```
+
+遍历用户所有历史页面。一次性拉齐全量后，切换回 `incremental` 模式用于定时任务。
 
 ---
 
@@ -63,6 +79,8 @@ python3 monitor.py
 | 配置段 | 用途 |
 |--------|------|
 | `users` | 要监控的 Civitai 用户名列表 |
+| `mode` | `incremental`（增量，默认）或 `full`（全量回填） |
+| `nsfw` | `sfw_only`（仅非敏感）、`nsfw_only`（仅敏感）、`both`（全部，默认） |
 | `api` | API 地址、每页数量 |
 | `download` | 下载目录、URL 尺寸后缀替换规则 |
 | `telegram` | **必填** — Bot Token 和频道/群组 Chat ID |
@@ -70,16 +88,32 @@ python3 monitor.py
 
 ---
 
+## 模式对比
+
+| 特性 | `incremental` 增量模式 | `full` 全量模式 |
+|------|----------------------|-----------------|
+| 用途 | 定时 cron 任务 | 首次回填历史数据 |
+| 检查页数 | 仅最新页 | 遍历所有分页 |
+| 每次 API 调用 | 1–2 次（取决于 nsfw 设置） | 大量（直到遍历完毕） |
+| 耗时 | 数秒 | 数分钟到数小时 |
+| 适合定时任务 | ✅ 是 | ❌ 否，一次性使用 |
+
+---
+
+## NSFW 说明
+
+Civitai 公开 API **默认不返回 NSFW 图片**，必须显式传入 `nsfw=true` 参数。
+当设置 `nsfw: "both"`（默认值）时，脚本每次会发起**两次 API 调用**：一次拉 SFW、一次拉 NSFW。
+NSFW 图片可直接从 CDN 下载，无需登录认证。
+
+---
+
 ## 定时自动化
 
-使用 cron 定时执行脚本，即可实现自动推送通知：
-
 ```bash
-# 每 10 分钟执行一次
+# 每 10 分钟执行一次（config.yaml 中需设置 mode: "incremental"）
 */10 * * * * cd ~/civitai-monitor && python3 monitor.py >> monitor.log 2>&1
 ```
-
-也可以使用 systemd timer 或其他定时工具。
 
 ---
 
@@ -87,16 +121,13 @@ python3 monitor.py
 
 ```
 civitai-monitor/
-├── monitor.py              # 主脚本
+├── monitor.py              # 主脚本（支持增量 + 全量回填）
 ├── config.yaml.example     # 配置模板（全部占位符）
 ├── requirements.txt        # Python 依赖
 ├── LICENSE                 # MIT 许可证
 ├── README.md               # 英文说明
 ├── README.zh-CN.md         # 中文说明
-├── .gitignore
-├── config.yaml             # ⚠ 从模板生成 — 切勿提交
-├── seen_ids.json           # 自动生成 — 已处理的图片 ID
-└── downloads/              # 自动生成 — 缓存的原图文件
+└── .gitignore
 ```
 
 ---

@@ -18,14 +18,33 @@ users:
   # - name: "YOUR_TARGET_USERNAME_2"
 
 # ---------------------------------------------------------------------------
+# Operation mode
+# ---------------------------------------------------------------------------
+#   incremental (default): check only the latest page(s) — ideal for cron
+#   full: walk every page of the user's gallery — use for initial backfill
+mode: "incremental"
+
+# ---------------------------------------------------------------------------
+# NSFW filtering
+# ---------------------------------------------------------------------------
+#   sfw_only:  only safe-for-work images
+#   nsfw_only: only NSFW images
+#   both:      pull both SFW and NSFW (recommended — note: API returns SFW
+#              by default when no nsfw param is given, so "both" makes two
+#              separate API calls per poll)
+nsfw: "both"
+
+# ---------------------------------------------------------------------------
 # Civitai API settings
 # ---------------------------------------------------------------------------
 api:
   # Base URL for the Civitai REST API (public, no key required).
   base_url: "https://civitai.com/api/v1"
 
-  # Images to fetch per poll.  Max recommended: 100.
-  images_per_page: 20
+  # Images to fetch per page.  Max recommended: 100.
+  # For incremental mode: lower = faster polls (e.g. 20).
+  # For full mode:        higher = fewer pages (e.g. 100).
+  images_per_page: 100
 
 # ---------------------------------------------------------------------------
 # Download settings
