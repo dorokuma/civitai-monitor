@@ -765,7 +765,7 @@ def main() -> None:
     app.add_handler(CommandHandler("backfill", cmd_backfill))
 
     # Remove button callbacks
-    app.add_handler(CallbackQueryHandler(cmd_remove_callback, pattern="^rem:"))
+    app.add_handler(CallbackQueryHandler(cmd_remove_callback, pattern="^rem"))
 
     log.info("Civitai Admin Bot starting...")
     app.run_polling(allowed_updates=["message"])
