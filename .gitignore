@@ -1,0 +1,17 @@
+# Dependencies
+__pycache__/
+*.pyc
+.env
+venv/
+.venv/
+
+# Config (copy from config.yaml.example — never commit credentials)
+config.yaml
+
+# Runtime data (auto-generated)
+seen_ids.json
+downloads/
+
+# OS junk
+.DS_Store
+Thumbs.db
