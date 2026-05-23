@@ -309,11 +309,21 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
         resp.raise_for_status()
         b2_url = str(resp.url)
 
-        # Step 2: rewrite /default → /original
+        # Step 2: rewrite /default → /original with retry on 5xx/transient errors
         if "image-b2.civitai.com" in b2_url and b2_url.endswith("/default"):
             orig_url = b2_url[:-8] + "/original"
             log.info("B2: /default → /original")
-            resp = safe_get(orig_url, stream=True, timeout=120)
+            # Retry up to 3 times on transient errors, but not on 404
+            for attempt in range(3):
+                resp = safe_get(orig_url, stream=True, timeout=120)
+                if resp.status_code == 200:
+                    break
+                if resp.status_code == 404:
+                    log.warning("B2 /original 404 — video file not available on CDN")
+                    return False
+                if attempt < 2:
+                    log.info("B2 /original returned %d, retrying (%d/3)...", resp.status_code, attempt + 2)
+                    time.sleep(2 ** attempt)
             resp.raise_for_status()
         else:
             resp.raise_for_status()
