@@ -19,12 +19,9 @@ Run as a systemd service for 24/7 availability.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
-import shutil
-import signal
 import subprocess
 import sys
 import time

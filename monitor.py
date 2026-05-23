@@ -340,6 +340,14 @@ def send_to_telegram(
 
 
 def _send_telegram_video(api_base: str, chat_id: str, text: str, video_path: Path) -> bool:
+    """Send a video to Telegram. Falls back to text if video exceeds 50 MB limit."""
+    MAX_TG_VIDEO = 50 * 1024 * 1024
+    size = video_path.stat().st_size
+    if size > MAX_TG_VIDEO:
+        log.warning("Video %.1f MB exceeds Telegram 50 MB limit — sending text only",
+                     size / 1024 / 1024)
+        return _send_telegram_text(api_base, chat_id, text)
+
     try:
         with open(video_path, "rb") as f:
             resp = requests.post(
@@ -426,6 +434,7 @@ def process_and_push(
         video_enabled
         and (
             item.get("type") == "video"
+            or str(item.get("url", "")).lower().endswith((".mp4", ".webm", ".mov"))
             or "video" in str(item.get("url", "")).lower()
         )
     )
