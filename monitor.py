@@ -60,6 +60,7 @@ class HttpConfig(BaseModel):
     )
     referer: str = Field(default="https://civitai.com")
     extra_headers: dict[str, str] = Field(default_factory=dict)
+    cookies_file: str = Field(default="", description="Path to Netscape-format cookies.txt for Civitai auth")
 
 
 class DownloadConfig(BaseModel):
@@ -130,6 +131,16 @@ def init_session(http_cfg: HttpConfig) -> None:
     })
     if http_cfg.extra_headers:
         session.headers.update(http_cfg.extra_headers)
+
+    # Load Civitai cookies (needed for video CDN and NSFW API auth)
+    if http_cfg.cookies_file:
+        cookies_path = Path(http_cfg.cookies_file)
+        if cookies_path.exists():
+            import http.cookiejar
+            cj = http.cookiejar.MozillaCookieJar(str(cookies_path))
+            cj.load(ignore_expires=True, ignore_discard=True)
+            session.cookies.update(cj)
+            log.info("Loaded %d cookies from %s", len(cj), cookies_path)
 
 
 # ---------------------------------------------------------------------------
