@@ -1,8 +1,0 @@
-Add username validation: URL/@ parsing + API existence check
-
-- parse_username_input(): supports civitai.com + civitai.red (with www.)
-- Rejects any non-Civitai URL (pixiv, twitter, etc.)
-- Validates username format before adding
-- Calls Civitai API to confirm user exists with public works
-- Both /add and /backfill use validation
-- All messages in Chinese
