@@ -59,10 +59,9 @@
 ```
 config.yaml                       磁盘
 ──────────────────────────────────────────────
-subscriptions:                    seen_ids/
-  2222222222: [UserTwo, vuurtoren] ├ seen_ids_2222222222_UserTwo.json
-  1111111111: [bunnyoppai]         ├ seen_ids_2222222222_vuurtoren.json
-                                   └ seen_ids_1111111111_bunnyoppai.json
+subscriptions:                      seen_ids/
+  YOUR_TELEGRAM_USER_ID: [Username] ├ seen_ids_YOUR_TG_ID_Username.json
+  ANOTHER_USER_ID: [Username2]      └ seen_ids_ANOTHER_ID_Username2.json
 ```
 
 ---
@@ -96,7 +95,7 @@ authorized_users:
 
 subscriptions:
   '123456789':
-    - name: "UserOne"
+    - name: "YourTargetUser"
 ```
 
 ### 3. 增量模式运行（默认）

@@ -251,9 +251,9 @@ async def cmd_add(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if len(args) < 2:
         await update.message.reply_text(
             "用法: `/add <用户名|主页链接|@用户名>`\n"
-            "示例: `/add UserThree`\n"
-            "      `/add https://civitai.red/user/UserThree`\n"
-            "      `/add @UserThree`",
+            "示例: `/add TargetUser`\n"
+            "      `/add https://civitai.red/user/TargetUser`\n"
+            "      `/add @TargetUser`",
             parse_mode="Markdown",
         )
         return
@@ -263,9 +263,9 @@ async def cmd_add(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not username:
         await update.message.reply_text(
             "❌ 无法识别用户名。支持的格式：\n"
-            "• 纯用户名: `UserThree`\n"
+            "• 纯用户名: `TargetUser`\n"
             "• 主页链接: `https://civitai.com/user/xxx`\n"
-            "• @用户名: `@UserThree`",
+            "• @用户名: `@TargetUser`",
             parse_mode="Markdown",
         )
         return
