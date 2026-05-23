@@ -517,9 +517,13 @@ def main() -> None:
 
         consolidated_seen.update(user_seen)
 
-    # -- Persist --
+    # -- Persist (merge with existing seen IDs — don't overwrite) --
     if consolidated_seen:
-        save_seen_ids(seen_file, consolidated_seen)
+        union = seen_ids | consolidated_seen
+        if len(union) > len(seen_ids):
+            save_seen_ids(seen_file, union)
+            log.info("Merged %d new IDs into seen_ids (total: %d)",
+                     len(union) - len(seen_ids), len(union))
 
     # -- Cleanup old cached images --
     keep_days = cfg.get("download", {}).get("keep_days", 7)
