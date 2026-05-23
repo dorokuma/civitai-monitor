@@ -48,7 +48,7 @@ logging.basicConfig(
 log = logging.getLogger("civitai-bot")
 
 # ---------------------------------------------------------------------------
-# Paths
+# Constants
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -57,8 +57,8 @@ SEEN_PATH = SCRIPT_DIR / "seen_ids.json"
 DOWNLOAD_DIR = SCRIPT_DIR / "downloads"
 MONITOR_SCRIPT = SCRIPT_DIR / "monitor.py"
 
-# The only authorised user — dad
-AUTHORIZED_USER_ID = 1111111111
+# Authorised user — resolved from config at startup
+AUTHORIZED_USER_ID: int = 0
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -449,11 +449,25 @@ async def post_init(application: Application) -> None:
 
 
 def main() -> None:
+    global AUTHORIZED_USER_ID
     cfg = read_config()
     token = cfg.get("telegram", {}).get("bot_token", "") or os.environ.get("CIVITAI_BOT_TOKEN", "")
     if not token:
         log.error("telegram.bot_token not found in config.yaml")
         sys.exit(1)
+
+    # Resolve authorised user from telegram.chat_id
+    chat_id_raw = cfg.get("telegram", {}).get("chat_id", "")
+    if not chat_id_raw:
+        log.error("telegram.chat_id is required (used as authorised user ID)")
+        sys.exit(1)
+    try:
+        AUTHORIZED_USER_ID = int(chat_id_raw)
+    except ValueError:
+        log.error("telegram.chat_id must be a numeric user ID, got: %s", chat_id_raw)
+        sys.exit(1)
+
+    log.info("Authorised user ID: %d", AUTHORIZED_USER_ID)
 
     app = (
         Application.builder()
