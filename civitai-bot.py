@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -29,6 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import requests
 import yaml
 from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -87,6 +89,91 @@ def set_users(cfg: dict[str, Any], users: list[str]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Username parsing & validation
+# ---------------------------------------------------------------------------
+
+CIVITAI_API = "https://civitai.com/api/v1"
+USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{2,64}$")
+
+# Known Civitai user profile URL prefixes (only these are accepted)
+_CIVITAI_URL_PREFIXES = (
+    "https://www.civitai.com/user/", "http://www.civitai.com/user/",
+    "https://civitai.com/user/", "http://civitai.com/user/",
+    "www.civitai.com/user/", "civitai.com/user/",
+    "https://www.civitai.red/user/", "http://www.civitai.red/user/",
+    "https://civitai.red/user/", "http://civitai.red/user/",
+    "www.civitai.red/user/", "civitai.red/user/",
+)
+
+
+def parse_username_input(raw: str) -> str | None:
+    """Extract Civitai username from various input formats.
+
+    Only accepts:
+      - https://civitai.com/user/Username
+      - https://civitai.red/user/Username
+      - @Username
+      - Username (plain text)
+
+    Returns None if input doesn't match any known format.
+    """
+    text = raw.strip()
+
+    # URL: only match known Civitai domains
+    for prefix in _CIVITAI_URL_PREFIXES:
+        if text.lower().startswith(prefix.lower()):
+            cand = text[len(prefix):].split("/")[0].split("?")[0].split("#")[0]
+            if USERNAME_RE.match(cand):
+                return cand
+            return None
+
+    # Also reject URLs that look like a different site entirely
+    if text.startswith(("http://", "https://", "www.")):
+        return None
+
+    # @username
+    if text.startswith("@"):
+        cand = text[1:]
+        if USERNAME_RE.match(cand):
+            return cand
+        return None
+
+    # Plain username
+    if USERNAME_RE.match(text):
+        return text
+
+    return None
+
+
+def validate_username_exists(username: str) -> tuple[bool, str]:
+    """Check if a Civitai username exists by calling the public API.
+
+    Returns (ok, message).
+    """
+    try:
+        resp = requests.get(
+            f"{CIVITAI_API}/images",
+            params={"username": username, "limit": 1, "sort": "Newest"},
+            headers={"User-Agent": "CivitaiMonitor/2.0"},
+            timeout=10,
+        )
+        if resp.status_code == 404:
+            return False, f"❌ 用户 @{username} 不存在（Civitai 返回 404）"
+        if resp.status_code == 403:
+            return False, f"❌ 无法验证 @{username}（被 API 拒绝，可能已封禁或限制访问）"
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("items", [])
+        metadata = data.get("metadata", {})
+        total = metadata.get("totalItems", len(items))
+        if total == 0:
+            return False, f"❌ 用户 @{username} 存在但没有任何公开作品，无法监控"
+        return True, f"✅ 用户 @{username} 存在，共 {total} 个作品"
+    except requests.RequestException as e:
+        return False, f"❌ 验证用户时网络错误: {e}"
+
+
+# ---------------------------------------------------------------------------
 # Authorisation guard
 # ---------------------------------------------------------------------------
 
@@ -129,20 +216,59 @@ async def cmd_add(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     args = update.message.text.strip().split(maxsplit=1)
     if len(args) < 2:
-        await update.message.reply_text("Usage: `/add <username>`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "用法: `/add <用户名|主页链接|@用户名>`\n"
+            "示例: `/add UserThree`\n"
+            "      `/add https://civitai.red/user/UserThree`\n"
+            "      `/add @UserThree`",
+            parse_mode="Markdown",
+        )
         return
-    username = args[1].strip()
+
+    # 智能识别用户名
+    username = parse_username_input(args[1])
+    if not username:
+        await update.message.reply_text(
+            "❌ 无法识别用户名。支持的格式：\n"
+            "• 纯用户名: `UserThree`\n"
+            "• 主页链接: `https://civitai.com/user/xxx`\n"
+            "• @用户名: `@UserThree`",
+            parse_mode="Markdown",
+        )
+        return
+
+    # 格式校验
+    if not USERNAME_RE.match(username):
+        await update.message.reply_text(
+            f"❌ 用户名 `{username}` 格式无效（仅允许字母、数字、下划线、连字符和点，2-64位）",
+            parse_mode="Markdown",
+        )
+        return
+
+    # 发送验证中提示
+    verifying_msg = await update.message.reply_text(f"⏳ 正在验证 @{username} 是否存在...")
+
+    # 存在性校验
+    ok, msg = validate_username_exists(username)
+    if not ok:
+        await verifying_msg.edit_text(msg)
+        return
+    await verifying_msg.edit_text(msg)
+
+    # 检查是否已监控
     cfg = read_config()
     users = get_users(cfg)
     if username in users:
-        await update.message.reply_text(f"👤 @{username} is already being watched.")
+        await update.message.reply_text(f"👤 @{username} 已经在监控列表中了")
         return
+
+    # 添加用户
     users.append(username)
     cfg = set_users(cfg, users)
     write_config(cfg)
     await update.message.reply_text(
-        f"✅ Added @{username} to the watch list.\n"
-        f"Next cron run will pick them up (every 10 min)."
+        f"✅ 已添加 @{username} 到监控列表\n"
+        f"下次定时任务（每10分钟）将自动开始抓取",
     )
 
 
@@ -340,9 +466,29 @@ async def cmd_backfill(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     args = update.message.text.strip().split(maxsplit=1)
     if len(args) < 2:
-        await update.message.reply_text("Usage: `/backfill <username>`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "用法: `/backfill <用户名>`\n"
+            "示例: `/backfill UserThree`",
+            parse_mode="Markdown",
+        )
         return
-    username = args[1].strip()
+    username = parse_username_input(args[1])
+    if not username:
+        await update.message.reply_text(
+            "❌ 无法识别用户名。支持的格式：\n"
+            "• 纯用户名: `UserThree`\n"
+            "• 主页链接: `https://civitai.com/user/xxx`\n"
+            "• @用户名: `@UserThree`",
+            parse_mode="Markdown",
+        )
+        return
+
+    # 验证用户存在
+    ok, msg = validate_username_exists(username)
+    if not ok:
+        await update.message.reply_text(msg)
+        return
+    await update.message.reply_text(msg)
 
     # Temporarily set mode to full, run, then restore
     cfg = read_config()
