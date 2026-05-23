@@ -9,8 +9,10 @@ venv/
 config.yaml
 
 # Runtime data (auto-generated)
-seen_ids.json
+seen_ids/
 downloads/
+civitai_cookies.txt
+*.log
 
 # OS junk
 .DS_Store

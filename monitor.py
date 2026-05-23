@@ -86,7 +86,8 @@ class DataConfig(BaseModel):
 
 
 class MonitorConfig(BaseModel):
-    users: list
+    users: list = Field(default_factory=list)
+    subscriptions: dict[str, list] = Field(default_factory=dict)
     mode: str = "incremental"
     nsfw: str = "both"
     api: ApiConfig = Field(default_factory=ApiConfig)
@@ -246,18 +247,29 @@ def normalize_to_original(
 LOCK_PATH = SCRIPT_DIR / "seen_ids.lock"
 
 
-def load_seen_ids(path: Path) -> set[int]:
-    if path.exists():
-        raw = json.loads(path.read_text())
-        return set(raw) if isinstance(raw, list) else set()
-    return set()
+def seen_file_for_user(seen_dir: Path, tg_id: str, username: str) -> Path:
+    """Get the per-user seen IDs file path.
+
+    Each (Telegram user, Civitai user) pair has its own independent file
+    so that different Telegram accounts have separate download progress.
+    """
+    seen_dir.mkdir(parents=True, exist_ok=True)
+    return seen_dir / f"seen_ids_{tg_id}_{username}.json"
 
 
-def save_seen_ids(path: Path, ids: set[int]) -> None:
+def load_seen_ids(seen_dir: Path, tg_id: str, username: str) -> set[int]:
+    """Load seen IDs for a specific (Telegram user, Civitai user) pair."""
+    path = seen_file_for_user(seen_dir, tg_id, username)
+    return set(json.loads(path.read_text())) if path.exists() else set()
+
+
+def save_seen_ids(seen_dir: Path, tg_id: str, username: str, ids: set[int]) -> None:
+    """Save seen IDs for a specific (Telegram user, Civitai user) pair."""
+    path = seen_file_for_user(seen_dir, tg_id, username)
     lock = FileLock(str(LOCK_PATH), timeout=10)
     with lock:
         path.write_text(json.dumps(sorted(ids), indent=2))
-    log.info("Saved %d seen IDs to %s", len(ids), path)
+    log.info("Saved %d seen IDs for @%s", len(ids), username)
 
 
 # ---------------------------------------------------------------------------
@@ -283,19 +295,34 @@ def download_image(url: str, save_path: Path, timeout: int = 120) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def download_video(url: str, save_path: Path, max_size_mb: int = 500) -> bool:
+def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
+    """Download a full-quality video from Civitai CDN.
+
+    Strategy:
+      1. Follow redirect from image.civitai.com → B2 /default (cover)
+      2. Rewrite /default → /original on B2 to get the real video
+      3. If /original is 404 (video no longer available), skip
+    """
     try:
+        # Step 1: follow redirect to B2
         resp = safe_get(url, stream=True)
         resp.raise_for_status()
+        b2_url = str(resp.url)
 
-        # Check Content-Length header
-        content_length = resp.headers.get("content-length")
-        if content_length and int(content_length) > max_size_mb * 1024 * 1024:
-            log.warning(
-                "Video too large (%.1f MB > %d MB), skipping",
-                int(content_length) / 1024 / 1024,
-                max_size_mb,
-            )
+        # Step 2: rewrite /default → /original
+        if "image-b2.civitai.com" in b2_url and b2_url.endswith("/default"):
+            orig_url = b2_url[:-8] + "/original"
+            log.info("B2: /default → /original")
+            resp = safe_get(orig_url, stream=True, timeout=120)
+            resp.raise_for_status()
+        else:
+            resp.raise_for_status()
+
+        # Check size
+        cl = resp.headers.get("content-length")
+        if cl and int(cl) > max_size_mb * 1024 * 1024:
+            log.warning("Video too large (%.1f MB > %d MB), skipping",
+                        int(cl) / 1024 / 1024, max_size_mb)
             return False
 
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -303,7 +330,8 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 500) -> bool:
             for chunk in resp.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
-        log.info("Video downloaded: %s (%.1f MB)", save_path.name, save_path.stat().st_size / 1024 / 1024)
+        log.info("Video downloaded: %s (%.1f MB)", save_path.name,
+                 save_path.stat().st_size / 1024 / 1024)
         return True
     except requests.RequestException as e:
         log.warning("Video download failed for %s: %s", url, e)
@@ -442,12 +470,16 @@ def process_and_push(
         filepath = output_dir / "videos" / f"{item_id}.mp4"
         success = download_video(video_url, filepath, max_video_size_mb)
 
+        status = " ✅" if success else " ⚠️（视频下载失败，请在 Civitai 页面查看）"
         text = (
-            f"🎥 *New video by @{username}*\n"
+            f"🎥 *New video by @{username}*{status}\n"
             f"🔗 [View on Civitai]({civitai_url})\n"
             f"🕐 {created_at}"
         )
-        send_to_telegram(bot_token, chat_id, text, [filepath] if success else None)
+        pushed = send_to_telegram(bot_token, chat_id, text, [filepath] if success else None)
+        log.info("Pushed %s %s to @%s | id=%d file=%s success=%s push=%s",
+                 "video", "✅" if pushed else "❌", username, item_id,
+                 filepath.name if success else "none", success, pushed)
         return success
 
     # Image path
@@ -456,12 +488,16 @@ def process_and_push(
     filepath = output_dir / f"{item_id}{ext}"
     success = download_image(orig_url, filepath)
 
+    status = " ✅" if success else " ⚠️（图片下载失败，请在 Civitai 页面查看）"
     text = (
-            f"🖼 *New artwork by @{username}*\n"
+            f"🖼 *New artwork by @{username}*{status}\n"
             f"🔗 [View on Civitai]({civitai_url})\n"
             f"🕐 {created_at}"
         )
-    send_to_telegram(bot_token, chat_id, text, [filepath] if success else None)
+    pushed = send_to_telegram(bot_token, chat_id, text, [filepath] if success else None)
+    log.info("Pushed %s %s to @%s | id=%d file=%s success=%s push=%s",
+             "image", "✅" if pushed else "❌", username, item_id,
+             filepath.name if success else "none", success, pushed)
     return success
 
 
@@ -474,6 +510,8 @@ def run_incremental(
     username: str,
     *,
     seen_ids: set[int],
+    tg_id: str,
+    seen_dir: Path,
     nsfw_setting: str,
     output_dir: Path,
     size_suffixes: list[str],
@@ -486,6 +524,8 @@ def run_incremental(
 ) -> set[int]:
     """Check only the latest page(s) — stop as soon as we hit a known ID.
 
+    Saves seen_ids periodically during processing to prevent duplicate
+    pushes when cron fires again before a long run completes.
     Returns the set of all image IDs seen on the latest page(s).
     """
     all_seen: set[int] = set()
@@ -502,7 +542,7 @@ def run_incremental(
 
         new_on_page = [img for img in items if img["id"] not in seen_ids]
         if new_on_page:
-            for img in reversed(new_on_page):
+            for i, img in enumerate(reversed(new_on_page)):
                 process_and_push(
                     img, username,
                     size_suffixes=size_suffixes,
@@ -513,9 +553,22 @@ def run_incremental(
                     max_video_size_mb=max_video_size_mb,
                 )
                 time.sleep(0.5)
+                # Save progress every 5 items to prevent cron race
+                if (i + 1) % 5 == 0:
+                    union = seen_ids | all_seen
+                    if len(union) > len(seen_ids):
+                        save_seen_ids(seen_dir, tg_id, username, union)
+                        log.info("Checkpoint saved %d seen IDs for @%s", len(union), username)
             log.info("%s: +%d new (track: %s)", username, len(new_on_page), label)
         else:
             log.info("%s: no new (track: %s)", username, label)
+
+        # Save after each track to ensure no IDs are lost on interrupt
+        if all_seen:
+            union = seen_ids | all_seen
+            if len(union) > len(seen_ids):
+                save_seen_ids(seen_dir, tg_id, username, union)
+                log.info("Track-end saved %d seen IDs for @%s", len(union), username)
 
     return all_seen
 
@@ -529,6 +582,7 @@ def run_full(
     username: str,
     *,
     seen_ids: set[int],
+    tg_id: str,
     nsfw_setting: str,
     output_dir: Path,
     size_suffixes: list[str],
@@ -538,7 +592,7 @@ def run_full(
     limit: int,
     video_enabled: bool,
     max_video_size_mb: int,
-    seen_file: Path,
+    seen_dir: Path,
 ) -> set[int]:
     """Walk every page of the user's gallery for the requested tracks.
 
@@ -589,7 +643,7 @@ def run_full(
 
             # Save progress periodically
             if page % 10 == 0:
-                save_seen_ids(seen_file, all_seen)
+                save_seen_ids(seen_dir, tg_id, username, all_seen)
 
             page += 1
             time.sleep(0.5)
@@ -640,83 +694,80 @@ def main() -> None:
     data_dir = Path(cfg.data.data_dir) if cfg.data.data_dir else SCRIPT_DIR
     output_dir = data_dir / cfg.download.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    seen_file = data_dir / cfg.data.seen_ids_file
+    seen_dir = data_dir / "seen_ids"
+    seen_dir.mkdir(parents=True, exist_ok=True)
 
-    # -- Parse users --
-    users: list[str] = cfg.users
-    if users and isinstance(users[0], dict):
-        users = [u.get("name", str(u)) if isinstance(u, dict) else str(u) for u in users]
-    if not users:
-        log.error("No users configured in config.yaml")
+    # -- Per-Telegram-user processing (each TG user has independent seen_ids) --
+    subs = cfg.subscriptions or {}
+    if not subs:
+        log.error("No subscriptions configured in config.yaml")
         sys.exit(1)
 
-    # -- State --
-    seen_ids = load_seen_ids(seen_file)
+    for tg_id, user_list in subs.items():
+        tg_id_str = str(tg_id)
+        for entry in user_list:
+            username = entry.get("name", str(entry)) if isinstance(entry, dict) else str(entry)
+            log.info("=" * 50)
+            log.info("Processing @%s (TG:%s, %s mode)...", username, tg_id_str, cfg.mode)
 
-    # -- Per-user processing --
-    consolidated_seen: set[int] = set()
+            # Load this (TG user, Civitai user) pair's own seen IDs
+            seen_ids = load_seen_ids(seen_dir, tg_id_str, username)
 
-    for username in users:
-        log.info("=" * 50)
-        log.info("Processing @%s (%s mode)...", username, cfg.mode)
+            if cfg.mode == "full":
+                user_seen = run_full(
+                    username,
+                    seen_ids=seen_ids,
+                    nsfw_setting=cfg.nsfw,
+                    output_dir=output_dir,
+                    size_suffixes=cfg.download.size_suffixes,
+                    bot_token=cfg.telegram.bot_token,
+                    chat_id=cfg.telegram.chat_id,
+                    base_url=cfg.api.base_url,
+                    limit=cfg.api.images_per_page,
+                    video_enabled=cfg.video_enabled,
+                    max_video_size_mb=cfg.max_video_size_mb,
+                    seen_dir=seen_dir,
+                    tg_id=tg_id_str,
+                )
+            else:
+                user_seen = run_incremental(
+                    username,
+                    seen_ids=seen_ids,
+                    tg_id=tg_id_str,
+                    seen_dir=seen_dir,
+                    nsfw_setting=cfg.nsfw,
+                    output_dir=output_dir,
+                    size_suffixes=cfg.download.size_suffixes,
+                    bot_token=cfg.telegram.bot_token,
+                    chat_id=cfg.telegram.chat_id,
+                    base_url=cfg.api.base_url,
+                    limit=cfg.api.images_per_page,
+                    video_enabled=cfg.video_enabled,
+                    max_video_size_mb=cfg.max_video_size_mb,
+                )
 
-        if cfg.mode == "full":
-            user_seen = run_full(
-                username,
-                seen_ids=seen_ids,
-                nsfw_setting=cfg.nsfw,
-                output_dir=output_dir,
-                size_suffixes=cfg.download.size_suffixes,
-                bot_token=cfg.telegram.bot_token,
-                chat_id=cfg.telegram.chat_id,
-                base_url=cfg.api.base_url,
-                limit=cfg.api.images_per_page,
-                video_enabled=cfg.video_enabled,
-                max_video_size_mb=cfg.max_video_size_mb,
-                seen_file=seen_file,
-            )
-        else:
-            user_seen = run_incremental(
-                username,
-                seen_ids=seen_ids,
-                nsfw_setting=cfg.nsfw,
-                output_dir=output_dir,
-                size_suffixes=cfg.download.size_suffixes,
-                bot_token=cfg.telegram.bot_token,
-                chat_id=cfg.telegram.chat_id,
-                base_url=cfg.api.base_url,
-                limit=cfg.api.images_per_page,
-                video_enabled=cfg.video_enabled,
-                max_video_size_mb=cfg.max_video_size_mb,
-            )
+            # Save per-(TG user, Civitai user) progress immediately
+            if user_seen:
+                union = seen_ids | user_seen
+                if len(union) > len(seen_ids):
+                    save_seen_ids(seen_dir, tg_id_str, username, union)
+                    new_count = len(union) - len(seen_ids)
+                    log.info("Merged %d new IDs for @%s (TG:%s) (total: %d)", new_count, username, tg_id_str, len(union))
 
-        consolidated_seen.update(user_seen)
+                    # Full mode: per-user completion message
+                    if cfg.mode == "full":
+                        log.info("Full backfill complete for @%s (TG:%s): %d new items", username, tg_id_str, new_count)
+                        summary = (
+                            f"✅ *Backfill complete for @{username}*\n"
+                            f"📸 Mode: {cfg.mode} · NSFW: {cfg.nsfw} · Video: {cfg.video_enabled}\n"
+                            f"🆕 New items: {new_count}"
+                        )
+                        send_to_telegram(cfg.telegram.bot_token, cfg.telegram.chat_id, summary)
 
-    # -- Persist (merge — don't overwrite!) --
-    if consolidated_seen:
-        union = seen_ids | consolidated_seen
-        if len(union) > len(seen_ids):
-            save_seen_ids(seen_file, union)
-            log.info("Merged %d new IDs into seen_ids (total: %d)",
-                     len(union) - len(seen_ids), len(union))
-
-    # -- Cleanup --
+    # -- Cleanup old caches --
     removed = cleanup_old_caches(output_dir, cfg.download.keep_days)
     if removed:
         log.info("Cleaned %d cached files older than %d days", removed, cfg.download.keep_days)
-
-    # -- Full-mode summary --
-    if cfg.mode == "full":
-        total_new = len(consolidated_seen - seen_ids)
-        log.info("=" * 50)
-        log.info("Full backfill complete for %s", ", ".join(users))
-        log.info("Total new items found: %d", total_new)
-        summary = (
-            f"✅ *Backfill complete for @{', @'.join(users)}*\n"
-            f"📸 Mode: {cfg.mode} · NSFW: {cfg.nsfw} · Video: {cfg.video_enabled}\n"
-            f"🆕 New items: {total_new}"
-        )
-        send_to_telegram(cfg.telegram.bot_token, cfg.telegram.chat_id, summary)
 
 
 if __name__ == "__main__":

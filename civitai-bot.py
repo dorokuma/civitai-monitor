@@ -57,7 +57,7 @@ DOWNLOAD_DIR = SCRIPT_DIR / "downloads"
 MONITOR_SCRIPT = SCRIPT_DIR / "monitor.py"
 
 # Authorised user — resolved from config at startup
-AUTHORIZED_USER_ID: int = 0
+AUTHORIZED_USER_IDS: set[int] = set()
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -76,15 +76,28 @@ def write_config(cfg: dict[str, Any]) -> None:
         yaml.dump(cfg, f, default_flow_style=False, sort_keys=False, allow_unicode=True, indent=2)
 
 
-def get_users(cfg: dict[str, Any]) -> list[str]:
-    raw = cfg.get("users", [])
-    if isinstance(raw, list):
-        return [u.get("name", str(u)) if isinstance(u, dict) else str(u) for u in raw]
-    return []
+def get_users(cfg: dict[str, Any], telegram_user_id: int) -> list[str]:
+    """Get the user watch list for a specific Telegram user."""
+    # Migrate legacy flat users list to subscriptions dict
+    if "users" in cfg and "subscriptions" not in cfg:
+        raw = cfg["users"]
+        legacy = [u.get("name", str(u)) if isinstance(u, dict) else str(u) for u in raw]
+        cfg["subscriptions"] = {str(telegram_user_id): [{"name": u} for u in legacy]}
+        del cfg["users"]
+        write_config(cfg)
+        log.info("Migrated legacy users list to subscriptions dict for %d", telegram_user_id)
+        return legacy
+
+    subs = cfg.get("subscriptions", {})
+    raw = subs.get(str(telegram_user_id), [])
+    return [u.get("name", str(u)) if isinstance(u, dict) else str(u) for u in raw]
 
 
-def set_users(cfg: dict[str, Any], users: list[str]) -> dict[str, Any]:
-    cfg["users"] = [{"name": u} for u in users]
+def set_users(cfg: dict[str, Any], telegram_user_id: int, users: list[str]) -> dict[str, Any]:
+    """Set the user watch list for a specific Telegram user."""
+    if "subscriptions" not in cfg:
+        cfg["subscriptions"] = {}
+    cfg["subscriptions"][str(telegram_user_id)] = [{"name": u} for u in users]
     return cfg
 
 
@@ -200,10 +213,10 @@ def validate_username_exists(username: str) -> tuple[bool, str]:
 
 async def _check_auth(update: Update) -> bool:
     """Return True if the sender is authorised."""
-    if update.effective_user and update.effective_user.id == AUTHORIZED_USER_ID:
+    if update.effective_user and update.effective_user.id in AUTHORIZED_USER_IDS:
         return True
     if update.message:
-        await update.message.reply_text("⛔ Unauthorised. This bot is private.")
+        await update.message.reply_text("⛔ 未授权，此 Bot 仅限主人使用")
     return False
 
 
@@ -277,14 +290,15 @@ async def cmd_add(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     # 检查是否已监控
     cfg = read_config()
-    users = get_users(cfg)
+    uid = update.effective_user.id
+    users = get_users(cfg, uid)
     if username in users:
         await update.message.reply_text(f"👤 @{username} 已经在监控列表中了")
         return
 
     # 添加用户
     users.append(username)
-    cfg = set_users(cfg, users)
+    cfg = set_users(cfg, uid, users)
     write_config(cfg)
     await update.message.reply_text(
         f"✅ 已添加 @{username} 到监控列表\n"
@@ -295,13 +309,13 @@ async def cmd_add(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_remove(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _check_auth(update):
         return
-    await _show_remove_list(update.message, page=0)
+    await _show_remove_list(update.message, update.effective_user.id, page=0)
 
 
-async def _show_remove_list(message, page: int = 0) -> None:
+async def _show_remove_list(message, telegram_user_id: int, page: int = 0) -> None:
     """Display paginated user list with remove buttons."""
     cfg = read_config()
-    users = get_users(cfg)
+    users = get_users(cfg, telegram_user_id)
     if not users:
         await message.reply_text("📭 监控列表是空的，先 `/add` 加几个吧", parse_mode="Markdown")
         return
@@ -340,18 +354,19 @@ async def cmd_remove_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     await query.answer()
     data = query.data
+    uid = query.from_user.id
 
     try:
         # Close — remove keyboard to avoid repeat clicks
         if data == "rem_cl":
-            await query.edit_text("🔒 已关闭", reply_markup=None)
+            await query.edit_message_text("🔒 已关闭", reply_markup=None)
             return
 
         # Pagination
         if data.startswith("rem_pg:"):
             page = int(data.split(":", 1)[1])
             cfg = read_config()
-            users = get_users(cfg)
+            users = get_users(cfg, uid)
             await _render_remove_page(query, users, page)
             return
 
@@ -359,23 +374,23 @@ async def cmd_remove_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -
         if data.startswith("rem:"):
             username = data.split(":", 1)[1]
             cfg = read_config()
-            users = get_users(cfg)
+            users = get_users(cfg, uid)
             if username not in users:
-                await query.edit_text(f"👤 @{username} 已不在监控列表中", reply_markup=None)
+                await query.edit_message_text(f"👤 @{username} 已不在监控列表中", reply_markup=None)
                 return
             users.remove(username)
-            cfg = set_users(cfg, users)
+            cfg = set_users(cfg, uid, users)
             write_config(cfg)
 
             if users:
-                await query.edit_text(f"✅ 已取消关注 @{username}", reply_markup=None)
-                await _show_remove_list(query.message, page=0)
+                await query.edit_message_text(f"✅ 已取消关注 @{username}", reply_markup=None)
+                await _show_remove_list(query.message, uid, page=0)
             else:
-                await query.edit_text(f"✅ 已取消关注 @{username}\n📭 监控列表已清空", reply_markup=None)
+                await query.edit_message_text(f"✅ 已取消关注 @{username}\n📭 监控列表已清空", reply_markup=None)
     except Exception as e:
         log.error("Remove callback error: %s", e)
         try:
-            await query.edit_text(f"❌ 操作失败，请重试 /remove", reply_markup=None)
+            await query.edit_message_text(f"❌ 操作失败，请重试 /remove", reply_markup=None)
         except Exception:
             pass
 
@@ -413,7 +428,7 @@ async def cmd_list(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _check_auth(update):
         return
     cfg = read_config()
-    users = get_users(cfg)
+    users = get_users(cfg, update.effective_user.id)
     if not users:
         await update.message.reply_text("📭 No users configured. Use `/add` to add some.", parse_mode="Markdown")
         return
@@ -426,7 +441,7 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _check_auth(update):
         return
     cfg = read_config()
-    users = get_users(cfg)
+    users = get_users(cfg, update.effective_user.id)
 
     # Config summary
     mode = cfg.get("mode", "incremental")
@@ -582,80 +597,147 @@ async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_backfill(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _check_auth(update):
         return
-    args = update.message.text.strip().split(maxsplit=1)
-    if len(args) < 2:
-        await update.message.reply_text(
-            "用法: `/backfill <用户名>`\n"
-            "示例: `/backfill UserThree`",
-            parse_mode="Markdown",
-        )
-        return
-    username = parse_username_input(args[1])
-    if not username:
-        await update.message.reply_text(
-            "❌ 无法识别用户名。支持的格式：\n"
-            "• 纯用户名: `UserThree`\n"
-            "• 主页链接: `https://civitai.com/user/xxx`\n"
-            "• @用户名: `@UserThree`",
-            parse_mode="Markdown",
-        )
-        return
+    await _show_backfill_list(update.message, update.effective_user.id, page=0)
 
-    # 验证用户存在
-    ok, msg = validate_username_exists(username)
-    if not ok:
-        await update.message.reply_text(msg)
-        return
-    await update.message.reply_text(msg)
 
-    # Temporarily set mode to full, run, then restore
+async def _show_backfill_list(message, telegram_user_id: int, page: int = 0) -> None:
+    """Display paginated user list with backfill buttons."""
     cfg = read_config()
-    orig_mode = cfg.get("mode", "incremental")
-    orig_users = cfg.get("users", [])
-    cfg["mode"] = "full"
-    cfg["users"] = [{"name": username}]
-    write_config(cfg)
+    users = get_users(cfg, telegram_user_id)
+    if not users:
+        await message.reply_text("📭 监控列表是空的，先 `/add` 加几个吧", parse_mode="Markdown")
+        return
 
-    await update.message.reply_text(
-        f"⏳ Running full backfill for @{username}...\n"
-        f"This may take a while. I'll notify you when done.",
-        parse_mode="Markdown",
+    per_page = 8
+    total_pages = (len(users) + per_page - 1) // per_page
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    end = start + per_page
+    page_users = users[start:end]
+
+    keyboard = []
+    for u in page_users:
+        keyboard.append([InlineKeyboardButton(f"⏳ @{u}", callback_data=f"bf:{u}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ 上一页", callback_data=f"bf_pg:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("下一页 ▶", callback_data=f"bf_pg:{page + 1}"))
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton("🔒 关闭", callback_data="bf_cl")])
+
+    total_text = f"👥 共 {len(users)} 个监控对象" if total_pages <= 1 else f"👥 共 {len(users)} 个（第 {page + 1}/{total_pages} 页）"
+    await message.reply_text(
+        f"{total_text}\n点击用户开始全量回填：",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
-    try:
-        result = subprocess.run(
-            [sys.executable, str(MONITOR_SCRIPT)],
-            capture_output=True, text=True, timeout=7200, cwd=str(SCRIPT_DIR),
-        )
-        # Restore original config
-        current_cfg = read_config()
-        current_cfg["mode"] = orig_mode
-        current_cfg["users"] = orig_users
-        write_config(current_cfg)
 
-        if result.returncode != 0:
-            await update.message.reply_text(
-                f"❌ Backfill failed (exit {result.returncode}). Config restored.",
-            )
+async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle backfill button presses."""
+    if not await _check_auth(update):
+        return
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    uid = query.from_user.id
+
+    try:
+        # Close
+        if data == "bf_cl":
+            await query.edit_message_text("🔒 已关闭", reply_markup=None)
             return
 
-        summary = _summarise_log(result.stderr)
-        await update.message.reply_text(
-            f"✅ Backfill for @{username} complete.\n{summary}",
-            parse_mode="Markdown",
-        )
-    except subprocess.TimeoutExpired:
-        current_cfg = read_config()
-        current_cfg["mode"] = orig_mode
-        current_cfg["users"] = orig_users
-        write_config(current_cfg)
-        await update.message.reply_text("⏱ Backfill timed out after 2 hours. Config restored.")
+        # Pagination
+        if data.startswith("bf_pg:"):
+            page = int(data.split(":", 1)[1])
+            cfg = read_config()
+            users = get_users(cfg, uid)
+            await _render_backfill_page(query, users, page)
+            return
+
+        # Start backfill
+        if data.startswith("bf:"):
+            username = data.split(":", 1)[1]
+            await query.edit_message_text(f"⏳ 正在全量回填 @{username}...\n这可能需要一段时间，完成后会通知你", reply_markup=None)
+
+            # Save original config state before temporary override
+            cfg = read_config()
+            orig_mode = cfg.get("mode", "incremental")
+            orig_subs = cfg.get("subscriptions", {}).copy()
+            cfg["mode"] = "full"
+            # Set a single-user flat users list for the backfill run
+            cfg["users"] = [{"name": username}]
+            write_config(cfg)
+
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(MONITOR_SCRIPT)],
+                    capture_output=True, text=True, timeout=7200, cwd=str(SCRIPT_DIR),
+                )
+                # Restore original config
+                current_cfg = read_config()
+                current_cfg["mode"] = orig_mode
+                current_cfg["subscriptions"] = orig_subs
+                current_cfg.pop("users", None)  # Remove temp flat users list
+                write_config(current_cfg)
+
+                if result.returncode != 0:
+                    await query.message.reply_text(f"❌ 回填 @{username} 失败（exit {result.returncode}），配置已恢复")
+                    return
+
+                summary = _summarise_log(result.stderr)
+                await query.message.reply_text(
+                    f"✅ 回填 @{username} 完成\n{summary}",
+                    parse_mode="Markdown",
+                )
+            except subprocess.TimeoutExpired:
+                cfg = read_config()
+                cfg["mode"] = orig_mode
+                cfg["subscriptions"] = orig_subs
+                cfg.pop("users", None)
+                write_config(cfg)
+                await query.message.reply_text("⏱ 回填超时（2小时），配置已恢复")
+            except Exception as e:
+                cfg = read_config()
+                cfg["mode"] = orig_mode
+                cfg["subscriptions"] = orig_subs
+                cfg.pop("users", None)
+                write_config(cfg)
+                await query.message.reply_text(f"❌ 回填出错: {e}，配置已恢复")
     except Exception as e:
-        current_cfg = read_config()
-        current_cfg["mode"] = orig_mode
-        current_cfg["users"] = orig_users
-        write_config(current_cfg)
-        await update.message.reply_text(f"❌ Error: {e}. Config restored.")
+        log.error("Backfill callback error: %s", e)
+
+
+async def _render_backfill_page(query, users: list[str], page: int) -> None:
+    """Update the message with a fresh page of backfill buttons."""
+    per_page = 8
+    total_pages = (len(users) + per_page - 1) // per_page
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    end = start + per_page
+    page_users = users[start:end]
+
+    keyboard = []
+    for u in page_users:
+        keyboard.append([InlineKeyboardButton(f"⏳ @{u}", callback_data=f"bf:{u}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ 上一页", callback_data=f"bf_pg:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("下一页 ▶", callback_data=f"bf_pg:{page + 1}"))
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton("🔒 关闭", callback_data="bf_cl")])
+
+    total_text = f"👥 共 {len(users)} 个监控对象" if total_pages <= 1 else f"👥 共 {len(users)} 个（第 {page + 1}/{total_pages} 页）"
+    await query.edit_message_text(
+        f"{total_text}\n点击用户开始全量回填：",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -705,19 +787,19 @@ def _summarise_log(stderr: str) -> str:
 
 async def post_init(application: Application) -> None:
     commands = [
-        BotCommand("add", "Add a user to the watch list"),
-        BotCommand("remove", "Remove a user from the watch list"),
-        BotCommand("list", "List all watched users"),
-        BotCommand("status", "Show monitor status"),
-        BotCommand("mode", "Switch scan mode (incremental|full)"),
-        BotCommand("nsfw", "Switch NSFW filter (sfw_only|nsfw_only|both)"),
-        BotCommand("cleanup", "Clean cached images older than N days"),
-        BotCommand("scan", "Trigger an immediate incremental scan"),
-        BotCommand("backfill", "Run a full backfill for a user"),
-        BotCommand("help", "Show all commands"),
+        BotCommand("add", "增加监控对象（支持用户名/链接/@）"),
+        BotCommand("remove", "取消监控对象（按钮选择）"),
+        BotCommand("list", "查看当前监控列表"),
+        BotCommand("status", "查看运行状态"),
+        BotCommand("mode", "切换运行模式 incremental|full"),
+        BotCommand("nsfw", "切换NSFW过滤 sfw_only|nsfw_only|both"),
+        BotCommand("cleanup", "清理N天前的缓存图片"),
+        BotCommand("scan", "立即执行一次增量扫描"),
+        BotCommand("backfill", "全量回填某个用户的作品"),
+        BotCommand("help", "显示所有命令说明"),
     ]
     await application.bot.set_my_commands(commands)
-    log.info("Bot commands registered. Ready.")
+    log.info("Slash commands registered. Ready.")
 
 
 # ---------------------------------------------------------------------------
@@ -726,25 +808,35 @@ async def post_init(application: Application) -> None:
 
 
 def main() -> None:
-    global AUTHORIZED_USER_ID
+    global AUTHORIZED_USER_IDS
     cfg = read_config()
     token = cfg.get("telegram", {}).get("bot_token", "") or os.environ.get("CIVITAI_BOT_TOKEN", "")
     if not token:
         log.error("telegram.bot_token not found in config.yaml")
         sys.exit(1)
 
-    # Resolve authorised user from telegram.chat_id
-    chat_id_raw = cfg.get("telegram", {}).get("chat_id", "")
-    if not chat_id_raw:
-        log.error("telegram.chat_id is required (used as authorised user ID)")
-        sys.exit(1)
-    try:
-        AUTHORIZED_USER_ID = int(chat_id_raw)
-    except ValueError:
-        log.error("telegram.chat_id must be a numeric user ID, got: %s", chat_id_raw)
+    # Resolve authorised users from config
+    raw_ids = cfg.get("authorized_users", [])
+    if not raw_ids:
+        # Fallback to telegram.chat_id for backward compatibility
+        fallback = cfg.get("telegram", {}).get("chat_id", "")
+        if fallback:
+            try:
+                AUTHORIZED_USER_IDS = {int(fallback)}
+            except ValueError:
+                pass
+    else:
+        for uid in raw_ids:
+            try:
+                AUTHORIZED_USER_IDS.add(int(uid))
+            except (ValueError, TypeError):
+                pass
+
+    if not AUTHORIZED_USER_IDS:
+        log.error("No authorized users configured (set authorized_users or telegram.chat_id)")
         sys.exit(1)
 
-    log.info("Authorised user ID: %d", AUTHORIZED_USER_ID)
+    log.info("Authorised user IDs: %s", AUTHORIZED_USER_IDS)
 
     app = (
         Application.builder()
@@ -764,11 +856,12 @@ def main() -> None:
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("backfill", cmd_backfill))
 
-    # Remove button callbacks
+    # Button callbacks
     app.add_handler(CallbackQueryHandler(cmd_remove_callback, pattern="^rem"))
+    app.add_handler(CallbackQueryHandler(cmd_backfill_callback, pattern="^bf"))
 
     log.info("Civitai Admin Bot starting...")
-    app.run_polling(allowed_updates=["message"])
+    app.run_polling(allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
