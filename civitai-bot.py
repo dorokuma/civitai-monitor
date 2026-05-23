@@ -146,19 +146,20 @@ def parse_username_input(raw: str) -> str | None:
 
 
 def validate_username_exists(username: str) -> tuple[bool, str]:
-    """Check if a Civitai username exists by calling the public API.
+    """Check if a Civitai username exists and has public content.
 
-    Makes TWO requests (SFW + NSFW) to get the full work count.
+    Makes two requests (SFW + NSFW) to handle both content types.
     Returns (ok, message).
     """
-    total_works = 0
+    has_sfw = False
+    has_nsfw = False
     errors = []
 
     for nsfw_flag, label in [(False, "SFW"), (True, "NSFW")]:
         try:
             resp = requests.get(
                 f"{CIVITAI_API}/images",
-                params={"username": username, "limit": 1, "sort": "Newest",
+                params={"username": username, "limit": 5, "sort": "Newest",
                         "nsfw": "true" if nsfw_flag else "false"},
                 headers={"User-Agent": "CivitaiMonitor/2.0"},
                 timeout=10,
@@ -169,18 +170,27 @@ def validate_username_exists(username: str) -> tuple[bool, str]:
                 return False, f"❌ 无法验证 @{username}（被 API 拒绝，可能已封禁或限制访问）"
             resp.raise_for_status()
             data = resp.json()
-            metadata = data.get("metadata", {})
-            total_works += metadata.get("totalItems", len(data.get("items", [])))
+            items = data.get("items", [])
+            if items:
+                if nsfw_flag:
+                    has_nsfw = True
+                else:
+                    has_sfw = True
         except requests.RequestException as e:
             errors.append(f"{label}: {e}")
 
     if errors:
         return False, f"❌ 验证用户时出错: {'; '.join(errors)}"
 
-    if total_works == 0:
-        return False, f"❌ 用户 @{username} 存在但没有任何公开作品，无法监控"
+    if not has_sfw and not has_nsfw:
+        return False, f"❌ 用户 @{username} 存在但未找到公开作品，无法监控"
 
-    return True, f"✅ 用户 @{username} 存在，共 {total_works} 个作品（SFW + NSFW）"
+    parts = []
+    if has_sfw:
+        parts.append("SFW ✅")
+    if has_nsfw:
+        parts.append("NSFW ✅")
+    return True, f"✅ 用户 @{username} 存在，有公开作品（{' '.join(parts)}）"
 
 
 # ---------------------------------------------------------------------------
