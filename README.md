@@ -125,11 +125,56 @@ can be downloaded from the CDN without authentication.
 
 ---
 
+## Admin Bot (optional)
+
+Run a 24/7 Telegram Bot that lets you manage the monitor via chat commands:
+
+| Command | Description |
+|---------|-------------|
+| `/add <username>` | Add a user to the watch list |
+| `/remove <username>` | Remove a user |
+| `/list` | List all watched users |
+| `/status` | Show monitor status |
+| `/mode <incremental\|full>` | Switch scan mode |
+| `/nsfw <sfw_only\|nsfw_only\|both>` | Switch NSFW filter |
+| `/cleanup [days]` | Clean cached images older than N days |
+| `/scan` | Trigger an immediate incremental scan |
+| `/backfill <username>` | Run a full backfill |
+| `/help` | Show all commands |
+
+### Run with systemd
+
+```bash
+# Install the service
+sudo tee /etc/systemd/system/civitai-bot.service <<'SVC'
+[Unit]
+Description=Civitai Monitor Admin Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/civitai-monitor
+ExecStart=/usr/bin/python3 /root/civitai-monitor/civitai-bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now civitai-bot
+```
+
+---
+
 ## File Structure
 
 ```
 civitai-monitor/
 ├── monitor.py              # Main script (incremental + full backfill)
+├── civitai-bot.py          # Admin Bot (optional — manage via Telegram)
 ├── config.yaml.example     # Configuration template (all placeholders)
 ├── requirements.txt        # Python dependencies
 ├── LICENSE                 # MIT

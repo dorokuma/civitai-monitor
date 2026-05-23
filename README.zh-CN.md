@@ -117,11 +117,55 @@ NSFW 图片可直接从 CDN 下载，无需登录认证。
 
 ---
 
+## 管理 Bot（可选）
+
+运行一个 24/7 的 Telegram Bot，通过聊天命令管理监控：
+
+| 命令 | 说明 |
+|------|------|
+| `/add <用户名>` | 增加监控对象 |
+| `/remove <用户名>` | 移除监控对象 |
+| `/list` | 查看监控列表 |
+| `/status` | 查看运行状态 |
+| `/mode <incremental\|full>` | 切换运行模式 |
+| `/nsfw <sfw_only\|nsfw_only\|both>` | 切换 NSFW 过滤 |
+| `/cleanup [天数]` | 清理 N 天前的缓存 |
+| `/scan` | 立即执行一次增量扫描 |
+| `/backfill <用户名>` | 全量回填某个用户 |
+| `/help` | 显示所有命令 |
+
+### systemd 部署
+
+```bash
+sudo tee /etc/systemd/system/civitai-bot.service <<'SVC'
+[Unit]
+Description=Civitai Monitor Admin Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/civitai-monitor
+ExecStart=/usr/bin/python3 /root/civitai-monitor/civitai-bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now civitai-bot
+```
+
+---
+
 ## 文件结构
 
 ```
 civitai-monitor/
 ├── monitor.py              # 主脚本（支持增量 + 全量回填）
+├── civitai-bot.py          # 管理 Bot（可选 — 通过 TG 管理监控）
 ├── config.yaml.example     # 配置模板（全部占位符）
 ├── requirements.txt        # Python 依赖
 ├── LICENSE                 # MIT 许可证
