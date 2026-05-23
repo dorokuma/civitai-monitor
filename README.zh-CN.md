@@ -12,11 +12,12 @@
 - 🔍 调用 Civitai 公开 API（无需 API Key）
 - 👥 多用户监控 — 可同时监控任意数量的创作者
 - 🖼 自动下载**最高分辨率原图**（自动将 `width=*` 替换为 `width=original`）
+- 🎥 **视频支持** — 下载并推送视频作品（流式下载，大小限制）
 - 🤖 通过 Telegram Bot API 直接推送
 - 🔀 **两种运行模式**：增量模式（适合定时任务）和全量回填模式
 - 🚦 **NSFW 过滤**：仅 SFW、仅 NSFW、或全部拉取
-- 💾 去重机制（`seen_ids.json`）— 不会重复处理已见过的图片
-- 🛡 优雅的错误处理，自动重试 + 指数退避
+- 💾 去重机制（`seen_ids.json`）— 不会重复处理已见的作品
+- 🛡 **增强健壮性**：tenacity 自动重试 + pydantic 配置校验 + FileLock 并发安全
 
 ---
 
@@ -81,8 +82,11 @@ python3 monitor.py
 | `users` | 要监控的 Civitai 用户名列表 |
 | `mode` | `incremental`（增量，默认）或 `full`（全量回填） |
 | `nsfw` | `sfw_only`（仅非敏感）、`nsfw_only`（仅敏感）、`both`（全部，默认） |
+| `video_enabled` | 是否下载视频（`true` / `false`） |
+| `max_video_size_mb` | 视频文件大小上限（默认 500 MB） |
 | `api` | API 地址、每页数量 |
 | `download` | 下载目录、URL 尺寸后缀、缓存保留天数 |
+| `http` | User-Agent、Referer、额外请求头 |
 | `telegram` | **必填** — Bot Token 和频道/群组 Chat ID |
 | `data` | `seen_ids.json` 及运行时数据路径 |
 

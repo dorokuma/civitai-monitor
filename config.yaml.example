@@ -12,7 +12,6 @@
 # ---------------------------------------------------------------------------
 # User(s) to monitor
 # ---------------------------------------------------------------------------
-# List of Civitai usernames whose galleries will be polled for new images.
 users:
   - name: "YOUR_TARGET_USERNAME_1"
   # - name: "YOUR_TARGET_USERNAME_2"
@@ -29,49 +28,47 @@ mode: "incremental"
 # ---------------------------------------------------------------------------
 #   sfw_only:  only safe-for-work images
 #   nsfw_only: only NSFW images
-#   both:      pull both SFW and NSFW (recommended — note: API returns SFW
-#              by default when no nsfw param is given, so "both" makes two
-#              separate API calls per poll)
+#   both:      pull both SFW and NSFW (recommended)
 nsfw: "both"
+
+# ---------------------------------------------------------------------------
+# Video support
+# ---------------------------------------------------------------------------
+# Enable downloading and pushing of video posts (type: "video").
+video_enabled: true
+
+# Maximum video file size in MB. Videos exceeding this are skipped.
+max_video_size_mb: 500
 
 # ---------------------------------------------------------------------------
 # Civitai API settings
 # ---------------------------------------------------------------------------
 api:
-  # Base URL for the Civitai REST API (public, no key required).
   base_url: "https://civitai.com/api/v1"
-
-  # Images to fetch per page.  Max recommended: 100.
-  # For incremental mode: lower = faster polls (e.g. 20).
-  # For full mode:        higher = fewer pages (e.g. 100).
   images_per_page: 100
 
 # ---------------------------------------------------------------------------
 # Download settings
 # ---------------------------------------------------------------------------
 download:
-  # Directory (relative to data_dir) where downloaded originals are cached.
   output_dir: "downloads"
-
-  # URL size-suffixes to replace with "width=original".
-  # Civitai CDN returns preview URLs like ".../width=1024/...";
-  # the script replaces these to fetch the full-resolution original.
   size_suffixes:
     - "/width=1024/"
     - "/width=450/"
     - "/width=640/"
-
-  # Auto-clean cached images older than this many days.
-  # Set to 0 to disable cleanup (not recommended — downloads will grow
-  # unbounded).  Default: 7.
   keep_days: 7
 
 # ---------------------------------------------------------------------------
-# Telegram Bot (required — script will not run without these)
+# HTTP settings
 # ---------------------------------------------------------------------------
-# Create a bot via @BotFather on Telegram and paste the token here.
-# To find your chat/channel ID, forward a message from the destination
-# to @userinfobot or look it up in the URL of a public group.
+http:
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+  referer: "https://civitai.com"
+  extra_headers: {}
+
+# ---------------------------------------------------------------------------
+# Telegram Bot (required)
+# ---------------------------------------------------------------------------
 telegram:
   bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
   chat_id: "YOUR_TELEGRAM_CHAT_ID"
@@ -80,9 +77,5 @@ telegram:
 # Data persistence
 # ---------------------------------------------------------------------------
 data:
-  # Directory for seen_ids.json and downloads/.  Defaults to the script's
-  # own directory if left empty.
   data_dir: ""
-
-  # File that tracks already-processed image IDs (auto-generated).
   seen_ids_file: "seen_ids.json"

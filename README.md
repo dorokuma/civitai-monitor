@@ -17,11 +17,12 @@ full-resolution originals and push them to a Telegram channel via the Bot API.
 - 🔍 Polls Civitai public API (no API key required)
 - 👥 Multi-user monitoring — watch any number of creators
 - 🖼 Auto-downloads **full-resolution originals** (replaces `width=*` with `width=original`)
+- 🎥 **Video support** — downloads and pushes video posts (streaming, size-limited)
 - 🤖 Pushes directly to Telegram via Bot API
 - 🔀 **Two operation modes**: incremental (cron-friendly) or full backfill
 - 🚦 **NSFW filter**: sfw-only, nsfw-only, or both
-- 💾 Deduplication via `seen_ids.json` — never re-processes known images
-- 🛡 Graceful error handling with retries and back-off
+- 💾 Deduplication via `seen_ids.json` — never re-processes known items
+- 🛡 Graceful error handling: **tenacity** retry (exponential back-off) + **pydantic** config validation + **FileLock** crash-safe persistence
 
 ---
 
@@ -88,8 +89,11 @@ descriptive comments.  Key sections:
 | `users` | List of Civitai usernames to monitor |
 | `mode` | `incremental` (default) or `full` (backfill) |
 | `nsfw` | `sfw_only`, `nsfw_only`, or `both` (default) |
+| `video_enabled` | Download video posts (`true` / `false`) |
+| `max_video_size_mb` | Max video file size (default: 500 MB) |
 | `api` | API base URL, page size |
 | `download` | Output directory, URL size-suffix replacements, cache retention |
+| `http` | User-Agent, Referer, extra headers |
 | `telegram` | **Required** — bot token and chat/channel ID |
 | `data` | Paths for `seen_ids.json` and runtime data |
 
