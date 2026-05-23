@@ -468,12 +468,22 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Stats
     seen_count = 0
-    if SEEN_PATH.exists():
-        try:
-            seen_data = json.loads(SEEN_PATH.read_text())
-            seen_count = len(seen_data) if isinstance(seen_data, list) else 0
-        except Exception:
-            pass
+    mtime = ""
+    seen_dir = SCRIPT_DIR / "seen_ids"
+    if seen_dir.exists():
+        latest_mtime = 0
+        for f in seen_dir.iterdir():
+            if f.suffix == ".json":
+                try:
+                    data = json.loads(f.read_text())
+                    seen_count += len(data) if isinstance(data, list) else 0
+                    if f.stat().st_mtime > latest_mtime:
+                        latest_mtime = f.stat().st_mtime
+                except Exception:
+                    pass
+        if latest_mtime:
+            mt = datetime.fromtimestamp(latest_mtime, tz=timezone.utc)
+            mtime = mt.strftime("%Y-%m-%d %H:%M UTC")
 
     download_count = 0
     download_size = 0
@@ -482,12 +492,6 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         download_size = sum(f.stat().st_size for f in DOWNLOAD_DIR.iterdir() if f.is_file())
 
     size_str = _human_size(download_size)
-
-    # Last seen_ids update
-    mtime = ""
-    if SEEN_PATH.exists():
-        mt = datetime.fromtimestamp(SEEN_PATH.stat().st_mtime, tz=timezone.utc)
-        mtime = mt.strftime("%Y-%m-%d %H:%M UTC")
 
     lines = [
         f"👥 *监控用户:* {len(users)} 个 — {' '.join('@' + u for u in users) if users else '无'}",
