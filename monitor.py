@@ -95,7 +95,7 @@ class MonitorConfig(BaseModel):
     data: DataConfig = Field(default_factory=DataConfig)
     http: HttpConfig = Field(default_factory=HttpConfig)
     video_enabled: bool = True
-    max_video_size_mb: int = 500
+    max_video_size_mb: int = 1024
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +340,7 @@ def send_to_telegram(
 
 
 def _send_telegram_video(api_base: str, chat_id: str, text: str, video_path: Path) -> bool:
+    """Send a video to Telegram. Falls back to text on error (Telegram caps at 50 MB)."""
     try:
         with open(video_path, "rb") as f:
             resp = requests.post(
@@ -426,6 +427,7 @@ def process_and_push(
         video_enabled
         and (
             item.get("type") == "video"
+            or str(item.get("url", "")).lower().endswith((".mp4", ".webm", ".mov"))
             or "video" in str(item.get("url", "")).lower()
         )
     )
