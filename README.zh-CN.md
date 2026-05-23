@@ -82,7 +82,7 @@ python3 monitor.py
 | `mode` | `incremental`（增量，默认）或 `full`（全量回填） |
 | `nsfw` | `sfw_only`（仅非敏感）、`nsfw_only`（仅敏感）、`both`（全部，默认） |
 | `api` | API 地址、每页数量 |
-| `download` | 下载目录、URL 尺寸后缀替换规则 |
+| `download` | 下载目录、URL 尺寸后缀、缓存保留天数 |
 | `telegram` | **必填** — Bot Token 和频道/群组 Chat ID |
 | `data` | `seen_ids.json` 及运行时数据路径 |
 

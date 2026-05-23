@@ -521,6 +521,18 @@ def main() -> None:
     if consolidated_seen:
         save_seen_ids(seen_file, consolidated_seen)
 
+    # -- Cleanup old cached images --
+    keep_days = cfg.get("download", {}).get("keep_days", 7)
+    if keep_days > 0 and output_dir.exists():
+        cutoff = time.time() - keep_days * 86400
+        removed = 0
+        for f in output_dir.iterdir():
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+                removed += 1
+        if removed:
+            log.info("Cleaned %d cached images older than %d days", removed, keep_days)
+
     if mode == "full":
         total_new = len(consolidated_seen - seen_ids)
         log.info("=" * 50)

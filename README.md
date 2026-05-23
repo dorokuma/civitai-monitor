@@ -89,7 +89,7 @@ descriptive comments.  Key sections:
 | `mode` | `incremental` (default) or `full` (backfill) |
 | `nsfw` | `sfw_only`, `nsfw_only`, or `both` (default) |
 | `api` | API base URL, page size |
-| `download` | Output directory, URL size-suffix replacements |
+| `download` | Output directory, URL size-suffix replacements, cache retention |
 | `telegram` | **Required** — bot token and chat/channel ID |
 | `data` | Paths for `seen_ids.json` and runtime data |
 
