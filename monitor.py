@@ -527,6 +527,7 @@ def run_full(
     username: str,
     *,
     seen_ids: set[int],
+    seen_file: Path,
     nsfw_setting: str,
     output_dir: Path,
     size_suffixes: list[str],
@@ -586,7 +587,7 @@ def run_full(
 
             # Save progress periodically
             if page % 10 == 0:
-                save_seen_ids(seen_file := Path(cfg.data.seen_ids_file), all_seen)  # noqa: PLW2901
+                save_seen_ids(seen_file, all_seen)
 
             page += 1
             time.sleep(0.5)
@@ -661,6 +662,7 @@ def main() -> None:
             user_seen = run_full(
                 username,
                 seen_ids=seen_ids,
+                seen_file=seen_file,
                 nsfw_setting=cfg.nsfw,
                 output_dir=output_dir,
                 size_suffixes=cfg.download.size_suffixes,
