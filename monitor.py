@@ -682,12 +682,12 @@ def main() -> None:
                 nsfw_setting=cfg.nsfw,
                 output_dir=output_dir,
                 size_suffixes=cfg.download.size_suffixes,
-                bot_token=bot_token,
-                chat_id=chat_id,
-                base_url=base_url,
-                limit=limit,
-                video_enabled=video_enabled,
-                max_video_size_mb=max_video_size_mb,
+                bot_token=cfg.telegram.bot_token,
+                chat_id=cfg.telegram.chat_id,
+                base_url=cfg.api.base_url,
+                limit=cfg.api.images_per_page,
+                video_enabled=cfg.video_enabled,
+                max_video_size_mb=cfg.max_video_size_mb,
             )
 
         consolidated_seen.update(user_seen)
