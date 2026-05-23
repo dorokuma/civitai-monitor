@@ -341,37 +341,43 @@ async def cmd_remove_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -
     await query.answer()
     data = query.data
 
-    # Close
-    if data == "rem_cl":
-        await query.edit_text("🔒 已关闭")
-        return
-
-    # Pagination
-    if data.startswith("rem_pg:"):
-        page = int(data.split(":", 1)[1])
-        cfg = read_config()
-        users = get_users(cfg)
-        await _render_remove_page(query, users, page)
-        return
-
-    # Remove user
-    if data.startswith("rem:"):
-        username = data.split(":", 1)[1]
-        cfg = read_config()
-        users = get_users(cfg)
-        if username not in users:
-            await query.edit_text(f"👤 @{username} 已不在监控列表中")
+    try:
+        # Close — remove keyboard to avoid repeat clicks
+        if data == "rem_cl":
+            await query.edit_text("🔒 已关闭", reply_markup=None)
             return
-        users.remove(username)
-        cfg = set_users(cfg, users)
-        write_config(cfg)
 
-        if users:
-            await query.edit_text(f"✅ 已取消关注 @{username}")
-            # Send updated list
-            await _show_remove_list(query.message, page=0)
-        else:
-            await query.edit_text(f"✅ 已取消关注 @{username}\n📭 监控列表已清空")
+        # Pagination
+        if data.startswith("rem_pg:"):
+            page = int(data.split(":", 1)[1])
+            cfg = read_config()
+            users = get_users(cfg)
+            await _render_remove_page(query, users, page)
+            return
+
+        # Remove user
+        if data.startswith("rem:"):
+            username = data.split(":", 1)[1]
+            cfg = read_config()
+            users = get_users(cfg)
+            if username not in users:
+                await query.edit_text(f"👤 @{username} 已不在监控列表中", reply_markup=None)
+                return
+            users.remove(username)
+            cfg = set_users(cfg, users)
+            write_config(cfg)
+
+            if users:
+                await query.edit_text(f"✅ 已取消关注 @{username}", reply_markup=None)
+                await _show_remove_list(query.message, page=0)
+            else:
+                await query.edit_text(f"✅ 已取消关注 @{username}\n📭 监控列表已清空", reply_markup=None)
+    except Exception as e:
+        log.error("Remove callback error: %s", e)
+        try:
+            await query.edit_text(f"❌ 操作失败，请重试 /remove", reply_markup=None)
+        except Exception:
+            pass
 
 
 async def _render_remove_page(query, users: list[str], page: int) -> None:
