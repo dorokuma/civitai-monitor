@@ -1,5 +1,9 @@
 # Civitai Monitor
 
+<p align="center">
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">中文</a>
+</p>
+
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -94,6 +98,8 @@ civitai-monitor/
 ├── config.yaml.example     # Configuration template (all placeholders)
 ├── requirements.txt        # Python dependencies
 ├── LICENSE                 # MIT
+├── README.md               # English
+├── README.zh-CN.md         # 中文
 ├── .gitignore
 ├── config.yaml             # ⚠ Created from template — never committed
 ├── seen_ids.json           # Auto-generated — processed image IDs
