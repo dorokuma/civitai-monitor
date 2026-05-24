@@ -189,7 +189,10 @@ def validate_username_exists(username: str) -> tuple[bool, str]:
             if not nsfw_flag and api_name != "civitai.com":
                 continue  # SFW only needed from civitai.com
             try:
-                params: dict = {"username": username, "limit": 5, "sort": "Newest"}
+                # NOTE: some users return 0 items with sort=Newest (Civitai API bug),
+                # so we omit sort entirely and use the API default (Most Reactions).
+                # The goal here is just to verify the user HAS public content.
+                params: dict = {"username": username, "limit": 5}
                 if nsfw_flag:
                     params["nsfw"] = "true"
                     params["browsingLevel"] = 8

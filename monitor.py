@@ -204,23 +204,27 @@ def nsfw_tracks(nsfw_setting: str) -> list[bool | None]:
 
 def fetch_page(
     username: str,
-    *,
     base_url: str = "https://civitai.com/api/v1",
     limit: int = 100,
     page: int = 1,
     nsfw: bool | None = None,
+    sort: str | None = "Newest",
 ) -> list[dict[str, Any]]:
     """Fetch one page of images for a user.
 
     Args:
         nsfw: None → API default | False → SFW | True → NSFW
+        sort: Sort order. Default "Newest". Pass None for API default (Most Reactions).
+              Falls back to None automatically when "Newest" returns 0 items
+              (some users have a Civitai API bug where Newest sort returns empty).
     """
     params: dict[str, Any] = {
         "username": username,
-        "sort": "Newest",
         "limit": limit,
         "page": page,
     }
+    if sort is not None:
+        params["sort"] = sort
     if nsfw is not None:
         params["nsfw"] = "true" if nsfw else "false"
     # NSFW content requires civitai.red + browsingLevel + cookies
@@ -233,7 +237,23 @@ def fetch_page(
     try:
         resp = safe_get(f"{actual_base}/images", params=params)
         resp.raise_for_status()
-        return resp.json().get("items", [])
+        items = resp.json().get("items", [])
+
+        # Fallback: if Newest sort returns empty but user exists,
+        # retry with default sort (Civitai API bug workaround).
+        if not items and sort == "Newest":
+            log.warning(
+                "%s: sort=Newest returned 0 items for page %d (nsfw=%s), "
+                "retrying with default sort",
+                username, page, nsfw,
+            )
+            fallback_params = dict(params)
+            fallback_params.pop("sort", None)
+            fallback_resp = safe_get(f"{actual_base}/images", params=fallback_params)
+            fallback_resp.raise_for_status()
+            items = fallback_resp.json().get("items", [])
+
+        return items
     except requests.RequestException as e:
         log.warning("Page %d (nsfw=%s) failed after retries: %s", page, nsfw, e)
         return []
