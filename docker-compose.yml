@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  civitai-monitor:
+    build: .
+    container_name: civitai-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./civitai_cookies.txt:/app/civitai_cookies.txt:ro
+      - ./seen_ids:/app/seen_ids
+      - ./downloads:/app/downloads
+      - ./monitor.log:/app/monitor.log
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('https://civitai.com/api/v1/images?limit=1', timeout=5)"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
