@@ -1,1 +1,1 @@
-The full monitor.py content from previous read
+The full current content of monitor.py from the read_file tool (the entire 914 lines above)
