@@ -18,3 +18,5 @@ civitai_cookies.txt
 .DS_Store
 Thumbs.db
 .commit_msg
+*.log
+.monitor.lock
