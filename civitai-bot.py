@@ -60,6 +60,24 @@ CONFIG_PATH = SCRIPT_DIR / "config.yaml"
 DOWNLOAD_DIR = SCRIPT_DIR / "downloads"
 MONITOR_SCRIPT = SCRIPT_DIR / "monitor.py"
 
+# Scan interval config file
+INTERVAL_CONFIG = SCRIPT_DIR / "interval.json"
+
+
+def _load_interval() -> int:
+    """Load interval from file, default 600s (10 min)."""
+    try:
+        return json.loads(INTERVAL_CONFIG.read_text()).get("seconds", 600)
+    except Exception:
+        return 600
+
+
+def _save_interval(seconds: int) -> None:
+    INTERVAL_CONFIG.write_text(json.dumps({"seconds": seconds}))
+
+
+_scan_interval: int = 600
+
 # Authorised user — resolved from config at startup
 AUTHORIZED_USER_IDS: set[int] = set()
 
@@ -626,6 +644,30 @@ async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"❌ Error: {e}")
 
 
+async def cmd_interval(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set scan interval in minutes."""
+    if not await _check_auth(update):
+        return
+    args = update.message.text.strip().split(maxsplit=1)
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: `/interval <minutes>`  e.g. `/interval 30`", parse_mode="Markdown"
+        )
+        return
+    try:
+        minutes = int(args[1])
+        if minutes < 1 or minutes > 1440:
+            await update.message.reply_text("Interval must be between 1 and 1440 minutes.")
+            return
+        global _scan_interval
+        seconds = minutes * 60
+        _scan_interval = seconds
+        _save_interval(seconds)
+        await update.message.reply_text(f"✅ Scan interval set to {minutes} minutes.")
+    except ValueError:
+        await update.message.reply_text("Invalid number. Usage: `/interval <minutes>`", parse_mode="Markdown")
+
+
 async def cmd_backfill(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _check_auth(update):
         return
@@ -808,7 +850,7 @@ async def scheduled_scan_cron() -> None:
                 log.warning("Scheduled scan failed (exit %d)", proc.returncode)
         except Exception as e:
             log.error("Scheduled scan error: %s", e)
-        await asyncio.sleep(600)
+        await asyncio.sleep(_scan_interval)
 
 
 async def post_init(application: Application) -> None:
@@ -821,6 +863,7 @@ async def post_init(application: Application) -> None:
         BotCommand("nsfw", "切换NSFW过滤 sfw_only|nsfw_only|both"),
         BotCommand("cleanup", "清理N天前的缓存图片"),
         BotCommand("scan", "立即执行一次增量扫描"),
+        BotCommand("interval", "设置扫描间隔（分钟）"),
         BotCommand("backfill", "全量回填某个用户的作品"),
         BotCommand("help", "显示所有命令说明"),
     ]
@@ -828,7 +871,7 @@ async def post_init(application: Application) -> None:
     # Start periodic scan as background task (PTBUserWarning is harmless)
     loop = asyncio.get_event_loop()
     loop.create_task(scheduled_scan_cron())
-    log.info("Slash commands registered. Scheduled scan every 10min. Ready.")
+    log.info(f"Slash commands registered. Scheduled scan every {_scan_interval//60}min. Ready.")
 
 
 # ---------------------------------------------------------------------------
@@ -839,6 +882,8 @@ async def post_init(application: Application) -> None:
 def main() -> None:
     global AUTHORIZED_USER_IDS
     cfg = read_config()
+    global _scan_interval
+    _scan_interval = _load_interval()
     token = cfg.telegram.bot_token or os.environ.get("CIVITAI_BOT_TOKEN", "")
     if not token or token == "UNSET":
         log.error("telegram.bot_token not found in config.yaml")
@@ -884,6 +929,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cleanup", cmd_cleanup))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("backfill", cmd_backfill))
+    app.add_handler(CommandHandler("interval", cmd_interval))
 
     # Button callbacks
     app.add_handler(CallbackQueryHandler(cmd_remove_callback, pattern="^rem"))
