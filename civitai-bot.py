@@ -889,7 +889,7 @@ def _read_scan_status(target: str = "") -> str:
                     names_str = "\u3001".join(f"@{n}" for n in ahead_names)
                     lines.append(f"@{target} 前面还有 {ahead} 个（{names_str}）")
                 elif ahead == 0:
-                    lines.append(f"?? @{target} 就是下一个！")
+                    lines.append(f"→ @{target} 就是下一个！")
                 elif ahead < 0:
                     lines.append(f"?? @{target} 已经处理过了，可以直接用 /backfill")
             except (ValueError, Exception):
