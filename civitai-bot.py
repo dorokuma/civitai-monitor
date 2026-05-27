@@ -800,10 +800,8 @@ async def scheduled_scan_cron() -> None:
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, str(MONITOR_SCRIPT),
                 cwd=str(SCRIPT_DIR),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
+            await proc.wait()
             if proc.returncode == 0:
                 log.info("Scheduled scan completed")
             else:
