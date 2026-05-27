@@ -739,7 +739,7 @@ def run_full(
     for nsfw_flag in tracks:
         label = "NSFW" if nsfw_flag else "SFW"
         log.info("── %s track for @%s ──", label, username)
-        cursor = ""
+        cursor = 
         page = 0
 
         while True:
