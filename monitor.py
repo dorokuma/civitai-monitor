@@ -648,7 +648,7 @@ def run_incremental(
     cron fires again before processing completes.
     Returns the set of all image IDs seen on the latest page(s).
     """
-    all_seen: set[int] = set()
+    all_seen: set[int] = set(seen_ids)
     tracks = nsfw_tracks(nsfw_setting)
 
     for nsfw_flag in tracks:
