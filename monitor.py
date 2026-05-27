@@ -790,7 +790,10 @@ def main() -> None:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (BlockingIOError, OSError):
         log.warning("Another monitor process is already running - skipping this cron tick")
-        os.close(lock_fd)
+        try:
+            os.close(lock_fd)
+        except Exception:
+            pass
         sys.exit(0)
 
     parser = argparse.ArgumentParser(description="Civitai Monitor — civitai.com user gallery monitor")

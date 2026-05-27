@@ -57,7 +57,6 @@ log = logging.getLogger("civitai-bot")
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 CONFIG_PATH = SCRIPT_DIR / "config.yaml"
-SEEN_PATH = SCRIPT_DIR / "seen_ids.json"
 DOWNLOAD_DIR = SCRIPT_DIR / "downloads"
 MONITOR_SCRIPT = SCRIPT_DIR / "monitor.py"
 
