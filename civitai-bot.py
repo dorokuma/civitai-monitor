@@ -942,6 +942,7 @@ def _summarise_log(stderr: str) -> str:
 
 async def scheduled_scan_cron() -> None:
     """Run monitor.py every 10 minutes as background task."""
+    proc = None
     while not _shutdown_requested:
         try:
             log.info("Scheduled scan starting...")
@@ -950,6 +951,8 @@ async def scheduled_scan_cron() -> None:
                 cwd=str(SCRIPT_DIR),
             )
             await proc.wait()
+            if _shutdown_requested:
+                break
             if proc.returncode == 0:
                 log.info("Scheduled scan completed")
             else:
@@ -960,8 +963,19 @@ async def scheduled_scan_cron() -> None:
             break
         await asyncio.sleep(_scan_interval)
 
+    # Graceful shutdown: give the subprocess up to 30s to save and exit
+    if proc is not None and proc.returncode is None:
+        log.info("Shutdown: stopping current scan...")
+        proc.terminate()  # SIGTERM -> monitor.py saves current page
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=30)
+            log.info("Shutdown: scan exited cleanly (exit %d)", proc.returncode)
+        except asyncio.TimeoutError:
+            log.warning("Shutdown: scan did not exit in 30s, sending SIGKILL")
+            proc.kill()
+            await proc.wait()
+
     log.info("Scheduled scan stopped. All good, shutting down...")
-    # Force exit since run_polling is still blocking
     import os as _os
     _os._exit(0)
 
