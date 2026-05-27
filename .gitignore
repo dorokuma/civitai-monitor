@@ -20,3 +20,4 @@ Thumbs.db
 .commit_msg
 *.log
 .monitor.lock
+*.bak
