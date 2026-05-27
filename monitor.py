@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import os
@@ -777,6 +778,15 @@ def cleanup_old_caches(output_dir: Path, keep_days: int) -> int:
 
 
 def main() -> None:
+    # Process lock: prevent concurrent cron runs
+    lock_file = SCRIPT_DIR / ".monitor.lock"
+    try:
+        lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        log.warning("Another monitor process is already running - skipping this cron tick")
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(description="Civitai Monitor — civitai.com user gallery monitor")
     parser.add_argument("--config", type=str, help="Path to config.yaml (default: auto-search)")
     parser.add_argument("--mode", type=str, choices=["incremental", "full"], help="Override scan mode")

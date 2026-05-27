@@ -481,8 +481,10 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 except Exception:
                     pass
         if latest_mtime:
+            from zoneinfo import ZoneInfo
             mt = datetime.fromtimestamp(latest_mtime, tz=timezone.utc)
-            mtime = mt.strftime("%Y-%m-%d %H:%M UTC")
+            bj = mt.astimezone(ZoneInfo("Asia/Shanghai"))
+            mtime = bj.strftime("%Y-%m-%d %H:%M")
 
     download_count = 0
     download_size = 0
@@ -493,13 +495,11 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     size_str = _human_size(download_size)
 
     lines = [
-        f"👥 *监控用户:* {len(users)} 人",
-        f"⚙️  *模式:* {mode} · *NSFW:* {nsfw} · *图片保留:* {keep_days}天",
+        f"👥 监控 · {len(users)} 人",
         "",
-        f"🎥 *视频:* {'开启' if video else '关闭'} · 上限 {max_video}MB",
+        f"💾 缓存 · {size_str}",
         "",
-        f"💾 *缓存:* {download_count} 张图片 ({size_str})",
-        f"📋 *已处理:* {seen_count} 个ID · 最近更新: {mtime}",
+        f"🕐 更新 · {mtime}",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
