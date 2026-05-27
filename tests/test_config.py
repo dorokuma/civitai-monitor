@@ -32,19 +32,51 @@ def test_config_from_yaml():
         Path(temp_path).unlink()
 
 def test_download_workers_bounds():
-    # Test that pydantic validator clamps workers
     test_data = {
         "mode": "incremental",
         "telegram": {"bot_token": "t", "chat_id": "c"},
         "authorized_users": [],
         "subscriptions": {},
-        "download_workers": 20  # should be clamped to 16
+        "download_workers": 20
     }
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
         yaml.dump(test_data, f)
         temp_path = f.name
     try:
         settings = Settings.from_yaml(temp_path)
-        assert settings.download_workers == 16  # clamped by validator
+        assert settings.download_workers == 16
+    finally:
+        Path(temp_path).unlink()
+
+def test_nsfw_validator():
+    test_data = {
+        "mode": "incremental",
+        "nsfw": "invalid",
+        "telegram": {"bot_token": "t", "chat_id": "c"},
+        "authorized_users": [],
+        "subscriptions": {}
+    }
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+        yaml.dump(test_data, f)
+        temp_path = f.name
+    try:
+        with pytest.raises(Exception):
+            Settings.from_yaml(temp_path)
+    finally:
+        Path(temp_path).unlink()
+
+def test_mode_validator():
+    test_data = {
+        "mode": "invalid_mode",
+        "telegram": {"bot_token": "t", "chat_id": "c"},
+        "authorized_users": [],
+        "subscriptions": {}
+    }
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+        yaml.dump(test_data, f)
+        temp_path = f.name
+    try:
+        with pytest.raises(Exception):
+            Settings.from_yaml(temp_path)
     finally:
         Path(temp_path).unlink()
