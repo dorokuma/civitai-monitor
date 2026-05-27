@@ -1,3 +1,8 @@
+# =============================================================================
+# DEPRECATED — This module is no longer used by the main application.
+# The unified config lives in monitor.py (MonitorConfig + load_config).
+# Keep this file for reference only; do NOT import from it.
+# =============================================================================
 import yaml
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings

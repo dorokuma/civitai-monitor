@@ -36,6 +36,9 @@ import yaml
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
+# Import unified config from monitor
+from monitor import MonitorConfig, load_config
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -65,40 +68,33 @@ AUTHORIZED_USER_IDS: set[int] = set()
 # ---------------------------------------------------------------------------
 
 
-def read_config() -> dict[str, Any]:
+def read_config() -> MonitorConfig:
     if not CONFIG_PATH.exists():
-        return {"users": []}
-    with open(CONFIG_PATH, encoding="utf-8") as f:
-        return dict(yaml.safe_load(f) or {})
+        # Return minimal config so bot can still respond before setup
+        return MonitorConfig(
+            telegram={"bot_token": "UNSET", "chat_id": "UNSET"},
+            subscriptions={},
+            authorized_users=[],
+        )
+    return load_config(CONFIG_PATH)
 
 
-def write_config(cfg: dict[str, Any]) -> None:
+def write_config(cfg: MonitorConfig) -> None:
+    data = cfg.model_dump(exclude_none=True)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        yaml.dump(cfg, f, default_flow_style=False, sort_keys=False, allow_unicode=True, indent=2)
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True, indent=2)
 
 
-def get_users(cfg: dict[str, Any], telegram_user_id: int) -> list[str]:
-    """Get the user watch list for a specific Telegram user."""
-    # Migrate legacy flat users list to subscriptions dict
-    if "users" in cfg and "subscriptions" not in cfg:
-        raw = cfg["users"]
-        legacy = [u.get("name", str(u)) if isinstance(u, dict) else str(u) for u in raw]
-        cfg["subscriptions"] = {str(telegram_user_id): [{"name": u} for u in legacy]}
-        del cfg["users"]
-        write_config(cfg)
-        log.info("Migrated legacy users list to subscriptions dict for %d", telegram_user_id)
-        return legacy
-
-    subs = cfg.get("subscriptions", {})
+def get_users(cfg: MonitorConfig, telegram_user_id: int) -> list[str]:
+    subs = cfg.subscriptions or {}
     raw = subs.get(str(telegram_user_id), [])
     return [u.get("name", str(u)) if isinstance(u, dict) else str(u) for u in raw]
 
 
-def set_users(cfg: dict[str, Any], telegram_user_id: int, users: list[str]) -> dict[str, Any]:
-    """Set the user watch list for a specific Telegram user."""
-    if "subscriptions" not in cfg:
-        cfg["subscriptions"] = {}
-    cfg["subscriptions"][str(telegram_user_id)] = [{"name": u} for u in users]
+def set_users(cfg: MonitorConfig, telegram_user_id: int, users: list[str]) -> MonitorConfig:
+    if not cfg.subscriptions:
+        cfg.subscriptions = {}
+    cfg.subscriptions[str(telegram_user_id)] = [{"name": u} for u in users]
     return cfg
 
 
@@ -463,11 +459,11 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     users = get_users(cfg, update.effective_user.id)
 
     # Config summary
-    mode = cfg.get("mode", "incremental")
-    nsfw = cfg.get("nsfw", "both")
-    keep_days = cfg.get("download", {}).get("keep_days", 7)
-    video = cfg.get("video_enabled", True)
-    max_video = cfg.get("max_video_size_mb", 1024)
+    mode = cfg.mode
+    nsfw = cfg.nsfw
+    keep_days = cfg.download.keep_days
+    video = cfg.video_enabled
+    max_video = cfg.max_video_size_mb
 
     # Stats
     seen_count = 0
@@ -520,7 +516,7 @@ async def cmd_mode(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Invalid mode. Choose `incremental` or `full`.", parse_mode="Markdown")
         return
     cfg = read_config()
-    cfg["mode"] = mode
+    cfg.mode = mode
     write_config(cfg)
     await update.message.reply_text(f"✅ Mode set to `{mode}`.", parse_mode="Markdown")
 
@@ -539,7 +535,7 @@ async def cmd_nsfw(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Invalid. Choose `sfw_only`, `nsfw_only`, or `both`.", parse_mode="Markdown")
         return
     cfg = read_config()
-    cfg["nsfw"] = val
+    cfg.nsfw = val
     write_config(cfg)
     await update.message.reply_text(f"✅ NSFW filter set to `{val}`.", parse_mode="Markdown")
 
@@ -686,29 +682,14 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
             username = data.split(":", 1)[1]
             await query.edit_message_text(f"⏳ 正在全量回填 @{username}...\n这可能需要一段时间，完成后会通知你", reply_markup=None)
 
-            # Save original config state before temporary override
-            cfg = read_config()
-            orig_mode = cfg.get("mode", "incremental")
-            orig_subs = cfg.get("subscriptions", {}).copy()
-            cfg["mode"] = "full"
-            # Set a single-user flat users list for the backfill run
-            cfg["users"] = [{"name": username}]
-            write_config(cfg)
-
             try:
                 result = subprocess.run(
-                    [sys.executable, str(MONITOR_SCRIPT)],
+                    [sys.executable, str(MONITOR_SCRIPT), "--mode", "full", "--user", username],
                     capture_output=True, text=True, timeout=7200, cwd=str(SCRIPT_DIR),
                 )
-                # Restore original config
-                current_cfg = read_config()
-                current_cfg["mode"] = orig_mode
-                current_cfg["subscriptions"] = orig_subs
-                current_cfg.pop("users", None)  # Remove temp flat users list
-                write_config(current_cfg)
 
                 if result.returncode != 0:
-                    await query.message.reply_text(f"❌ 回填 @{username} 失败（exit {result.returncode}），配置已恢复")
+                    await query.message.reply_text(f"❌ 回填 @{username} 失败（exit {result.returncode}）\n{result.stderr[:500]}")
                     return
 
                 summary = _summarise_log(result.stderr)
@@ -717,19 +698,9 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
                     parse_mode="Markdown",
                 )
             except subprocess.TimeoutExpired:
-                cfg = read_config()
-                cfg["mode"] = orig_mode
-                cfg["subscriptions"] = orig_subs
-                cfg.pop("users", None)
-                write_config(cfg)
-                await query.message.reply_text("⏱ 回填超时（2小时），配置已恢复")
+                await query.message.reply_text("⏱ 回填超时（2小时）")
             except Exception as e:
-                cfg = read_config()
-                cfg["mode"] = orig_mode
-                cfg["subscriptions"] = orig_subs
-                cfg.pop("users", None)
-                write_config(cfg)
-                await query.message.reply_text(f"❌ 回填出错: {e}，配置已恢复")
+                await query.message.reply_text(f"❌ 回填出错: {e}")
     except Exception as e:
         log.error("Backfill callback error: %s", e)
 
@@ -833,16 +804,16 @@ async def post_init(application: Application) -> None:
 def main() -> None:
     global AUTHORIZED_USER_IDS
     cfg = read_config()
-    token = cfg.get("telegram", {}).get("bot_token", "") or os.environ.get("CIVITAI_BOT_TOKEN", "")
-    if not token:
+    token = cfg.telegram.bot_token or os.environ.get("CIVITAI_BOT_TOKEN", "")
+    if not token or token == "UNSET":
         log.error("telegram.bot_token not found in config.yaml")
         sys.exit(1)
 
     # Resolve authorised users from config
-    raw_ids = cfg.get("authorized_users", [])
+    raw_ids = cfg.authorized_users or []
     if not raw_ids:
         # Fallback to telegram.chat_id for backward compatibility
-        fallback = cfg.get("telegram", {}).get("chat_id", "")
+        fallback = cfg.telegram.chat_id
         if fallback:
             try:
                 AUTHORIZED_USER_IDS = {int(fallback)}

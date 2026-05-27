@@ -19,10 +19,12 @@ Features:
 Usage:
   python3 monitor.py                          # uses config.yaml
   python3 monitor.py --config /path/to.yaml   # custom config path
+  python3 monitor.py --mode full --user xxx   # backfill single user
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -35,7 +37,7 @@ import requests
 import yaml
 from filelock import FileLock
 from pydantic import BaseModel, Field, ValidationError
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, wait_random, retry_if_exception_type
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -89,6 +91,7 @@ class DataConfig(BaseModel):
 class MonitorConfig(BaseModel):
     users: list = Field(default_factory=list)
     subscriptions: dict[str, list] = Field(default_factory=dict)
+    authorized_users: list[int] = Field(default_factory=list)
     mode: str = "incremental"
     nsfw: str = "both"
     api: ApiConfig = Field(default_factory=ApiConfig)
@@ -144,18 +147,34 @@ def init_session(http_cfg: HttpConfig) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Rate-limit error (for 429 Retry-After handling)
+# ---------------------------------------------------------------------------
+
+
+class RateLimitError(requests.RequestException):
+    """Raised when the API returns 429 Too Many Requests."""
+    def __init__(self, response: requests.Response) -> None:
+        self.retry_after = int(response.headers.get("Retry-After", 30))
+        super().__init__(f"429 Rate Limited, retry after {self.retry_after}s")
+
+
+# ---------------------------------------------------------------------------
 # Tenacity-retried GET
 # ---------------------------------------------------------------------------
 
 
 @retry(
     stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type((requests.RequestException,)),
+    wait=wait_exponential(multiplier=1, min=2, max=30) + wait_random(min=0, max=3),
+    retry=retry_if_exception_type((requests.RequestException, RateLimitError)),
     reraise=True,
 )
 def safe_get(url: str, **kwargs) -> requests.Response:
-    return session.get(url, timeout=kwargs.pop("timeout", 30), **kwargs)
+    resp = session.get(url, timeout=kwargs.pop("timeout", 30), **kwargs)
+    if resp.status_code == 429:
+        raise RateLimitError(resp)
+    resp.raise_for_status()
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +568,54 @@ def process_and_push(
 
 
 # ---------------------------------------------------------------------------
+# Single-page fetch-and-process helper (shared by incremental and full modes)
+# ---------------------------------------------------------------------------
+
+
+def _fetch_and_process_page(
+    username: str,
+    nsfw_flag: bool | None,
+    page: int,
+    seen_ids: set[int],
+    *,
+    base_url: str,
+    limit: int,
+    size_suffixes: list[str],
+    output_dir: Path,
+    bot_token: str,
+    chat_id: str,
+    video_enabled: bool,
+    max_video_size_mb: int,
+) -> tuple[list[dict], set[int]]:
+    """Fetch one page, find new items, process and push them.
+
+    Returns (new_items_processed, all_item_ids_on_page).
+    The caller is responsible for checkpoint-saving seen_ids.
+    """
+    items = fetch_page(username, base_url=base_url, limit=limit, page=page, nsfw=nsfw_flag)
+    if not items:
+        return [], set()
+
+    page_ids = {img["id"] for img in items}
+    new_on_page = [img for img in items if img["id"] not in seen_ids]
+
+    if new_on_page:
+        for img in reversed(new_on_page):
+            process_and_push(
+                img, username,
+                size_suffixes=size_suffixes,
+                output_dir=output_dir,
+                bot_token=bot_token,
+                chat_id=chat_id,
+                video_enabled=video_enabled,
+                max_video_size_mb=max_video_size_mb,
+            )
+            time.sleep(0.5)
+
+    return new_on_page, page_ids
+
+
+# ---------------------------------------------------------------------------
 # Incremental mode
 # ---------------------------------------------------------------------------
 
@@ -571,8 +638,8 @@ def run_incremental(
 ) -> set[int]:
     """Check only the latest page(s) — stop as soon as we hit a known ID.
 
-    Saves seen_ids periodically during processing to prevent duplicate
-    pushes when cron fires again before a long run completes.
+    Saves seen_ids after each track to prevent duplicate pushes when
+    cron fires again before processing completes.
     Returns the set of all image IDs seen on the latest page(s).
     """
     all_seen: set[int] = set()
@@ -580,32 +647,19 @@ def run_incremental(
 
     for nsfw_flag in tracks:
         label = "NSFW" if nsfw_flag else "SFW"
-        items = fetch_page(username, base_url=base_url, limit=limit, page=1, nsfw=nsfw_flag)
-        if not items:
+        new_on_page, page_ids = _fetch_and_process_page(
+            username, nsfw_flag, 1, seen_ids,
+            base_url=base_url, limit=limit,
+            size_suffixes=size_suffixes, output_dir=output_dir,
+            bot_token=bot_token, chat_id=chat_id,
+            video_enabled=video_enabled, max_video_size_mb=max_video_size_mb,
+        )
+        if not page_ids:
             continue
 
-        for img in items:
-            all_seen.add(img["id"])
+        all_seen.update(page_ids)
 
-        new_on_page = [img for img in items if img["id"] not in seen_ids]
         if new_on_page:
-            for i, img in enumerate(reversed(new_on_page)):
-                process_and_push(
-                    img, username,
-                    size_suffixes=size_suffixes,
-                    output_dir=output_dir,
-                    bot_token=bot_token,
-                    chat_id=chat_id,
-                    video_enabled=video_enabled,
-                    max_video_size_mb=max_video_size_mb,
-                )
-                time.sleep(0.5)
-                # Save progress every 5 items to prevent cron race
-                if (i + 1) % 5 == 0:
-                    union = seen_ids | all_seen
-                    if len(union) > len(seen_ids):
-                        save_seen_ids(seen_dir, tg_id, username, union)
-                        log.info("Checkpoint saved %d seen IDs for @%s", len(union), username)
             log.info("%s: +%d new (track: %s)", username, len(new_on_page), label)
         else:
             log.info("%s: no new (track: %s)", username, label)
@@ -615,7 +669,6 @@ def run_incremental(
             union = seen_ids | all_seen
             if len(union) > len(seen_ids):
                 save_seen_ids(seen_dir, tg_id, username, union)
-                log.info("Track-end saved %d seen IDs for @%s", len(union), username)
 
     return all_seen
 
@@ -655,9 +708,15 @@ def run_full(
         consecutive_empty = 0
 
         while True:
-            items = fetch_page(username, base_url=base_url, limit=limit, page=page, nsfw=nsfw_flag)
+            new_on_page, page_ids = _fetch_and_process_page(
+                username, nsfw_flag, page, all_seen,
+                base_url=base_url, limit=limit,
+                size_suffixes=size_suffixes, output_dir=output_dir,
+                bot_token=bot_token, chat_id=chat_id,
+                video_enabled=video_enabled, max_video_size_mb=max_video_size_mb,
+            )
 
-            if not items:
+            if not page_ids:
                 consecutive_empty += 1
                 if consecutive_empty >= 2:
                     log.info("%s: exhausted after page %d", label, page - 1)
@@ -667,26 +726,12 @@ def run_full(
                 continue
             consecutive_empty = 0
 
-            new_on_page = [img for img in items if img["id"] not in all_seen]
+            all_seen.update(page_ids)
 
             if new_on_page:
-                for img in reversed(new_on_page):
-                    process_and_push(
-                        img, username,
-                        size_suffixes=size_suffixes,
-                        output_dir=output_dir,
-                        bot_token=bot_token,
-                        chat_id=chat_id,
-                        video_enabled=video_enabled,
-                        max_video_size_mb=max_video_size_mb,
-                    )
-                    time.sleep(0.5)
                 log.info("%s page %d: +%d new", label, page, len(new_on_page))
             else:
-                log.info("%s page %d: all %d already seen", label, page, len(items))
-
-            for img in items:
-                all_seen.add(img["id"])
+                log.info("%s page %d: all %d already seen", label, page, len(page_ids))
 
             # Save progress periodically
             if page % 10 == 0:
@@ -732,8 +777,16 @@ def cleanup_old_caches(output_dir: Path, keep_days: int) -> int:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Civitai Monitor — civitai.com user gallery monitor")
+    parser.add_argument("--config", type=str, help="Path to config.yaml (default: auto-search)")
+    parser.add_argument("--mode", type=str, choices=["incremental", "full"], help="Override scan mode")
+    parser.add_argument("--user", type=str, help="Process only this Civitai username")
+    args = parser.parse_args()
+
     global cfg  # noqa: PLW0602
-    cfg = load_config()
+    cfg = load_config(Path(args.config) if args.config else None)
+    if args.mode:
+        cfg.mode = args.mode
 
     log.info("Mode: %s | NSFW: %s | Video: %s", cfg.mode, cfg.nsfw, cfg.video_enabled)
 
@@ -754,6 +807,9 @@ def main() -> None:
         tg_id_str = str(tg_id)
         for entry in user_list:
             username = entry.get("name", str(entry)) if isinstance(entry, dict) else str(entry)
+            if args.user and username != args.user:
+                log.info("Skipping @%s (--user filter active)", username)
+                continue
             log.info("=" * 50)
             log.info("Processing @%s (TG:%s, %s mode)...", username, tg_id_str, cfg.mode)
 
