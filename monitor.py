@@ -842,15 +842,17 @@ def main() -> None:
 
     # -- Write initial scan status --
     import datetime as _dt
+    _start_time = _dt.datetime.now()
+    _total_creators = sum(len(v) for v in subs.values()) if subs else 0
     STATUS_PATH.write_text(json.dumps({
         "status": "running",
-        "pid": os.getpid(),
-        "started_at": _dt.datetime.now().strftime("%H:%M:%S"),
+        "started_at": _start_time.strftime("%H:%M:%S"),
         "mode": cfg.mode,
-        "current_user": "",
-        "users_done": 0,
-        "users_total": len(cfg.subscriptions or {}),
+        "current_creator": "",
+        "creators_done": 0,
+        "creators_total": _total_creators,
         "pushed_count": 0,
+        "elapsed_seconds": 0,
     }))
 
     # -- Paths --
@@ -867,6 +869,7 @@ def main() -> None:
         sys.exit(1)
 
     pushed_count = 0
+    _creator_idx = 0
     for idx, (tg_id, user_list) in enumerate(subs.items()):
         tg_id_str = str(tg_id)
         for entry in user_list:
@@ -876,13 +879,13 @@ def main() -> None:
                 continue
             STATUS_PATH.write_text(json.dumps({
                 "status": "running",
-                "pid": os.getpid(),
-                "started_at": _dt.datetime.now().strftime("%H:%M:%S"),
+                "started_at": _start_time.strftime("%H:%M:%S"),
                 "mode": cfg.mode,
-                "current_user": username,
-                "users_done": idx + 1,
-                "users_total": len(subs),
+                "current_creator": username,
+                "creators_done": _creator_idx + 1,
+                "creators_total": _total_creators,
                 "pushed_count": pushed_count,
+                "elapsed_seconds": int((_dt.datetime.now() - _start_time).total_seconds()),
             }))
             log.info("=" * 50)
             log.info("Processing @%s (TG:%s, %s mode)...", username, tg_id_str, cfg.mode)
@@ -923,6 +926,8 @@ def main() -> None:
                     max_video_size_mb=cfg.max_video_size_mb,
                 )
 
+            _creator_idx += 1
+
             # Save per-(TG user, Civitai user) progress immediately
             if user_seen:
                 union = seen_ids | user_seen
@@ -947,8 +952,10 @@ def main() -> None:
     if removed:
         log.info("Cleaned %d cached files older than %d days", removed, cfg.download.keep_days)
 
-    # Clear status
+    # Mark complete and clear status
     try:
+        elapsed = int((_dt.datetime.now() - _start_time).total_seconds())
+        STATUS_PATH.write_text(json.dumps({"status": "completed", "elapsed_seconds": elapsed}))
         STATUS_PATH.unlink()
     except Exception:
         pass

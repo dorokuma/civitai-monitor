@@ -643,9 +643,7 @@ async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         stderr = result.stderr.strip()
         if result.returncode == 75:
             progress = _read_scan_status()
-            msg = f"⏳ 当前有定时扫描正在运行。"
-            if progress:
-                msg += "\n" + progress
+            msg = progress if progress else f"⏳ 当前有定时扫描正在运行。"
             await update.message.reply_text(msg, parse_mode="Markdown")
             return
         if result.returncode != 0:
@@ -689,6 +687,29 @@ async def cmd_interval(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"✅ Scan interval set to {minutes} minutes.")
     except ValueError:
         await update.message.reply_text("Invalid number. Usage: `/interval <minutes>`", parse_mode="Markdown")
+
+
+async def cmd_stop(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stop the current scheduled scan so you can /backfill."""
+    if not await _check_auth(update):
+        return
+    import subprocess as _sp
+    try:
+        # Find and kill the running monitor.py (not bot, not emby)
+        result = _sp.run(["pgrep", "-f", "python3.*/root/civitai-monitor/monitor.py"],
+                         capture_output=True, text=True, timeout=5)
+        pids = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
+        if not pids:
+            await update.message.reply_text("当前没有正在运行的定时扫描。")
+            return
+        for pid in pids:
+            _sp.run(["kill", pid], capture_output=True, timeout=3)
+        await update.message.reply_text(
+            f"🛑 已终止定时扫描（PID: {', '.join(pids)}）。\n"
+            f"锁已释放，你现在可以用 `/backfill` 了。"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ 终止失败: {e}")
 
 
 async def cmd_backfill(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -767,11 +788,8 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
                 )
 
                 if result.returncode == 75:
-                    progress = _read_scan_status()
-                    msg = f"⏳ 当前有定时扫描正在运行，无法同时回填。\n"
-                    if progress:
-                        msg += progress + "\n"
-                    msg += f"等定时扫描跑完后，再试一次 `/backfill` 即可。"
+                    progress = _read_scan_status(target=username)
+                    msg = progress if progress else f"⏳ 当前有定时扫描正在运行，无法同时回填。\n等扫描完成或输入 /stop 中断后重试。"
                     await query.message.reply_text(msg, parse_mode="Markdown")
                     return
                 if result.returncode != 0:
@@ -833,23 +851,59 @@ def _human_size(bytes_: int) -> str:
     return f"{bytes_:.1f}TB"
 
 
-def _read_scan_status() -> str:
-    """Read current scan status from status file."""
+def _read_scan_status(target: str = "") -> str:
+    """Read current scan status from status file.
+    If target is provided, calculate queue position.
+    """
     try:
         import json
         path = SCRIPT_DIR / "monitor_status.json"
         if not path.exists():
             return ""
         data = json.loads(path.read_text())
-        status = data.get("status", "")
-        user = data.get("current_user", "")
-        done = data.get("users_done", 0)
-        total = data.get("users_total", 0)
+        creator = data.get("current_creator", "")
+        done = data.get("creators_done", 0)
+        total = data.get("creators_total", 0)
         pushed = data.get("pushed_count", 0)
-        since = data.get("started_at", "")
-        if user:
-            return f"（当前 @{user}，已完成 {done}/{total} 个用户，已推送 {pushed} 条，始于 {since}）"
-        return ""
+        elapsed = data.get("elapsed_seconds", 0)
+        if not creator:
+            return ""
+
+        lines = [f"⏳ 定时扫描进行中"]
+        lines.append(f"当前：@{creator} \u00b7 进度 {done}/{total}")
+
+        # Calculate queue position if target is specified
+        if target:
+            try:
+                cfg_creators = []
+                for users in yaml.safe_load(open(CONFIG_PATH)).get("subscriptions", {}).values():
+                    for entry in users:
+                        u = entry.get("name", str(entry)) if isinstance(entry, dict) else str(entry)
+                        cfg_creators.append(u)
+                cur_idx = cfg_creators.index(creator)
+                tgt_idx = cfg_creators.index(target)
+                ahead = tgt_idx - cur_idx - 1
+                if ahead > 0:
+                    # List names ahead
+                    ahead_names = cfg_creators[cur_idx+1:tgt_idx]
+                    names_str = "\u3001".join(f"@{n}" for n in ahead_names)
+                    lines.append(f"@{target} 前面还有 {ahead} 个（{names_str}）")
+                elif ahead == 0:
+                    lines.append(f"?? @{target} 就是下一个！")
+                elif ahead < 0:
+                    lines.append(f"?? @{target} 已经处理过了，可以直接用 /backfill")
+            except (ValueError, Exception):
+                pass
+
+        pushed_str = f"已推送 {pushed} 条" if pushed > 0 else "尚未有新推送"
+        if elapsed >= 60:
+            lines.append(f"{pushed_str} \u00b7 已运行 {elapsed//60} 分钟")
+        else:
+            lines.append(f"{pushed_str} \u00b7 已运行 {elapsed} 秒")
+
+        lines.append("")
+        lines.append("等扫描完成或输入 /stop 中断后即可使用 /backfill")
+        return "\n".join(lines)
     except Exception:
         return ""
 
@@ -923,6 +977,7 @@ async def post_init(application: Application) -> None:
         BotCommand("cleanup", "清理N天前的缓存图片"),
         BotCommand("scan", "立即执行一次增量扫描"),
         BotCommand("interval", "设置扫描间隔（分钟）"),
+        BotCommand("stop", "终止当前定时扫描，释放锁以便回填"),
         BotCommand("backfill", "全量回填某个用户的作品"),
         BotCommand("help", "显示所有命令说明"),
     ]
@@ -987,6 +1042,7 @@ def main() -> None:
     app.add_handler(CommandHandler("nsfw", cmd_nsfw))
     app.add_handler(CommandHandler("cleanup", cmd_cleanup))
     app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("backfill", cmd_backfill))
     app.add_handler(CommandHandler("interval", cmd_interval))
 
