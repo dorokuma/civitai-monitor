@@ -19,6 +19,7 @@ Run as a systemd service for 24/7 availability.
 
 from __future__ import annotations
 
+import asyncio
 import http.cookiejar
 import json
 import logging
@@ -792,6 +793,27 @@ def _summarise_log(stderr: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+async def scheduled_scan_cron() -> None:
+    """Run monitor.py every 10 minutes as background task."""
+    while True:
+        try:
+            log.info("Scheduled scan starting...")
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, str(MONITOR_SCRIPT),
+                cwd=str(SCRIPT_DIR),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                log.info("Scheduled scan completed")
+            else:
+                log.warning("Scheduled scan failed (exit %d)", proc.returncode)
+        except Exception as e:
+            log.error("Scheduled scan error: %s", e)
+        await asyncio.sleep(600)
+
+
 async def post_init(application: Application) -> None:
     commands = [
         BotCommand("add", "增加监控对象（支持用户名/链接/@）"),
@@ -806,7 +828,10 @@ async def post_init(application: Application) -> None:
         BotCommand("help", "显示所有命令说明"),
     ]
     await application.bot.set_my_commands(commands)
-    log.info("Slash commands registered. Ready.")
+    # Start periodic scan as background task (PTBUserWarning is harmless)
+    loop = asyncio.get_event_loop()
+    loop.create_task(scheduled_scan_cron())
+    log.info("Slash commands registered. Scheduled scan every 10min. Ready.")
 
 
 # ---------------------------------------------------------------------------
