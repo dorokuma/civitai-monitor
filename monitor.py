@@ -366,19 +366,19 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
       3. If /original is 404 (video no longer available), skip
     """
     try:
-        # Step 1: follow redirect to B2
+        # Step 1: follow redirect to find the real CDN URL (don't download body)
         resp = safe_get(url, stream=True)
         resp.raise_for_status()
         b2_url = str(resp.url)
         resp.close()
 
-        # Step 2: rewrite /default → /original with retry on 5xx/transient errors
+        # Step 2: resolve the actual video content URL
         if "image-b2.civitai.com" in b2_url and b2_url.endswith("/default"):
-            orig_url = b2_url[:-8] + "/original"
+            resolved_url = b2_url[:-8] + "/original"
             log.info("B2: /default → /original")
             # Retry up to 3 times on transient errors, but not on 404
             for attempt in range(3):
-                resp = safe_get(orig_url, stream=True, timeout=120)
+                resp = safe_get(resolved_url, stream=True, timeout=120)
                 if resp.status_code == 200:
                     break
                 if resp.status_code == 404:
@@ -389,6 +389,9 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
                     time.sleep(2 ** attempt)
             resp.raise_for_status()
         else:
+            # Non-B2 CDN (e.g. civitai.red): re-fetch original URL with fresh connection
+            log.info("Non-B2 video CDN: %s...", b2_url[:80])
+            resp = safe_get(url, stream=True, timeout=120)
             resp.raise_for_status()
 
         # Check size
