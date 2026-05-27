@@ -24,7 +24,7 @@
 - 🔐 **多号授权** — `authorized_users` 列表支持多个 Telegram ID 管理 Bot
 - 🧠 **智能用户名解析** — 支持纯用户名、`@用户名`、Civitai 主页链接（`civitai.com/user/xxx`、`civitai.red/user/xxx`）——非 Civitai 域名一律拒绝
 - ✅ **用户存在性验证** — 调 Civitai API 确认用户存在且有公开作品后才添加
-- 💾 **去重机制** — 三层保存（每5个checkpoint + 每track结束 + main最终保存），防止定时任务竞态导致重复推送
+- 💾 **去重机制** — 双层保存（每track结束 + main最终保存），防止定时任务竞态导致重复推送
 - 📋 **推送审计日志** — 每次推送记录 ID、文件名、下载状态和推送结果
 - 🧹 **自动清理** — 自动删除超过 `keep_days` 天的缓存文件
 - 🗂 **交互式取消关注和回填** — 按钮选择用户，支持分页
@@ -263,6 +263,10 @@ image.civitai.com/xxx.mp4  ──301──►  B2 /default（仅封面图 JPEG �
 civitai-monitor/
 ├── monitor.py              # 主监控脚本（支持增量 + 全量回填）
 ├── civitai-bot.py          # 管理 Bot（可选 — 通过 Telegram 管理监控）
+├── config.py               # DEPRECATED — 仅作参考
+├── Dockerfile              # 容器构建（非 root 用户运行）
+├── docker-compose.yml      # Docker 编排
+├── .dockerignore           # 构建上下文排除规则
 ├── config.yaml.example     # 配置模板（全部占位符）
 ├── requirements.txt        # Python 依赖
 ├── LICENSE                 # MIT 许可证

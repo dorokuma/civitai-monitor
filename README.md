@@ -25,7 +25,7 @@ download full-resolution originals and push them to a Telegram channel via the B
 - 🔐 **Multi-user auth** — `authorized_users` list supports multiple Telegram IDs
 - 🧠 **Smart username parsing** — accepts plain usernames, `@username`, and Civitai profile URLs (`civitai.com/user/xxx`, `civitai.red/user/xxx`) — non-Civitai domains rejected
 - ✅ **User existence validation** — calls Civitai API to confirm the user has public works before adding
-- 💾 **Deduplication** — triple-layer save (checkpoint every 5 items + track-end + final) prevents cron race conditions
+- 💾 **Deduplication** — dual-layer save (track-end + final) prevents cron race conditions
 - 📋 **Push audit log** — every push is logged with ID, file, download status, and push result
 - 🧹 **Auto-cleanup** — removes cached files older than `keep_days`
 - 🗂 **Interactive remove & backfill** — button-based user selection with pagination
@@ -269,6 +269,10 @@ Each Telegram user only sees and manages their **own** subscriptions.
 civitai-monitor/
 ├── monitor.py              # Main monitor script (incremental + full backfill)
 ├── civitai-bot.py          # Admin Bot (optional — manage via Telegram)
+├── config.py               # DEPRECATED — kept for reference
+├── Dockerfile              # Container build (non-root user)
+├── docker-compose.yml      # Docker orchestration
+├── .dockerignore           # Build context exclusions
 ├── config.yaml.example     # Configuration template (all placeholders)
 ├── requirements.txt        # Python dependencies
 ├── LICENSE                 # MIT
