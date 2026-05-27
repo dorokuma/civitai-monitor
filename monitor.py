@@ -598,6 +598,7 @@ def _fetch_and_process_page(
     *,
     base_url: str,
     limit: int,
+    sort: str | None = "Newest",
     size_suffixes: list[str],
     output_dir: Path,
     bot_token: str,
@@ -610,7 +611,7 @@ def _fetch_and_process_page(
     Returns (new_items_processed, all_item_ids_on_page, next_cursor).
     The caller is responsible for checkpoint-saving seen_ids and cursor-looping.
     """
-    items, next_cursor = fetch_page(username, base_url=base_url, limit=limit, cursor=cursor, nsfw=nsfw_flag)
+    items, next_cursor = fetch_page(username, base_url=base_url, limit=limit, cursor=cursor, nsfw=nsfw_flag, sort=sort)
     if not items:
         return [], set(), next_cursor
 
@@ -671,7 +672,7 @@ def run_incremental(
             page += 1
             new_on_page, page_ids, next_cursor = _fetch_and_process_page(
                 username, nsfw_flag, cursor, all_seen,
-                base_url=base_url, limit=limit,
+                base_url=base_url, limit=limit, sort=None,
                 size_suffixes=size_suffixes, output_dir=output_dir,
                 bot_token=bot_token, chat_id=chat_id,
                 video_enabled=video_enabled, max_video_size_mb=max_video_size_mb,
