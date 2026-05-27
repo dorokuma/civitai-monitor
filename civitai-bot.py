@@ -891,7 +891,7 @@ def _read_scan_status(target: str = "") -> str:
                 elif ahead == 0:
                     lines.append(f"→ @{target} 就是下一个！")
                 elif ahead < 0:
-                    lines.append(f"?? @{target} 已经处理过了，可以直接用 /backfill")
+                    lines.append(f"✅ @{target} 已经处理过了，可以直接用 /backfill")
             except (ValueError, Exception):
                 pass
 
