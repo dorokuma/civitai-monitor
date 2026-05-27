@@ -78,6 +78,22 @@ def _save_interval(seconds: int) -> None:
 
 _scan_interval: int = 600
 
+# Graceful shutdown flag
+import signal
+_shutdown_requested = False
+
+
+def _signal_handler(signum, frame):
+    """Set shutdown flag on SIGTERM/SIGINT, let current scan finish."""
+    global _shutdown_requested
+    if _shutdown_requested:
+        return
+    _shutdown_requested = True
+    log.info("Shutdown requested (signal %d), waiting for current scan to finish...", signum)
+
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT, _signal_handler)
+
 # Authorised user — resolved from config at startup
 AUTHORIZED_USER_IDS: set[int] = set()
 
@@ -872,7 +888,7 @@ def _summarise_log(stderr: str) -> str:
 
 async def scheduled_scan_cron() -> None:
     """Run monitor.py every 10 minutes as background task."""
-    while True:
+    while not _shutdown_requested:
         try:
             log.info("Scheduled scan starting...")
             proc = await asyncio.create_subprocess_exec(
@@ -886,7 +902,14 @@ async def scheduled_scan_cron() -> None:
                 log.warning("Scheduled scan failed (exit %d)", proc.returncode)
         except Exception as e:
             log.error("Scheduled scan error: %s", e)
+        if _shutdown_requested:
+            break
         await asyncio.sleep(_scan_interval)
+
+    log.info("Scheduled scan stopped. All good, shutting down...")
+    # Force exit since run_polling is still blocking
+    import os as _os
+    _os._exit(0)
 
 
 async def post_init(application: Application) -> None:
