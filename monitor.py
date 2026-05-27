@@ -763,9 +763,8 @@ def run_full(
             else:
                 log.info("%s page %d: all %d already seen", label, page, len(page_ids))
 
-            # Save progress periodically
-            if page % 10 == 0:
-                save_seen_ids(seen_dir, tg_id, username, all_seen)
+            # Save after every page to prevent progress loss on crash
+            save_seen_ids(seen_dir, tg_id, username, all_seen)
 
             if not next_cursor:
                 log.info("%s: completed after %d pages", label, page)
