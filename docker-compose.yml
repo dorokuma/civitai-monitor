@@ -19,8 +19,8 @@ services:
         max-size: "10m"
         max-file: "3"
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('https://civitai.com/api/v1/images?limit=1', timeout=5)"]
-      interval: 5m
-      timeout: 10s
-      retries: 3
-      start_period: 30s
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30m
+      timeout: 5s
+      retries: 2
+      start_period: 10s

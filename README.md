@@ -99,6 +99,20 @@ subscriptions:
     - name: "YourTargetUser"
 ```
 
+### 2b. CLI Options
+
+```bash
+python3 monitor.py                          # uses config.yaml (auto-search)
+python3 monitor.py --config /path/to.yaml   # use a custom config file
+python3 monitor.py --mode full              # override mode (incremental/full)
+python3 monitor.py --user username          # process only one username
+python3 monitor.py --mode full --user xxx   # backfill one user's full gallery
+```
+
+The `--mode` and `--user` flags override config.yaml values for that run.
+This is especially useful when the Admin Bot triggers a backfill — it runs
+`monitor.py --mode full --user xxx` without modifying config.yaml.
+
 ### 3. Run (incremental mode — default)
 
 ```bash

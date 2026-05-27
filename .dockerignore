@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment & secrets  
+.env
+config.yaml
+civitai_cookies.txt
+
+# Runtime data (volume-mounted)
+seen_ids/
+downloads/
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore

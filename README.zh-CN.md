@@ -98,6 +98,20 @@ subscriptions:
     - name: "YourTargetUser"
 ```
 
+### 2b. 命令行参数
+
+```bash
+python3 monitor.py                          # 使用 config.yaml（自动查找）
+python3 monitor.py --config /path/to.yaml   # 指定自定义配置文件
+python3 monitor.py --mode full              # 覆盖运行模式（incremental/full）
+python3 monitor.py --user username          # 只处理指定用户名
+python3 monitor.py --mode full --user xxx   # 全量回填单个用户
+```
+
+`--mode` 和 `--user` 会临时覆盖 config.yaml 中的值，不影响配置文件本身。
+管理 Bot 触发回填时就是用 `monitor.py --mode full --user xxx` 这种方式，
+不再修改 config.yaml，安全可靠。
+
 ### 3. 增量模式运行（默认）
 
 ```bash
