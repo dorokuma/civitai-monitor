@@ -338,7 +338,10 @@ def save_seen_ids(seen_dir: Path, tg_id: str, username: str, ids: set[int]) -> N
     lock = FileLock(str(LOCK_PATH), timeout=10)
     try:
         with lock:
-            path.write_text(json.dumps(sorted(ids), indent=2))
+            # Atomic write: temp file + rename to prevent corruption on crash
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(sorted(ids), indent=2))
+            tmp.rename(path)
         log.info("Saved %d seen IDs for @%s", len(ids), username)
     except Timeout:
         log.warning("Timeout saving %d seen IDs for @%s, skipped", len(ids), username)
