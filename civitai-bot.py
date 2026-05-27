@@ -625,6 +625,9 @@ async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         stdout = result.stdout.strip()
         stderr = result.stderr.strip()
+        if result.returncode == 75:
+            await update.message.reply_text("⏳ 当前有定时扫描正在运行，扫描被跳过。稍后自动重试。", parse_mode="Markdown")
+            return
         if result.returncode != 0:
             await update.message.reply_text(
                 f"❌ Scan failed (exit {result.returncode}):\n`{stderr[-500:]}`",
@@ -743,6 +746,13 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
                     capture_output=True, text=True, timeout=7200, cwd=str(SCRIPT_DIR),
                 )
 
+                if result.returncode == 75:
+                    await query.message.reply_text(
+                        f"⏳ 当前有定时扫描正在运行，无法同时回填。\n"
+                        f"等定时扫描跑完后，再试一次 `/backfill`\即可。",
+                        parse_mode="Markdown",
+                    )
+                    return
                 if result.returncode != 0:
                     await query.message.reply_text(f"❌ 回填 @{username} 失败（exit {result.returncode}）\n{result.stderr[:500]}")
                     return
@@ -809,7 +819,7 @@ def _summarise_log(stderr: str) -> str:
     relevant = []
     for line in lines:
         lower = line.lower()
-        if any(kw in lower for kw in ("new images", "no new", "cleaned", "pushed", "new artwork", "new:", "complete", "total new", "fetched", "saved")):
+        if any(kw in lower for kw in ("new images", "no new", "cleaned", "pushed", "new artwork", "new:", "complete", "total new", "fetched", "saved", "another monitor")):
             # Strip timestamp prefix for readability
             if " [" in line:
                 line = line.split("] ", 1)[-1] if "] " in line else line

@@ -821,7 +821,7 @@ def main() -> None:
             os.close(lock_fd)
         except Exception:
             pass
-        sys.exit(0)
+        sys.exit(75)
 
     parser = argparse.ArgumentParser(description="Civitai Monitor — civitai.com user gallery monitor")
     parser.add_argument("--config", type=str, help="Path to config.yaml (default: auto-search)")
