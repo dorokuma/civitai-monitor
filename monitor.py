@@ -840,6 +840,15 @@ def main() -> None:
 
     log.info("Mode: %s | NSFW: %s | Video: %s", cfg.mode, cfg.nsfw, cfg.video_enabled)
 
+    # -- Paths --
+    data_dir = Path(cfg.data.data_dir) if cfg.data.data_dir else SCRIPT_DIR
+    output_dir = data_dir / cfg.download.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    seen_dir = data_dir / "seen_ids"
+    seen_dir.mkdir(parents=True, exist_ok=True)
+
+    # -- Per-Telegram-user processing (each TG user has independent seen_ids) --
+    subs = cfg.subscriptions or {}
     # -- Write initial scan status --
     import datetime as _dt
     _start_time = _dt.datetime.now()
@@ -855,15 +864,6 @@ def main() -> None:
         "elapsed_seconds": 0,
     }))
 
-    # -- Paths --
-    data_dir = Path(cfg.data.data_dir) if cfg.data.data_dir else SCRIPT_DIR
-    output_dir = data_dir / cfg.download.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-    seen_dir = data_dir / "seen_ids"
-    seen_dir.mkdir(parents=True, exist_ok=True)
-
-    # -- Per-Telegram-user processing (each TG user has independent seen_ids) --
-    subs = cfg.subscriptions or {}
     if not subs:
         log.error("No subscriptions configured in config.yaml")
         sys.exit(1)
