@@ -76,7 +76,17 @@ def read_config() -> MonitorConfig:
             subscriptions={},
             authorized_users=[],
         )
-    return load_config(CONFIG_PATH)
+    # Load config safely: if config is corrupted or validation fails,
+    # fall back to minimal config instead of crashing the bot process
+    try:
+        return load_config(CONFIG_PATH)
+    except SystemExit:
+        log.warning("Config validation failed, using minimal config fallback")
+        return MonitorConfig(
+            telegram={"bot_token": "UNSET", "chat_id": "UNSET"},
+            subscriptions={},
+            authorized_users=[],
+        )
 
 
 def write_config(cfg: MonitorConfig) -> None:
@@ -468,7 +478,8 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Stats
     seen_count = 0
     mtime = ""
-    seen_dir = SCRIPT_DIR / "seen_ids"
+    data_dir = Path(cfg.data.data_dir) if cfg.data.data_dir else SCRIPT_DIR
+    seen_dir = data_dir / "seen_ids"
     if seen_dir.exists():
         latest_mtime = 0
         for f in seen_dir.iterdir():

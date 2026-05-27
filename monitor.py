@@ -36,7 +36,7 @@ from typing import Any
 
 import requests
 import yaml
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from pydantic import BaseModel, Field, ValidationError
 from tenacity import retry, stop_after_attempt, wait_exponential, wait_random, retry_if_exception_type
 
@@ -214,7 +214,7 @@ def nsfw_tracks(nsfw_setting: str) -> list[bool | None]:
         "nsfw_only": [True],
         "both": [False, True],
     }
-    return mapping[nsfw_setting]
+    return mapping.get(nsfw_setting, [False, True])  # default both
 
 
 # ---------------------------------------------------------------------------
@@ -324,9 +324,12 @@ def save_seen_ids(seen_dir: Path, tg_id: str, username: str, ids: set[int]) -> N
     """Save seen IDs for a specific (Telegram user, Civitai user) pair."""
     path = seen_file_for_user(seen_dir, tg_id, username)
     lock = FileLock(str(LOCK_PATH), timeout=10)
-    with lock:
-        path.write_text(json.dumps(sorted(ids), indent=2))
-    log.info("Saved %d seen IDs for @%s", len(ids), username)
+    try:
+        with lock:
+            path.write_text(json.dumps(sorted(ids), indent=2))
+        log.info("Saved %d seen IDs for @%s", len(ids), username)
+    except Timeout:
+        log.warning("Timeout saving %d seen IDs for @%s, skipped", len(ids), username)
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +526,6 @@ def process_and_push(
         and (
             item.get("type") == "video"
             or str(item.get("url", "")).lower().endswith((".mp4", ".webm", ".mov"))
-            or "video" in str(item.get("url", "")).lower()
         )
     )
 
@@ -649,7 +651,7 @@ def run_incremental(
     for nsfw_flag in tracks:
         label = "NSFW" if nsfw_flag else "SFW"
         new_on_page, page_ids = _fetch_and_process_page(
-            username, nsfw_flag, 1, seen_ids,
+            username, nsfw_flag, 1, all_seen,
             base_url=base_url, limit=limit,
             size_suffixes=size_suffixes, output_dir=output_dir,
             bot_token=bot_token, chat_id=chat_id,
