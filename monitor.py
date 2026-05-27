@@ -214,6 +214,8 @@ def nsfw_tracks(nsfw_setting: str) -> list[bool | None]:
         "nsfw_only": [True],
         "both": [False, True],
     }
+    if nsfw_setting not in mapping:
+        log.warning("Unknown nsfw setting %r, defaulting to 'both'", nsfw_setting)
     return mapping.get(nsfw_setting, [False, True])  # default both
 
 
@@ -368,6 +370,7 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
         resp = safe_get(url, stream=True)
         resp.raise_for_status()
         b2_url = str(resp.url)
+        resp.close()
 
         # Step 2: rewrite /default → /original with retry on 5xx/transient errors
         if "image-b2.civitai.com" in b2_url and b2_url.endswith("/default"):
@@ -787,6 +790,7 @@ def main() -> None:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (BlockingIOError, OSError):
         log.warning("Another monitor process is already running - skipping this cron tick")
+        os.close(lock_fd)
         sys.exit(0)
 
     parser = argparse.ArgumentParser(description="Civitai Monitor — civitai.com user gallery monitor")

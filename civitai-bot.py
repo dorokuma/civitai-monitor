@@ -181,8 +181,8 @@ def validate_username_exists(username: str) -> tuple[bool, str]:
             cj = http.cookiejar.MozillaCookieJar(str(cookies_path))
             cj.load(ignore_expires=True, ignore_discard=True)
             s.cookies.update(cj)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Failed to load cookies from %s: %s", cookies_path, e)
 
     has_sfw = False
     has_nsfw = False
@@ -755,7 +755,7 @@ async def _render_backfill_page(query, users: list[str], page: int) -> None:
 def _human_size(bytes_: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if bytes_ < 1024:
-            return f"{bytes_:.1f}{unit}"
+            return f"{int(bytes_)}{unit}" if unit == "B" else f"{bytes_:.1f}{unit}"
         bytes_ /= 1024
     return f"{bytes_:.1f}TB"
 
