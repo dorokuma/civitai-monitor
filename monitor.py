@@ -313,6 +313,7 @@ def normalize_to_original(
 
 
 LOCK_PATH = SCRIPT_DIR / "seen_ids.lock"
+STATUS_PATH = SCRIPT_DIR / "monitor_status.json"
 
 
 def seen_file_for_user(seen_dir: Path, tg_id: str, username: str) -> Path:
@@ -836,6 +837,19 @@ def main() -> None:
 
     log.info("Mode: %s | NSFW: %s | Video: %s", cfg.mode, cfg.nsfw, cfg.video_enabled)
 
+    # -- Write initial scan status --
+    import datetime as _dt
+    STATUS_PATH.write_text(json.dumps({
+        "status": "running",
+        "pid": os.getpid(),
+        "started_at": _dt.datetime.now().strftime("%H:%M:%S"),
+        "mode": cfg.mode,
+        "current_user": "",
+        "users_done": 0,
+        "users_total": len(cfg.subscriptions or {}),
+        "pushed_count": 0,
+    }))
+
     # -- Paths --
     data_dir = Path(cfg.data.data_dir) if cfg.data.data_dir else SCRIPT_DIR
     output_dir = data_dir / cfg.download.output_dir
@@ -849,13 +863,24 @@ def main() -> None:
         log.error("No subscriptions configured in config.yaml")
         sys.exit(1)
 
-    for tg_id, user_list in subs.items():
+    pushed_count = 0
+    for idx, (tg_id, user_list) in enumerate(subs.items()):
         tg_id_str = str(tg_id)
         for entry in user_list:
             username = entry.get("name", str(entry)) if isinstance(entry, dict) else str(entry)
             if args.user and username != args.user:
                 log.info("Skipping @%s (--user filter active)", username)
                 continue
+            STATUS_PATH.write_text(json.dumps({
+                "status": "running",
+                "pid": os.getpid(),
+                "started_at": _dt.datetime.now().strftime("%H:%M:%S"),
+                "mode": cfg.mode,
+                "current_user": username,
+                "users_done": idx + 1,
+                "users_total": len(subs),
+                "pushed_count": pushed_count,
+            }))
             log.info("=" * 50)
             log.info("Processing @%s (TG:%s, %s mode)...", username, tg_id_str, cfg.mode)
 
@@ -901,6 +926,7 @@ def main() -> None:
                 if len(union) > len(seen_ids):
                     save_seen_ids(seen_dir, tg_id_str, username, union)
                     new_count = len(union) - len(seen_ids)
+                    pushed_count += new_count
                     log.info("Merged %d new IDs for @%s (TG:%s) (total: %d)", new_count, username, tg_id_str, len(union))
 
                     # Full mode: per-user completion message
@@ -917,6 +943,12 @@ def main() -> None:
     removed = cleanup_old_caches(output_dir, cfg.download.keep_days)
     if removed:
         log.info("Cleaned %d cached files older than %d days", removed, cfg.download.keep_days)
+
+    # Clear status
+    try:
+        STATUS_PATH.unlink()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

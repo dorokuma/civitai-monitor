@@ -626,7 +626,11 @@ async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         stdout = result.stdout.strip()
         stderr = result.stderr.strip()
         if result.returncode == 75:
-            await update.message.reply_text("⏳ 当前有定时扫描正在运行，扫描被跳过。稍后自动重试。", parse_mode="Markdown")
+            progress = _read_scan_status()
+            msg = f"⏳ 当前有定时扫描正在运行。"
+            if progress:
+                msg += "\n" + progress
+            await update.message.reply_text(msg, parse_mode="Markdown")
             return
         if result.returncode != 0:
             await update.message.reply_text(
@@ -747,11 +751,12 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
                 )
 
                 if result.returncode == 75:
-                    await query.message.reply_text(
-                        f"⏳ 当前有定时扫描正在运行，无法同时回填。\n"
-                        f"等定时扫描跑完后，再试一次 `/backfill` 即可。",
-                        parse_mode="Markdown",
-                    )
+                    progress = _read_scan_status()
+                    msg = f"⏳ 当前有定时扫描正在运行，无法同时回填。\n"
+                    if progress:
+                        msg += progress + "\n"
+                    msg += f"等定时扫描跑完后，再试一次 `/backfill` 即可。"
+                    await query.message.reply_text(msg, parse_mode="Markdown")
                     return
                 if result.returncode != 0:
                     await query.message.reply_text(f"❌ 回填 @{username} 失败（exit {result.returncode}）\n{result.stderr[:500]}")
@@ -810,6 +815,27 @@ def _human_size(bytes_: int) -> str:
             return f"{int(bytes_)}{unit}" if unit == "B" else f"{bytes_:.1f}{unit}"
         bytes_ /= 1024
     return f"{bytes_:.1f}TB"
+
+
+def _read_scan_status() -> str:
+    """Read current scan status from status file."""
+    try:
+        import json
+        path = SCRIPT_DIR / "monitor_status.json"
+        if not path.exists():
+            return ""
+        data = json.loads(path.read_text())
+        status = data.get("status", "")
+        user = data.get("current_user", "")
+        done = data.get("users_done", 0)
+        total = data.get("users_total", 0)
+        pushed = data.get("pushed_count", 0)
+        since = data.get("started_at", "")
+        if user:
+            return f"（当前 @{user}，已完成 {done}/{total} 个用户，已推送 {pushed} 条，始于 {since}）"
+        return ""
+    except Exception:
+        return ""
 
 
 def _summarise_log(stderr: str) -> str:
