@@ -248,6 +248,7 @@ See [`config.yaml.example`](config.yaml.example) for the full schema. Key sectio
 | `/cleanup [days]` | Manually clean cached images older than N days |
 | `/scan` | Trigger an immediate incremental scan |
 | `/backfill` | Interactive button list to backfill a user's full gallery |
+| `/interval <min>` | Set scan interval in minutes (default: 10) |
 | `/help` | Show all commands |
 
 Each Telegram user only sees and manages their **own** subscriptions.

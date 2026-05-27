@@ -242,6 +242,7 @@ image.civitai.com/xxx.mp4  ──301──►  B2 /default（仅封面图 JPEG �
 | `/cleanup [天数]` | 手动清理 N 天前的缓存 |
 | `/scan` | 立即执行一次增量扫描 |
 | `/backfill` | 交互式按钮列表，选择用户全量回填 |
+| `/interval <分钟>` | 设置扫描间隔（默认 10 分钟） |
 | `/help` | 显示所有命令说明 |
 
 每个 Telegram 号只能看到和管理**自己**的订阅。
