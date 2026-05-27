@@ -282,6 +282,7 @@ def fetch_page(
             fallback_resp = safe_get(f"{actual_base}/images", params=fallback_params)
             fallback_resp.raise_for_status()
             items = fallback_resp.json().get("items", [])
+            resp = fallback_resp  # use fallback response for cursor metadata
 
         next_cursor = resp.json().get("metadata", {}).get("nextCursor", "") if items else ""
         return items, next_cursor
