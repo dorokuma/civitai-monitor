@@ -749,7 +749,7 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
                 if result.returncode == 75:
                     await query.message.reply_text(
                         f"⏳ 当前有定时扫描正在运行，无法同时回填。\n"
-                        f"等定时扫描跑完后，再试一次 `/backfill`\即可。",
+                        f"等定时扫描跑完后，再试一次 `/backfill` 即可。",
                         parse_mode="Markdown",
                     )
                     return
