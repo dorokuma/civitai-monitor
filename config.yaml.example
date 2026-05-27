@@ -1,1 +1,95 @@
-The full current content of config.yaml.example (updated with the new fields from earlier edits)
+# =============================================================================
+# Civitai Monitor — Configuration
+# =============================================================================
+# Copy this file to config.yaml and replace all placeholders with your
+# actual values BEFORE running the script.
+#
+#   cp config.yaml.example config.yaml
+#   # edit config.yaml → fill in YOUR_*
+#
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Operation mode
+# ---------------------------------------------------------------------------
+#   incremental (default): check only the latest page(s) — ideal for cron
+#   full: walk every page of the user's gallery — use for initial backfill
+mode: "incremental"
+
+# ---------------------------------------------------------------------------
+# NSFW filtering
+# ---------------------------------------------------------------------------
+#   sfw_only:  only safe-for-work images
+#   nsfw_only: only NSFW images
+#   both:      pull both SFW and NSFW (recommended)
+nsfw: "both"
+
+# ---------------------------------------------------------------------------
+# Video support
+# ---------------------------------------------------------------------------
+# Civitai CDN requires browser cookies (login session) to download full-
+# resolution videos. See README for a guide on exporting cookies.
+video_enabled: true
+max_video_size_mb: 1024
+
+# ---------------------------------------------------------------------------
+# Civitai API settings
+# ---------------------------------------------------------------------------
+api:
+  base_url: "https://civitai.com/api/v1"
+  images_per_page: 100
+
+# ---------------------------------------------------------------------------
+# Download settings
+# ---------------------------------------------------------------------------
+download:
+  output_dir: "downloads"
+  size_suffixes:
+    - "/width=1024/"
+    - "/width=450/"
+    - "/width=640/"
+  keep_days: 7
+
+# ---------------------------------------------------------------------------
+# HTTP settings
+# ---------------------------------------------------------------------------
+http:
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+  referer: "https://civitai.com"
+  extra_headers: {}
+  # Path to Netscape-format cookies.txt exported from browser.
+  # Required only for video downloads (Civitai CDN requires login session).
+  # Leave empty if not using video auth. See README for export guide.
+  cookies_file: ""
+
+# ---------------------------------------------------------------------------
+# Telegram Bot (required — script will not run without these)
+# ---------------------------------------------------------------------------
+telegram:
+  bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
+  chat_id: "YOUR_TELEGRAM_CHAT_ID"
+
+# ---------------------------------------------------------------------------
+# Authorised Telegram users (who can send commands to the Bot)
+# ---------------------------------------------------------------------------
+# List the numeric Telegram user IDs that are allowed to control the Bot.
+# To find your ID, send a message to @userinfobot on Telegram.
+authorized_users:
+  - YOUR_TELEGRAM_USER_ID
+
+# ---------------------------------------------------------------------------
+# Per-Telegram-user subscriptions
+# ---------------------------------------------------------------------------
+# Each Telegram user has their own independent watch list and download
+# progress (seen_ids). Multiple users can watch the same Civitai creators
+# without interfering with each other's progress.
+subscriptions:
+  'YOUR_TELEGRAM_USER_ID':
+    - name: "YOUR_TARGET_USERNAME_1"
+    # - name: "YOUR_TARGET_USERNAME_2"
+
+# ---------------------------------------------------------------------------
+# Data persistence
+# ---------------------------------------------------------------------------
+data:
+  data_dir: ""
