@@ -273,9 +273,8 @@ def fetch_page(
         # retry with default sort (Civitai API bug workaround).
         if not items and sort == "Newest":
             log.warning(
-                "%s: sort=Newest returned 0 items for page %d (nsfw=%s), "
-                "retrying with default sort",
-                username, page, nsfw,
+                "%s: sort=Newest returned 0 items (nsfw=%s), retrying with default sort",
+                username, nsfw,
             )
             fallback_params = dict(params)
             fallback_params.pop("sort", None)
