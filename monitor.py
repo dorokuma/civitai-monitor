@@ -347,6 +347,24 @@ def save_seen_ids(seen_dir: Path, tg_id: str, username: str, ids: set[int]) -> N
         log.warning("Timeout saving %d seen IDs for @%s, skipped", len(ids), username)
 
 
+def pushed_file_for_user(pushed_dir: Path, tg_id: str, username: str) -> Path:
+    pushed_dir.mkdir(parents=True, exist_ok=True)
+    return pushed_dir / f"pushed_ids_{tg_id}_{username}.json"
+
+
+def load_pushed_ids(pushed_dir: Path, tg_id: str, username: str) -> set[int]:
+    path = pushed_file_for_user(pushed_dir, tg_id, username)
+    return set(json.loads(path.read_text())) if path.exists() else set()
+
+
+def save_pushed_ids(pushed_dir: Path, tg_id: str, username: str, ids: set[int]) -> None:
+    path = pushed_file_for_user(pushed_dir, tg_id, username)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(sorted(ids), indent=2))
+    tmp.rename(path)
+    log.info("Saved %d pushed IDs for @%s", len(ids), username)
+
+
 # ---------------------------------------------------------------------------
 # Image download
 # ---------------------------------------------------------------------------
@@ -599,6 +617,7 @@ def _fetch_and_process_page(
     nsfw_flag: bool | None,
     cursor: str,
     seen_ids: set[int],
+    pushed_ids: set[int],
     *,
     base_url: str,
     limit: int,
@@ -609,6 +628,8 @@ def _fetch_and_process_page(
     chat_id: str,
     video_enabled: bool,
     max_video_size_mb: int,
+    pushed_dir: Path,
+    tg_id: str,
 ) -> tuple[list[dict], set[int], str]:
     """Fetch one page (by cursor), find new items, process and push them.
 
@@ -624,7 +645,9 @@ def _fetch_and_process_page(
 
     if new_on_page:
         for img in reversed(new_on_page):
-            process_and_push(
+            if img["id"] in pushed_ids:
+                continue
+            pushed = process_and_push(
                 img, username,
                 size_suffixes=size_suffixes,
                 output_dir=output_dir,
@@ -633,6 +656,9 @@ def _fetch_and_process_page(
                 video_enabled=video_enabled,
                 max_video_size_mb=max_video_size_mb,
             )
+            if pushed:
+                pushed_ids.add(img["id"])
+                save_pushed_ids(pushed_dir, tg_id, username, pushed_ids)
             time.sleep(0.5)
 
     return new_on_page, page_ids, next_cursor
@@ -674,18 +700,20 @@ def run_incremental(
         page = 0
         while True:
             page += 1
+            pushed_ids = load_pushed_ids(seen_dir, tg_id, username)
             new_on_page, page_ids, next_cursor = _fetch_and_process_page(
-                username, nsfw_flag, cursor, all_seen,
+                username, nsfw_flag, cursor, all_seen, pushed_ids,
                 base_url=base_url, limit=limit, sort=None,
                 size_suffixes=size_suffixes, output_dir=output_dir,
                 bot_token=bot_token, chat_id=chat_id,
                 video_enabled=video_enabled, max_video_size_mb=max_video_size_mb,
+                pushed_dir=seen_dir, tg_id=tg_id,
             )
 
             if not page_ids:
                 break
 
-            # If all items on this page are already seen, we've caught up
+            # If all items on this page are already pushed, we've caught up
             all_seen.update(page_ids)
             if not new_on_page:
                 log.info("%s: caught up after %d pages (track: %s)", username, page, label)
@@ -749,12 +777,14 @@ def run_full(
 
         while True:
             page += 1
+            pushed_ids = load_pushed_ids(seen_dir, tg_id, username)
             new_on_page, page_ids, next_cursor = _fetch_and_process_page(
-                username, nsfw_flag, cursor, all_seen,
+                username, nsfw_flag, cursor, all_seen, pushed_ids,
                 base_url=base_url, limit=limit,
                 size_suffixes=size_suffixes, output_dir=output_dir,
                 bot_token=bot_token, chat_id=chat_id,
                 video_enabled=video_enabled, max_video_size_mb=max_video_size_mb,
+                pushed_dir=seen_dir, tg_id=tg_id,
             )
 
             if not page_ids:
