@@ -371,6 +371,9 @@ def save_pushed_ids(pushed_dir: Path, tg_id: str, username: str, ids: set[int]) 
 
 
 def download_image(url: str, save_path: Path, timeout: int = 120) -> bool:
+    if save_path.exists():
+        log.info("Already exists: %s, skipped", save_path.name)
+        return True
     try:
         resp = safe_get(url, timeout=timeout)
         resp.raise_for_status()
@@ -389,6 +392,9 @@ def download_image(url: str, save_path: Path, timeout: int = 120) -> bool:
 
 
 def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
+    if save_path.exists():
+        log.info("Already exists: %s, skipped", save_path.name)
+        return True
     """Download a full-quality video from Civitai CDN.
 
     Strategy:
@@ -586,7 +592,7 @@ def process_and_push(
         log.info("Pushed %s %s to @%s | id=%d file=%s success=%s push=%s",
                  "video", "✅" if pushed else "❌", username, item_id,
                  filepath.name if success else "none", success, pushed)
-        return success
+        return pushed
 
     # Image path
     orig_url = normalize_to_original(item.get("url", ""), size_suffixes)
@@ -604,7 +610,7 @@ def process_and_push(
     log.info("Pushed %s %s to @%s | id=%d file=%s success=%s push=%s",
              "image", "✅" if pushed else "❌", username, item_id,
              filepath.name if success else "none", success, pushed)
-    return success
+    return pushed
 
 
 # ---------------------------------------------------------------------------
@@ -641,7 +647,7 @@ def _fetch_and_process_page(
         return [], set(), next_cursor
 
     page_ids = {img["id"] for img in items}
-    new_on_page = [img for img in items if img["id"] not in seen_ids]
+    new_on_page = [img for img in items if img["id"] not in pushed_ids]
 
     if new_on_page:
         for img in reversed(new_on_page):
