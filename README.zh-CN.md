@@ -253,7 +253,7 @@ image.civitai.com/xxx.mp4  ──301──►  B2 /default（仅封面图 JPEG �
 
 ```bash
 # 每 10 分钟执行一次（config.yaml 中需设置 mode: "incremental"）
-*/10 * * * * cd ~/civitai-monitor && python3 monitor.py >> monitor.log 2>&1
+*/10 * * * * cd ~/civitai-monitor && python3 monitor.py 
 ```
 
 ---
@@ -280,7 +280,6 @@ civitai-monitor/
 # ├── seen_ids/             # 各用户的下载进度
 # ├── downloads/            # 缓存图片和视频
 # ├── civitai_cookies.txt   # 浏览器 cookies（视频认证用）
-# └── monitor.log           # 执行日志
 ```
 
 ---

@@ -190,6 +190,9 @@ def load_config(path: Path | None = None) -> MonitorConfig:
             log.info("Loading config from %s", p)
             with open(p, encoding="utf-8") as f:
                 raw = yaml.safe_load(f)
+            # Environment variable overrides for sensitive fields
+            if os.environ.get("CIVITAI_BOT_TOKEN"):
+                raw.setdefault("telegram", {})["bot_token"] = os.environ["CIVITAI_BOT_TOKEN"]
             try:
                 cfg = MonitorConfig(**raw)
                 init_session(cfg.http)
@@ -359,10 +362,15 @@ def load_pushed_ids(pushed_dir: Path, tg_id: str, username: str) -> set[int]:
 
 def save_pushed_ids(pushed_dir: Path, tg_id: str, username: str, ids: set[int]) -> None:
     path = pushed_file_for_user(pushed_dir, tg_id, username)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(sorted(ids), indent=2))
-    tmp.rename(path)
-    log.info("Saved %d pushed IDs for @%s", len(ids), username)
+    lock = FileLock(str(LOCK_PATH), timeout=10)
+    try:
+        with lock:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(sorted(ids), indent=2))
+            tmp.rename(path)
+        log.info("Saved %d pushed IDs for @%s", len(ids), username)
+    except Timeout:
+        log.warning("Timeout saving %d pushed IDs for @%s, skipped", len(ids), username)
 
 
 # ---------------------------------------------------------------------------

@@ -21,3 +21,5 @@ Thumbs.db
 *.log
 .monitor.lock
 *.bak
+*.env
+monitor_status.json

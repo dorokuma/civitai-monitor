@@ -259,7 +259,7 @@ Each Telegram user only sees and manages their **own** subscriptions.
 
 ```bash
 # Every 10 minutes (requires mode: "incremental" in config.yaml)
-*/10 * * * * cd ~/civitai-monitor && python3 monitor.py >> monitor.log 2>&1
+*/10 * * * * cd ~/civitai-monitor && python3 monitor.py 
 ```
 
 ---
@@ -286,7 +286,6 @@ civitai-monitor/
 # ├── seen_ids/             # Per-user download progress
 # ├── downloads/            # Cached images & videos
 # ├── civitai_cookies.txt   # Browser cookies for video auth
-# └── monitor.log           # Execution log
 ```
 
 ---
