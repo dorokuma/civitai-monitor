@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """
 Civitai Monitor — Enhanced Edition v2.0
 
@@ -23,6 +24,9 @@ Usage:
 """
 
 from __future__ import annotations
+
+import load_env  # 自动加载同目录下的 civitai-bot.env（token 等敏感信息）
+
 
 import argparse
 import fcntl
@@ -50,6 +54,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("civitai-monitor")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
 # Pydantic config models
@@ -199,10 +204,10 @@ def load_config(path: Path | None = None) -> MonitorConfig:
                 return cfg
             except ValidationError as e:
                 log.error("Config validation error:\n%s", e)
-                print(json.dumps({"error": "Config validation failed", "details": str(e)}))
+                log.error("Config validation failed: %s", e)
                 sys.exit(1)
     log.error("config.yaml not found (searched: %s)", [str(p) for p in paths])
-    print(json.dumps({"error": "config.yaml not found", "searched": [str(p) for p in paths]}))
+    log.error("config.yaml not found (searched: %s)", [str(p) for p in paths])
     sys.exit(1)
 
 
