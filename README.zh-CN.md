@@ -264,7 +264,6 @@ image.civitai.com/xxx.mp4  ──301──►  B2 /default（仅封面图 JPEG �
 civitai-monitor/
 ├── monitor.py              # 主监控脚本（支持增量 + 全量回填）
 ├── civitai-bot.py          # 管理 Bot（可选 — 通过 Telegram 管理监控）
-├── config.py               # DEPRECATED — 仅作参考
 ├── Dockerfile              # 容器构建（非 root 用户运行）
 ├── docker-compose.yml      # Docker 编排
 ├── .dockerignore           # 构建上下文排除规则

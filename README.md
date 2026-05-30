@@ -255,12 +255,13 @@ Each Telegram user only sees and manages their **own** subscriptions.
 
 ---
 
-## Automating with Cron
+## Automating (Recommended: systemd Timer)
 
-```bash
-# Every 10 minutes (requires mode: "incremental" in config.yaml)
-*/10 * * * * cd ~/civitai-monitor && python3 monitor.py 
-```
+We strongly recommend using the systemd timer approach instead of traditional cron (this is the standard on this server fleet).
+
+See the **Scheduled Scanning (systemd)** section above for full details and how to configure the user-adjustable interval via the bot.
+
+The old cron method is still technically possible but no longer the recommended way.
 
 ---
 
@@ -270,7 +271,6 @@ Each Telegram user only sees and manages their **own** subscriptions.
 civitai-monitor/
 ├── monitor.py              # Main monitor script (incremental + full backfill)
 ├── civitai-bot.py          # Admin Bot (optional — manage via Telegram)
-├── config.py               # DEPRECATED — kept for reference
 ├── Dockerfile              # Container build (non-root user)
 ├── docker-compose.yml      # Docker orchestration
 ├── .dockerignore           # Build context exclusions
@@ -308,3 +308,53 @@ civitai-monitor/
 ### License
 
 [MIT](LICENSE) © dorokuma
+
+---
+
+## Scheduled Scanning (systemd)
+
+This project now uses a **systemd timer + oneshot service** pattern for automatic incremental scans (the recommended way on this server fleet).
+
+### How it works
+
+- A lightweight timer fires **every 1 minute** (heartbeat only — no API calls).
+- A wrapper script (`run_scheduled_scan.sh`) checks:
+  - The user-configured interval in `interval.json`
+  - Time since last successful scan
+- Only when the configured interval has elapsed does it actually run `monitor.py --mode incremental`.
+
+### User-configurable interval
+
+Users can change the scan frequency from Telegram using the bot command:
+
+```
+/interval 15
+```
+
+- **Default**: 10 minutes (600 seconds)
+- **Allowed range**: 5 ~ 1440 minutes
+- The change takes effect within 1 minute (next heartbeat).
+
+### Requirements
+
+- `jq` is required by the wrapper script.
+  - Install with: `apt-get install -y jq`
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `run_scheduled_scan.sh` | Decision logic + execution wrapper |
+| `civitai-monitor.service` | oneshot systemd service |
+| `civitai-monitor.timer` | 1-minute heartbeat timer |
+| `interval.json` | Current user interval (`{"seconds": 600}`) |
+
+### Activation (when ready)
+
+```bash
+cp civitai-monitor.service civitai-monitor.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now civitai-monitor.timer
+```
+
+**Do not** enable the timer until the operator explicitly approves activation.
