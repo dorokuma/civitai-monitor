@@ -27,7 +27,7 @@ download full-resolution originals and push them to a Telegram channel via the B
 - ✅ **User existence validation** — calls Civitai API to confirm the user has public works before adding
 - 💾 **Deduplication** — dual-layer save (track-end + final) prevents cron race conditions
 - 📋 **Push audit log** — every push is logged with ID, file, download status, and push result
-- 🧹 **Auto-cleanup** — removes cached files older than `keep_days`, and/or when total size exceeds `max_total_gb` (default 10GB)
+- 🧹 **Auto-cleanup** — removes cached files older than `keep_days`
 - 🗂 **Interactive remove & backfill** — button-based user selection with pagination
 
 ---
@@ -226,7 +226,7 @@ See [`config.yaml.example`](config.yaml.example) for the full schema. Key sectio
 | `video_enabled` | Enable/disable video detection and download |
 | `max_video_size_mb` | Skip videos larger than this (default: 1024) |
 | `api` | API base URL, page size |
-| `download` | Output directory, URL size-suffix replacements, **cache retention** (`keep_days` + `max_total_gb`) |
+| `download` | Output directory, URL size-suffix replacements, cache retention |
 | `http` | User-Agent, Referer, extra headers, **cookies_file** |
 | `telegram` | **Required** — bot token and chat/channel ID |
 | `authorized_users` | List of Telegram user IDs allowed to control the Bot |
@@ -255,11 +255,9 @@ Each Telegram user only sees and manages their **own** subscriptions.
 
 ---
 
-## Automating (Recommended: systemd Timer)
+## Automating
 
-We strongly recommend using the systemd timer approach instead of traditional cron (this is the standard on this server fleet).
-
-See the **Scheduled Scanning (systemd)** section above for full details and how to configure the user-adjustable interval via the bot.
+The bot (`civitai-bot.service`) runs scheduled scans automatically using its internal scheduler. See the **Scheduled Scanning** section above for details on configuring the scan interval via the bot.
 
 The old cron method is still technically possible but no longer the recommended way.
 
@@ -270,36 +268,28 @@ The old cron method is still technically possible but no longer the recommended 
 ```
 civitai-monitor/
 ├── monitor.py              # Main monitor script (incremental + full backfill)
-├── civitai-bot.py          # Admin Bot (optional — manage via Telegram)
-├── Dockerfile              # Container build (non-root user)
-├── docker-compose.yml      # Docker orchestration
-├── .dockerignore           # Build context exclusions
+├── civitai-bot.py          # Admin Bot (manage via Telegram)
+├── backfill-memory-wrapper.py  # Stricter memory limit for backfill process
+├── load_env.py             # .env file loader
 ├── config.yaml.example     # Configuration template (all placeholders)
 ├── requirements.txt        # Python dependencies
 ├── LICENSE                 # MIT
 ├── README.md               # English
-├── README.zh-CN.md         # 中文
-└── .gitignore
+├── README.zh-CN.md         # Chinese
+├── .gitignore
+├── tests/                  # Unit tests
+└── .github/workflows/      # CI/CD (lint + test)
 
 # Runtime (auto-generated, not in repo):
 # ├── config.yaml           # Your configuration
+# ├── active_backfills.json # Backfill recovery state
+# ├── interval.json         # Scan interval setting
+# ├── civitai_cookies.txt   # Browser cookies for video auth
 # ├── seen_ids/             # Per-user download progress
 # ├── downloads/            # Cached images & videos
-# ├── civitai_cookies.txt   # Browser cookies for video auth
+# ├── optimization_logs/    # Audit & optimization documents
+# └── monitor.log*          # Log files (journald primary)
 ```
-
----
-
-## Minimum Hardware Requirements
-
-| Item | Requirement |
-|------|-------------|
-| **Minimum RAM** | 1 GB (Full Backfill can reach 1.7GB; 1GB machines work but 2GB+ recommended) |
-| **Recommended RAM** | 2 GB or above |
-| **Dynamic Memory Limit** | Bot auto-calculates limit at startup (≤1GB → 55%, 1-2GB → 60%, ≥2GB → 65%, hard cap 1.8GB) |
-| **Disk** | Varies by subscription count and cache strategy; 10GB+ recommended |
-
-> **Note**: Full Backfill has high memory usage. Low-memory machines (1GB) should monitor for OOM events. Backfill Auto-Resume is implemented — if killed by OOM, the task will auto-resume after restart.
 
 ---
 
@@ -324,17 +314,9 @@ civitai-monitor/
 
 ---
 
-## Scheduled Scanning (systemd)
+## Scheduled Scanning
 
-This project now uses a **systemd timer + oneshot service** pattern for automatic incremental scans (the recommended way on this server fleet).
-
-### How it works
-
-- A lightweight timer fires **every 1 minute** (heartbeat only — no API calls).
-- A wrapper script (`run_scheduled_scan.sh`) checks:
-  - The user-configured interval in `interval.json`
-  - Time since last successful scan
-- Only when the configured interval has elapsed does it actually run `monitor.py --mode incremental`.
+The bot (`civitai-bot.service`) runs `monitor.py --mode incremental` on a configurable schedule as a background task, using `interval.json` to determine the frequency.
 
 ### User-configurable interval
 
@@ -345,29 +327,11 @@ Users can change the scan frequency from Telegram using the bot command:
 ```
 
 - **Default**: 10 minutes (600 seconds)
-- **Allowed range**: 5 ~ 1440 minutes
-- The change takes effect within 1 minute (next heartbeat).
-
-### Requirements
-
-- `jq` is required by the wrapper script.
-  - Install with: `apt-get install -y jq`
+- **Allowed range**: 1 ~ 1440 minutes
+- The change takes effect on the next scan cycle.
 
 ### Files
 
 | File | Purpose |
 |------|---------|
-| `run_scheduled_scan.sh` | Decision logic + execution wrapper |
-| `civitai-monitor.service` | oneshot systemd service |
-| `civitai-monitor.timer` | 1-minute heartbeat timer |
 | `interval.json` | Current user interval (`{"seconds": 600}`) |
-
-### Activation (when ready)
-
-```bash
-cp civitai-monitor.service civitai-monitor.timer /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now civitai-monitor.timer
-```
-
-**Do not** enable the timer until the operator explicitly approves activation.

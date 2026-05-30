@@ -1,14 +1,16 @@
 """Tests for monitor.py — MonitorConfig and load_config."""
 
-import pytest
 import yaml
 import tempfile
 from pathlib import Path
 from monitor import MonitorConfig, load_config
 
 
-def test_load_config_from_yaml():
+def test_load_config_from_yaml(monkeypatch):
     """load_config() reads a valid yaml and returns a populated MonitorConfig."""
+    # Clear CIVITAI_BOT_TOKEN so it doesn't override the test value
+    monkeypatch.delenv("CIVITAI_BOT_TOKEN", raising=False)
+
     test_data = {
         "mode": "incremental",
         "nsfw": "both",

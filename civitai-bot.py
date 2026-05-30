@@ -26,13 +26,13 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import requests
 import yaml
@@ -49,7 +49,7 @@ from monitor import MonitorConfig, load_config
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
+    datefmt="%m-%d %H:%M:%S",
 )
 log = logging.getLogger("civitai-bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -224,7 +224,6 @@ def _save_interval(seconds: int) -> None:
 _scan_interval: int = 600
 
 # Graceful shutdown flag
-import signal
 _shutdown_requested = False
 
 
@@ -257,15 +256,15 @@ def read_config() -> MonitorConfig:
         )
     # Load config safely: if config is corrupted or validation fails,
     # fall back to minimal config instead of crashing the bot process
-    try:
-        return load_config(CONFIG_PATH)
-    except SystemExit:
+    cfg = load_config(CONFIG_PATH)
+    if cfg is None:
         log.warning("Config validation failed, using minimal config fallback")
         return MonitorConfig(
             telegram={"bot_token": "UNSET", "chat_id": "UNSET"},
             subscriptions={},
             authorized_users=[],
         )
+    return cfg
 
 
 def write_config(cfg: MonitorConfig) -> None:
@@ -594,7 +593,7 @@ async def cmd_remove_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -
     except Exception as e:
         log.error("Remove callback error: %s", e)
         try:
-            await query.edit_message_text(f"❌ 操作失败，请重试 /remove", reply_markup=None)
+            await query.edit_message_text("❌ 操作失败，请重试 /remove", reply_markup=None)
         except Exception as e:
             log.warning("Nested error in remove callback: %s", e)
 
@@ -647,13 +646,6 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = read_config()
     users = get_users(cfg, update.effective_user.id)
 
-    # Config summary
-    mode = cfg.mode
-    nsfw = cfg.nsfw
-    keep_days = cfg.download.keep_days
-    video = cfg.video_enabled
-    max_video = cfg.max_video_size_mb
-
     # Stats
     seen_count = 0
     mtime = ""
@@ -676,10 +668,8 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             bj = mt.astimezone(ZoneInfo("Asia/Shanghai"))
             mtime = bj.strftime("%Y-%m-%d %H:%M")
 
-    download_count = 0
     download_size = 0
     if DOWNLOAD_DIR.exists():
-        download_count = len(list(DOWNLOAD_DIR.iterdir()))
         download_size = sum(f.stat().st_size for f in DOWNLOAD_DIR.iterdir() if f.is_file())
 
     size_str = _human_size(download_size)
@@ -784,11 +774,10 @@ async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             [sys.executable, str(MONITOR_SCRIPT)],
             capture_output=True, text=True, timeout=300, cwd=str(SCRIPT_DIR),
         )
-        stdout = result.stdout.strip()
         stderr = result.stderr.strip()
         if result.returncode == 75:
             progress = _read_scan_status()
-            msg = progress if progress else f"⏳ 当前有定时扫描正在运行。"
+            msg = progress if progress else "⏳ 当前有定时扫描正在运行。"
             await update.message.reply_text(msg, parse_mode="Markdown")
             return
         if result.returncode != 0:
@@ -935,7 +924,7 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
                     return
                 if result == "busy":
                     progress = _read_scan_status(target=username)
-                    msg = progress if progress else f"⏳ 当前有定时扫描正在运行，无法同时回填。\n等扫描完成或输入 /stop 中断后重试。"
+                    msg = progress if progress else "⏳ 当前有定时扫描正在运行，无法同时回填。\n等扫描完成或输入 /stop 中断后重试。"
                     await query.message.reply_text(msg, parse_mode="Markdown")
                     return
                 if result.returncode != 0:
@@ -1165,7 +1154,7 @@ def _read_scan_status(target: str = "") -> str:
         if not creator:
             return ""
 
-        lines = [f"⏳ 定时扫描进行中"]
+        lines = ["⏳ 定时扫描进行中"]
         lines.append(f"当前：@{creator} \u00b7 进度 {done}/{total}")
 
         # Calculate queue position if target is specified

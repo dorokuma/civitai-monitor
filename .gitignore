@@ -25,3 +25,9 @@ Thumbs.db
 monitor_status.json
 .last_scheduled_scan
 # systemd units (if user wants to manage separately)
+
+# Runtime state files
+active_backfills.json
+interval.json
+# Local optimization documents
+optimization_logs/

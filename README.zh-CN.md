@@ -262,23 +262,28 @@ image.civitai.com/xxx.mp4  ──301──►  B2 /default（仅封面图 JPEG �
 
 ```
 civitai-monitor/
-├── monitor.py              # 主监控脚本（支持增量 + 全量回填）
-├── civitai-bot.py          # 管理 Bot（可选 — 通过 Telegram 管理监控）
-├── Dockerfile              # 容器构建（非 root 用户运行）
-├── docker-compose.yml      # Docker 编排
-├── .dockerignore           # 构建上下文排除规则
+├── monitor.py              # 主监控脚本（增量 + 全量回填）
+├── civitai-bot.py          # 管理 Bot（通过 Telegram 管理监控）
+├── backfill-memory-wrapper.py  # Backfill 进程内存限制包装器
+├── load_env.py             # .env 文件加载器
 ├── config.yaml.example     # 配置模板（全部占位符）
 ├── requirements.txt        # Python 依赖
 ├── LICENSE                 # MIT 许可证
 ├── README.md               # 英文说明
 ├── README.zh-CN.md         # 中文说明
-└── .gitignore
+├── .gitignore
+├── tests/                  # 单元测试
+└── .github/workflows/      # CI/CD（代码检查 + 测试）
 
 # 运行时生成（不在仓库中）：
 # ├── config.yaml           # 你的配置
+# ├── active_backfills.json # Backfill 恢复状态
+# ├── interval.json         # 扫描间隔设置
+# ├── civitai_cookies.txt   # 浏览器 cookies（视频认证用）
 # ├── seen_ids/             # 各用户的下载进度
 # ├── downloads/            # 缓存图片和视频
-# ├── civitai_cookies.txt   # 浏览器 cookies（视频认证用）
+# ├── optimization_logs/    # 审计与优化方案文档
+# └── monitor.log*          # 日志文件（主要走 journald）
 ```
 
 ---

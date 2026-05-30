@@ -25,8 +25,7 @@ Usage:
 
 from __future__ import annotations
 
-import os
-import load_env  # 自动加载同目录下的 civitai-bot.env（token 等敏感信息）
+import load_env  # noqa: F401  # 自动加载同目录下的 civitai-bot.env（token 等敏感信息）
 
 
 import argparse
@@ -43,7 +42,8 @@ import requests
 import yaml
 from filelock import FileLock, Timeout
 from pydantic import BaseModel, Field, ValidationError
-from tenacity import retry, stop_after_attempt, wait_exponential, wait_random, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import random
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -52,7 +52,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, wait_random, r
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
+    datefmt="%m-%d %H:%M:%S",
 )
 log = logging.getLogger("civitai-monitor")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -171,9 +171,17 @@ class RateLimitError(requests.RequestException):
 # ---------------------------------------------------------------------------
 
 
+def _rate_limit_wait(retry_state):
+    """Respect Retry-After header when rate-limited, fall back to exponential backoff."""
+    exc = retry_state.outcome.exception()
+    if isinstance(exc, RateLimitError):
+        return exc.retry_after + random.uniform(0, 2)
+    return wait_exponential(multiplier=1, min=2, max=30)(retry_state)
+
+
 @retry(
     stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=2, max=30) + wait_random(min=0, max=3),
+    wait=_rate_limit_wait,
     retry=retry_if_exception_type((requests.RequestException, RateLimitError)),
     reraise=True,
 )
@@ -190,7 +198,7 @@ def safe_get(url: str, **kwargs) -> requests.Response:
 # ---------------------------------------------------------------------------
 
 
-def load_config(path: Path | None = None) -> MonitorConfig:
+def load_config(path: Path | None = None) -> MonitorConfig | None:
     paths = [Path(path)] if path else DEFAULT_CONFIG_PATHS
     for p in paths:
         if p.exists():
@@ -205,12 +213,10 @@ def load_config(path: Path | None = None) -> MonitorConfig:
                 init_session(cfg.http)
                 return cfg
             except ValidationError as e:
-                log.error("Config validation error:\n%s", e)
                 log.error("Config validation failed: %s", e)
-                sys.exit(1)
+                return None
     log.error("config.yaml not found (searched: %s)", [str(p) for p in paths])
-    log.error("config.yaml not found (searched: %s)", [str(p) for p in paths])
-    sys.exit(1)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -922,6 +928,8 @@ def main() -> None:
 
     global cfg  # noqa: PLW0602
     cfg = load_config(Path(args.config) if args.config else None)
+    if cfg is None:
+        sys.exit(1)
     if args.mode:
         cfg.mode = args.mode
 
