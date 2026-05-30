@@ -25,6 +25,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import load_env  # 自动加载同目录下的 civitai-bot.env（token 等敏感信息）
 
 
@@ -74,6 +75,7 @@ class HttpConfig(BaseModel):
 class DownloadConfig(BaseModel):
     output_dir: str = "downloads"
     keep_days: int = 7
+    max_total_gb: int = 10          # 新增：最大缓存总大小（GB），0 表示不限制
     size_suffixes: list[str] = Field(
         default=["/width=1024/", "/width=450/", "/width=640/"]
     )
@@ -391,7 +393,9 @@ def download_image(url: str, save_path: Path, timeout: int = 120) -> bool:
         resp = safe_get(url, timeout=timeout)
         resp.raise_for_status()
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        save_path.write_bytes(resp.content)
+        tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
+        tmp_path.write_bytes(resp.content)
+        tmp_path.rename(save_path)
         log.info("Downloaded: %s (%d bytes)", save_path.name, len(resp.content))
         return True
     except requests.RequestException as e:
@@ -452,12 +456,13 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
             return False
 
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(save_path, "wb") as f:
+        tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
+        with open(tmp_path, "wb") as f:
             for chunk in resp.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
-        log.info("Video downloaded: %s (%.1f MB)", save_path.name,
-                 save_path.stat().st_size / 1024 / 1024)
+        tmp_path.rename(save_path)
+        log.info("Video downloaded: %s (%.1f MB)", save_path.name, save_path.stat().st_size / 1024 / 1024)
         return True
     except requests.RequestException as e:
         log.warning("Video download failed for %s: %s", url, e)
@@ -834,25 +839,58 @@ def run_full(
 # ---------------------------------------------------------------------------
 
 
-def cleanup_old_caches(output_dir: Path, keep_days: int) -> int:
-    """Remove cached files older than keep_days. Returns count removed."""
-    if keep_days <= 0 or not output_dir.exists():
+def cleanup_old_caches(output_dir: Path, keep_days: int, max_total_gb: int = 0) -> int:
+    """按天数 + 按总大小双重清理。返回删除的文件数量。"""
+    if not output_dir.exists():
         return 0
 
-    cutoff = time.time() - keep_days * 86400
     removed = 0
-    for f in output_dir.iterdir():
-        if f.is_file() and f.stat().st_mtime < cutoff:
-            f.unlink()
-            removed += 1
 
-    # Also clean videos subdirectory
-    video_dir = output_dir / "videos"
-    if video_dir.exists():
-        for f in video_dir.iterdir():
-            if f.is_file() and f.stat().st_mtime < cutoff:
-                f.unlink()
+    # 第一步：按天数清理
+    if keep_days > 0:
+        cutoff = time.time() - keep_days * 86400
+        for root, dirs, files in os.walk(output_dir):
+            for fname in files:
+                fpath = Path(root) / fname
+                try:
+                    if fpath.stat().st_mtime < cutoff:
+                        fpath.unlink()
+                        removed += 1
+                except OSError:
+                    pass
+            for dname in dirs:
+                dpath = Path(root) / dname
+                try:
+                    if not any(dpath.iterdir()):
+                        dpath.rmdir()
+                except OSError:
+                    pass
+
+    # 第二步：按总大小清理（如果设置了上限）
+    if max_total_gb > 0:
+        max_bytes = max_total_gb * 1024 * 1024 * 1024
+        while True:
+            all_files = []
+            for root, dirs, files in os.walk(output_dir):
+                for fname in files:
+                    fpath = Path(root) / fname
+                    try:
+                        all_files.append((fpath.stat().st_mtime, fpath.stat().st_size, fpath))
+                    except OSError:
+                        pass
+
+            total_size = sum(f[1] for f in all_files)
+            if total_size <= max_bytes:
+                break
+
+            # 删除最旧的文件
+            all_files.sort()  # 按 mtime 排序，最旧的在前
+            oldest = all_files[0][2]
+            try:
+                oldest.unlink()
                 removed += 1
+            except OSError:
+                break
 
     return removed
 
@@ -866,14 +904,14 @@ def main() -> None:
     # Process lock: prevent concurrent cron runs
     lock_file = SCRIPT_DIR / ".monitor.lock"
     try:
-        lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR)
+        lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (BlockingIOError, OSError):
         log.warning("Another monitor process is already running - skipping this cron tick")
         try:
             os.close(lock_fd)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Failed to close lock file descriptor: %s", e)
         sys.exit(75)
 
     parser = argparse.ArgumentParser(description="Civitai Monitor — civitai.com user gallery monitor")
@@ -997,7 +1035,7 @@ def main() -> None:
                         send_to_telegram(cfg.telegram.bot_token, cfg.telegram.chat_id, summary)
 
     # -- Cleanup old caches --
-    removed = cleanup_old_caches(output_dir, cfg.download.keep_days)
+    removed = cleanup_old_caches(output_dir, cfg.download.keep_days, cfg.download.max_total_gb)
     if removed:
         log.info("Cleaned %d cached files older than %d days", removed, cfg.download.keep_days)
 
@@ -1007,7 +1045,7 @@ def main() -> None:
         STATUS_PATH.write_text(json.dumps({"status": "completed", "elapsed_seconds": elapsed}))
         STATUS_PATH.unlink()
     except Exception:
-        pass
+        log.exception("Failed to write final status file (non-critical)")
 
 
 if __name__ == "__main__":
