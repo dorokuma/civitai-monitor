@@ -69,7 +69,8 @@ def _load_interval() -> int:
     """Load interval from file, default 600s (10 min)."""
     try:
         return json.loads(INTERVAL_CONFIG.read_text()).get("seconds", 600)
-    except Exception:
+    except (json.JSONDecodeError, OSError, FileNotFoundError) as e:
+        log.warning("Failed to load interval config, using default 600s: %s", e)
         return 600
 
 
@@ -216,7 +217,7 @@ def validate_username_exists(username: str) -> tuple[bool, str]:
             cj = http.cookiejar.MozillaCookieJar(str(cookies_path))
             cj.load(ignore_expires=True, ignore_discard=True)
             s.cookies.update(cj)
-        except Exception as e:
+        except (OSError, http.cookiejar.LoadError, Exception) as e:
             log.warning("Failed to load cookies from %s: %s", cookies_path, e)
 
     has_sfw = False
@@ -451,8 +452,8 @@ async def cmd_remove_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -
         log.error("Remove callback error: %s", e)
         try:
             await query.edit_message_text(f"❌ 操作失败，请重试 /remove", reply_markup=None)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Nested error in remove callback: %s", e)
 
 
 async def _render_remove_page(query, users: list[str], page: int) -> None:
@@ -524,8 +525,8 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     seen_count += len(data) if isinstance(data, list) else 0
                     if f.stat().st_mtime > latest_mtime:
                         latest_mtime = f.stat().st_mtime
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning("Error checking file mtime: %s", e)
         if latest_mtime:
             from zoneinfo import ZoneInfo
             mt = datetime.fromtimestamp(latest_mtime, tz=timezone.utc)
@@ -906,6 +907,7 @@ def _read_scan_status(target: str = "") -> str:
         lines.append("等扫描完成或输入 /stop 中断后即可使用 /backfill")
         return "\n".join(lines)
     except Exception:
+        log.exception("Error generating status message (non-critical)")
         return ""
 
 

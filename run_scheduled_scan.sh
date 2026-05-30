@@ -13,6 +13,7 @@ INTERVAL_FILE="$SCRIPT_DIR/interval.json"
 LAST_RUN_FILE="$SCRIPT_DIR/.last_scheduled_scan"
 MONITOR_SCRIPT="$SCRIPT_DIR/monitor.py"
 LOCK_FILE="$SCRIPT_DIR/.monitor.lock"
+SKIP_LOGGED_FILE="$SCRIPT_DIR/.skip_logged_this_cycle"
 
 DEFAULT_INTERVAL=600
 
@@ -53,6 +54,7 @@ if (( ELAPSED >= INTERVAL )); then
     set -e
     if [ $py_exit -eq 0 ]; then
         echo "$NOW" > "$LAST_RUN_FILE"
+        rm -f "$SKIP_LOGGED_FILE"
         echo "[$(date "+%F %T")] Scheduled scan completed."
     elif [ $py_exit -eq 75 ]; then
         echo "[$(date "+%F %T")] Skipped due to concurrent lock (normal behavior, exit 75)."
@@ -60,5 +62,8 @@ if (( ELAPSED >= INTERVAL )); then
         echo "[$(date "+%F %T")] Scan failed (exit code $py_exit)."
     fi
 else
-    echo "[$(date "+%F %T")] Skipping (only ${ELAPSED}s elapsed)."
+    if [[ ! -f "$SKIP_LOGGED_FILE" ]]; then
+        echo "[$(date "+%F %T")] Skipping this cycle (will run again in ~$(( (INTERVAL - ELAPSED) / 60 )) min)"
+        touch "$SKIP_LOGGED_FILE"
+    fi
 fi
