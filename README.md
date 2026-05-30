@@ -27,7 +27,7 @@ download full-resolution originals and push them to a Telegram channel via the B
 - ✅ **User existence validation** — calls Civitai API to confirm the user has public works before adding
 - 💾 **Deduplication** — dual-layer save (track-end + final) prevents cron race conditions
 - 📋 **Push audit log** — every push is logged with ID, file, download status, and push result
-- 🧹 **Auto-cleanup** — removes cached files older than `keep_days`
+- 🧹 **Auto-cleanup** — removes cached files older than `keep_days`, and/or when total size exceeds `max_total_gb` (default 10GB)
 - 🗂 **Interactive remove & backfill** — button-based user selection with pagination
 
 ---
@@ -226,7 +226,7 @@ See [`config.yaml.example`](config.yaml.example) for the full schema. Key sectio
 | `video_enabled` | Enable/disable video detection and download |
 | `max_video_size_mb` | Skip videos larger than this (default: 1024) |
 | `api` | API base URL, page size |
-| `download` | Output directory, URL size-suffix replacements, cache retention |
+| `download` | Output directory, URL size-suffix replacements, **cache retention** (`keep_days` + `max_total_gb`) |
 | `http` | User-Agent, Referer, extra headers, **cookies_file** |
 | `telegram` | **Required** — bot token and chat/channel ID |
 | `authorized_users` | List of Telegram user IDs allowed to control the Bot |

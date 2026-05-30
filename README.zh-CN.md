@@ -26,7 +26,7 @@
 - ✅ **用户存在性验证** — 调 Civitai API 确认用户存在且有公开作品后才添加
 - 💾 **去重机制** — 双层保存（每track结束 + main最终保存），防止定时任务竞态导致重复推送
 - 📋 **推送审计日志** — 每次推送记录 ID、文件名、下载状态和推送结果
-- 🧹 **自动清理** — 自动删除超过 `keep_days` 天的缓存文件
+- 🧹 **自动清理** — 自动删除超过 `keep_days` 天的缓存文件，或当总大小超过 `max_total_gb`（默认 10GB）时清理最旧文件
 - 🗂 **交互式取消关注和回填** — 按钮选择用户，支持分页
 
 ---
@@ -220,7 +220,7 @@ image.civitai.com/xxx.mp4  ──301──►  B2 /default（仅封面图 JPEG �
 | `video_enabled` | 启用/禁用视频检测和下载 |
 | `max_video_size_mb` | 跳过大于此值的视频（默认 1024MB） |
 | `api` | API 地址、每页数量 |
-| `download` | 下载目录、URL 尺寸后缀、缓存保留天数 |
+| `download` | 下载目录、URL 尺寸后缀、**缓存保留策略**（`keep_days` + `max_total_gb`） |
 | `http` | User-Agent、Referer、自定义请求头、**cookies_file** |
 | `telegram` | **必填** — Bot Token 和频道/群组 Chat ID |
 | `authorized_users` | 允许控制 Bot 的 Telegram 用户 ID 列表 |
