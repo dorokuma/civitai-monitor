@@ -948,30 +948,8 @@ async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProce
     _register_backfill(str(tg_uid), username)
 
     try:
-        # Check if monitor is busy (returncode 75) before starting
-        proc_check = await asyncio.create_subprocess_exec(
-            sys.executable, str(MONITOR_SCRIPT), "--mode", "full", "--user", username,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(SCRIPT_DIR),
-            start_new_session=True,
-        )
-        try:
-            check_out, check_err = await asyncio.wait_for(proc_check.communicate(), timeout=10)
-        except asyncio.TimeoutError:
-            proc_check.kill()
-            await proc_check.wait()
-            _unregister_backfill(str(tg_uid), username)
-            return "busy"
-
-        if proc_check.returncode == 75:
-            _unregister_backfill(str(tg_uid), username)
-            return "busy"
-        if proc_check.returncode != 0:
-            _unregister_backfill(str(tg_uid), username)
-            return subprocess.CompletedProcess(args=[], returncode=proc_check.returncode, stderr=check_err.decode())
-
-        # Run actual backfill with stricter memory limit via wrapper
+        # Run backfill directly. If lock is held by scheduled scan,
+        # monitor.py exits 75 immediately (fcntl LOCK_NB), so this is fast either way.
         proc = await asyncio.create_subprocess_exec(
             sys.executable, str(SCRIPT_DIR / "backfill-memory-wrapper.py"),
             sys.executable, str(MONITOR_SCRIPT), "--mode", "full", "--user", username,
@@ -1006,6 +984,10 @@ async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProce
                     pass
             _unregister_backfill(str(tg_uid), username)
             return None
+
+        if proc.returncode == 75:
+            _unregister_backfill(str(tg_uid), username)
+            return "busy"
 
         _unregister_backfill(str(tg_uid), username)
         return subprocess.CompletedProcess(args=[], returncode=proc.returncode, stdout=out, stderr=err)
@@ -1176,7 +1158,7 @@ def _read_scan_status(target: str = "") -> str:
                 elif ahead == 0:
                     lines.append(f"→ @{target} 就是下一个！")
                 elif ahead < 0:
-                    lines.append(f"✅ @{target} 已经处理过了，可以直接用 /backfill")
+                    lines.append(f"✅ @{target} 已处理，排在当前进度之前，等扫描完即可使用 /backfill")
             except (ValueError, Exception):
                 pass
 
