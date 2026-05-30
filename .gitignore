@@ -23,3 +23,5 @@ Thumbs.db
 *.bak
 *.env
 monitor_status.json
+.last_scheduled_scan
+# systemd units (if user wants to manage separately)

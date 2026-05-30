@@ -1,0 +1,16 @@
+[Unit]
+Description=Civitai Monitor - Configurable Incremental Scanner
+After=network.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/root/civitai-monitor/civitai-bot.env
+User=root
+WorkingDirectory=/root/civitai-monitor
+ExecStart=/root/civitai-monitor/run_scheduled_scan.sh
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=2h
+
+[Install]
+WantedBy=multi-user.target
