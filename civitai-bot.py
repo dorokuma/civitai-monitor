@@ -20,6 +20,7 @@ Run as a systemd service for 24/7 availability.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import http.cookiejar
 import json
 import logging
@@ -27,6 +28,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,6 +65,147 @@ MONITOR_SCRIPT = SCRIPT_DIR / "monitor.py"
 
 # Scan interval config file
 INTERVAL_CONFIG = SCRIPT_DIR / "interval.json"
+
+# Active backfills state file (persists running backfill tasks across restarts)
+ACTIVE_BACKFILLS = SCRIPT_DIR / "active_backfills.json"
+
+
+# -----------------------------------------------------------------------
+# Dynamic Memory Limit
+# -----------------------------------------------------------------------
+
+# Memory limit constants
+_MEMORY_HARD_LIMIT = 1800 * 1024 * 1024  # 1800 MB hard cap in bytes
+
+
+def _get_system_memory_mb() -> int:
+    """Read total system memory in MB from /proc/meminfo."""
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    # Line format: "MemTotal:       16384084 kB"
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        kb = int(parts[1])
+                        return kb // 1024  # Convert kB to MB
+        return 0
+    except (OSError, ValueError):
+        return 0
+
+
+def _compute_memory_max_mb() -> int:
+    """Compute the MemoryMax for this service based on total system RAM.
+
+    Rules:
+      total <= 1GB  -> 55%
+      total 1-2GB   -> 60%
+      total >= 2GB  -> 65%  (capped at 1800 MB)
+    """
+    total_mb = _get_system_memory_mb()
+    if total_mb <= 0:
+        log.warning("Could not detect system memory, defaulting to 1500 MB")
+        return 1500
+
+    if total_mb <= 1024:
+        pct = 0.55
+    elif total_mb <= 2048:
+        pct = 0.60
+    else:
+        pct = 0.65
+
+    calculated = int(total_mb * pct)
+    capped = min(calculated, _MEMORY_HARD_LIMIT // (1024 * 1024))
+    log.info(
+        "Memory policy: detected %d MB total | %.0f%% = %d MB | hard cap = %d MB | final = %d MB",
+        total_mb, pct * 100, calculated, _MEMORY_HARD_LIMIT // (1024 * 1024), capped,
+    )
+    return capped
+
+
+def _apply_memory_limit(service_name: str = "civitai-bot.service") -> None:
+    """Apply MemoryMax limit to the systemd service via systemctl set-property."""
+    import subprocess as _sp
+    mem_mb = _compute_memory_max_mb()
+    mem_bytes = mem_mb * 1024 * 1024
+    try:
+        result = _sp.run(
+            ["systemctl", "set-property", "--now", service_name, f"MemoryMax={mem_bytes}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            log.info("Set MemoryMax=%d MB (%d bytes) on %s", mem_mb, mem_bytes, service_name)
+        else:
+            log.warning("Failed to set MemoryMax: %s", result.stderr.strip())
+    except Exception as e:
+        log.warning("Could not apply MemoryMax via systemctl: %s", e)
+
+
+def _load_active_backfills() -> dict[str, dict[str, str]]:
+    """Load active backfills state. Returns {tg_id: {username: last_active_iso, ...}, ...}."""
+    try:
+        return json.loads(ACTIVE_BACKFILLS.read_text())
+    except (json.JSONDecodeError, OSError, FileNotFoundError):
+        return {}
+
+
+def _save_active_backfills(data: dict[str, dict[str, str]]) -> None:
+    """Atomically write active backfills state via rename."""
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".tmp", dir=SCRIPT_DIR, delete=False, encoding="utf-8"
+    )
+    try:
+        json.dump(data, tmp)
+        tmp.close()
+        os.replace(tmp.name, str(ACTIVE_BACKFILLS))
+    except Exception:
+        if os.path.exists(tmp.name):
+            os.unlink(tmp.name)
+        raise
+
+
+def _acquire_backfill_lock(tg_id: str, username: str, timeout: float = 1.0) -> bool:
+    """Try to acquire an exclusive lock for a backfill task. Returns True if acquired."""
+    lock_path = SCRIPT_DIR / f".backfill_lock_{tg_id}_{username}"
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Got the lock — hold it for `timeout` seconds then auto-release
+        # We use a background thread to close the fd after timeout
+        def release_later():
+            time.sleep(timeout)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+                os.unlink(lock_path)
+            except OSError:
+                pass
+
+        import threading
+        threading.Thread(target=release_later, daemon=True).start()
+        return True
+    except (OSError, IOError):
+        return False
+
+
+def _register_backfill(tg_id: str, username: str) -> None:
+    """Register (or refresh) a running backfill so it can be resumed after restart."""
+    from datetime import datetime, timezone
+    data = _load_active_backfills()
+    if tg_id not in data:
+        data[tg_id] = {}
+    data[tg_id][username] = datetime.now(timezone.utc).isoformat()
+    _save_active_backfills(data)
+
+
+def _unregister_backfill(tg_id: str, username: str) -> None:
+    """Remove a backfill from the active registry (called on completion/failure)."""
+    data = _load_active_backfills()
+    if tg_id in data and username in data[tg_id]:
+        del data[tg_id][username]
+        if not data[tg_id]:
+            del data[tg_id]
+        _save_active_backfills(data)
 
 
 def _load_interval() -> int:
@@ -784,12 +927,13 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
             await query.edit_message_text(f"⏳ 正在全量回填 @{username}...\n这可能需要一段时间，完成后会通知你", reply_markup=None)
 
             try:
-                result = subprocess.run(
-                    [sys.executable, str(MONITOR_SCRIPT), "--mode", "full", "--user", username],
-                    capture_output=True, text=True, timeout=7200, cwd=str(SCRIPT_DIR),
-                )
+                result = await _run_backfill(username, uid)
 
-                if result.returncode == 75:
+                if result is None:
+                    # Timeout
+                    await query.message.reply_text("⏱ 回填超时（2小时）")
+                    return
+                if result == "busy":
                     progress = _read_scan_status(target=username)
                     msg = progress if progress else f"⏳ 当前有定时扫描正在运行，无法同时回填。\n等扫描完成或输入 /stop 中断后重试。"
                     await query.message.reply_text(msg, parse_mode="Markdown")
@@ -803,12 +947,162 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
                     f"✅ 回填 @{username} 完成\n{summary}",
                     parse_mode="Markdown",
                 )
-            except subprocess.TimeoutExpired:
-                await query.message.reply_text("⏱ 回填超时（2小时）")
             except Exception as e:
+                log.error("Backfill error: %s", e)
                 await query.message.reply_text(f"❌ 回填出错: {e}")
     except Exception as e:
-        log.error("Backfill callback error: %s", e)
+        log.error("Backfill callback outer error: %s", e)
+
+
+async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProcess | None | str:
+    """Run backfill as an async process group. Returns CompletedProcess, None (timeout), or 'busy'."""
+    _register_backfill(str(tg_uid), username)
+
+    try:
+        # Check if monitor is busy (returncode 75) before starting
+        proc_check = await asyncio.create_subprocess_exec(
+            sys.executable, str(MONITOR_SCRIPT), "--mode", "full", "--user", username,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(SCRIPT_DIR),
+            start_new_session=True,
+        )
+        try:
+            check_out, check_err = await asyncio.wait_for(proc_check.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            proc_check.kill()
+            await proc_check.wait()
+            _unregister_backfill(str(tg_uid), username)
+            return "busy"
+
+        if proc_check.returncode == 75:
+            _unregister_backfill(str(tg_uid), username)
+            return "busy"
+        if proc_check.returncode != 0:
+            _unregister_backfill(str(tg_uid), username)
+            return subprocess.CompletedProcess(args=[], returncode=proc_check.returncode, stderr=check_err.decode())
+
+        # Run actual backfill with stricter memory limit via wrapper
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(SCRIPT_DIR / "backfill-memory-wrapper.py"),
+            sys.executable, str(MONITOR_SCRIPT), "--mode", "full", "--user", username,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(SCRIPT_DIR),
+            start_new_session=True,
+        )
+
+        # Heartbeat: refresh timestamp every 60 seconds while backfill runs
+        import threading
+        def _heartbeat():
+            while True:
+                time.sleep(60)
+                _register_backfill(str(tg_uid), username)
+        heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+        heartbeat_thread.start()
+
+        try:
+            # 2-hour timeout
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=7200)
+        except asyncio.TimeoutError:
+            # Graceful SIGTERM then SIGKILL the whole process group
+            try:
+                os.killpg(proc.get_pid(), signal.SIGTERM)
+                await asyncio.wait_for(proc.wait(), timeout=30)
+            except (ProcessLookupError, asyncio.TimeoutError):
+                try:
+                    os.killpg(proc.get_pid(), signal.SIGKILL)
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+            _unregister_backfill(str(tg_uid), username)
+            return None
+
+        _unregister_backfill(str(tg_uid), username)
+        return subprocess.CompletedProcess(args=[], returncode=proc.returncode, stdout=out, stderr=err)
+
+    except Exception as e:
+        log.error("Backfill subprocess error: %s", e)
+        _unregister_backfill(str(tg_uid), username)
+        raise
+
+
+def _resume_stale_backfills(application: Application) -> None:
+    """Check active_backfills.json for tasks interrupted by previous shutdown and auto-resume them."""
+    active = _load_active_backfills()
+    if not active:
+        return
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    STALE_THRESHOLD_MINUTES = 30  # consider zombie if no heartbeat for 30 minutes
+
+    log.info("Found %d stale backfill tasks to resume: %s", len(active), active)
+
+    async def _do_resume(tg_id: str, username: str, last_active_str: str | None) -> None:
+        log.info("Auto-resuming backfill for @%s (user %s, last_active=%s)",
+                 username, tg_id, last_active_str)
+
+        # Check timestamp as secondary zombie detection
+        is_zombie_by_time = False
+        if last_active_str:
+            try:
+                last_active = datetime.fromisoformat(last_active_str)
+                # Ensure timezone-aware
+                if last_active.tzinfo is None:
+                    last_active = last_active.replace(tzinfo=timezone.utc)
+                age_minutes = (now - last_active).total_seconds() / 60
+                if age_minutes > STALE_THRESHOLD_MINUTES:
+                    is_zombie_by_time = True
+                    log.info("Task @%s is stale by time (%.1f min old) — will resume", username, age_minutes)
+            except Exception as e:
+                log.warning("Could not parse last_active %s for @%s: %s", last_active_str, username, e)
+
+        # Try to acquire lock to check if still running
+        lock_acquired = _acquire_backfill_lock(tg_id, username, timeout=2.0)
+        if not lock_acquired and not is_zombie_by_time:
+            log.info("Skipping @%s — lock held and not stale by time (zombie or still running)", username)
+            return
+
+        # Schedule as a background task
+        loop = asyncio.get_event_loop()
+        loop.create_task(_resume_backfill_task(application, tg_id, username))
+
+    for tg_id, users_dict in active.items():
+        for username, last_active_str in users_dict.items():
+            try:
+                _do_resume(tg_id, username, last_active_str)
+            except Exception as e:
+                log.error("Error resuming backfill @%s: %s", username, e)
+
+
+async def _resume_backfill_task(application: Application, tg_id: str, username: str) -> None:
+    """Run a resumed backfill and notify the user on completion."""
+    try:
+        result = await _run_backfill(username, int(tg_id))
+        if result is None:
+            log.warning("Resumed backfill @%s timed out", username)
+            return
+        if result == "busy":
+            log.warning("Resumed backfill @%s — monitor busy, will retry next bot start", username)
+            return
+        if result.returncode != 0:
+            log.warning("Resumed backfill @%s failed (exit %d)", username, result.returncode)
+            return
+
+        log.info("Resumed backfill @%s completed successfully", username)
+        # Notify user if chat_id is known
+        try:
+            chat_id = int(tg_id)
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=f"✅ 后台任务完成：@{username} 的全量回填已在重启后自动续接并完成",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            log.warning("Could not notify user %s: %s", tg_id, e)
+    except Exception as e:
+        log.error("Resumed backfill @%s error: %s", username, e)
 
 
 async def _render_backfill_page(query, users: list[str], page: int) -> None:
@@ -999,6 +1293,8 @@ async def post_init(application: Application) -> None:
         BotCommand("help", "显示所有命令说明"),
     ]
     await application.bot.set_my_commands(commands)
+    # Auto-resume any backfills that were interrupted by a previous shutdown
+    _resume_stale_backfills(application)
     # Start periodic scan as background task (PTBUserWarning is harmless)
     loop = asyncio.get_event_loop()
     loop.create_task(scheduled_scan_cron())
@@ -1012,6 +1308,10 @@ async def post_init(application: Application) -> None:
 
 def main() -> None:
     global AUTHORIZED_USER_IDS
+
+    # Apply dynamic memory limit before anything else
+    _apply_memory_limit()
+
     cfg = read_config()
     global _scan_interval
     _scan_interval = _load_interval()

@@ -290,6 +290,19 @@ civitai-monitor/
 
 ---
 
+## Minimum Hardware Requirements
+
+| Item | Requirement |
+|------|-------------|
+| **Minimum RAM** | 1 GB (Full Backfill can reach 1.7GB; 1GB machines work but 2GB+ recommended) |
+| **Recommended RAM** | 2 GB or above |
+| **Dynamic Memory Limit** | Bot auto-calculates limit at startup (≤1GB → 55%, 1-2GB → 60%, ≥2GB → 65%, hard cap 1.8GB) |
+| **Disk** | Varies by subscription count and cache strategy; 10GB+ recommended |
+
+> **Note**: Full Backfill has high memory usage. Low-memory machines (1GB) should monitor for OOM events. Backfill Auto-Resume is implemented — if killed by OOM, the task will auto-resume after restart.
+
+---
+
 ## Disclaimer & License
 
 ### Disclaimer
