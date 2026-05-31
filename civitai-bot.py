@@ -972,7 +972,6 @@ async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProce
             stderr=asyncio.subprocess.PIPE,
             cwd=str(SCRIPT_DIR),
             start_new_session=True,
-            encoding="utf-8",
         )
 
     # Heartbeat
@@ -1022,10 +1021,10 @@ async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProce
                 _unregister_backfill(str(tg_uid), username)
                 return None
             _unregister_backfill(str(tg_uid), username)
-            return subprocess.CompletedProcess(args=[], returncode=proc2.returncode, stdout=out, stderr=err)
+            out2 = out.decode("utf-8") if isinstance(out, bytes) else out; err2 = err.decode("utf-8") if isinstance(err, bytes) else err; return subprocess.CompletedProcess(args=[], returncode=proc2.returncode, stdout=out2, stderr=err2)
 
         _unregister_backfill(str(tg_uid), username)
-        return subprocess.CompletedProcess(args=[], returncode=proc.returncode, stdout=out, stderr=err)
+        out_final = out.decode("utf-8") if isinstance(out, bytes) else out; err_final = err.decode("utf-8") if isinstance(err, bytes) else err; return subprocess.CompletedProcess(args=[], returncode=proc.returncode, stdout=out_final, stderr=err_final)
 
     except Exception as e:
         log.error("Backfill subprocess error: %s", e)
