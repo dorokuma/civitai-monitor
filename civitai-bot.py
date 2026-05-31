@@ -923,9 +923,11 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
                     await query.message.reply_text("⏱ 回填超时（2小时）")
                     return
                 if result == "busy":
-                    progress = _read_scan_status(target=username)
-                    msg = progress if progress else "⏳ 当前有定时扫描正在运行，无法同时回填。\n等扫描完成或输入 /stop 中断后重试。"
-                    await query.message.reply_text(msg, parse_mode="Markdown")
+                    # Extremely unlikely: scan still running after kill+retry
+                    await query.message.reply_text(
+                        "❌ 无法获取回填锁，请稍后重试或输入 /stop 检查扫描状态",
+                        parse_mode="Markdown",
+                    )
                     return
                 if result.returncode != 0:
                     await query.message.reply_text(f"❌ 回填 @{username} 失败（exit {result.returncode}）\n{result.stderr[:500]}")
@@ -944,13 +946,26 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
 
 
 async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProcess | None | str:
-    """Run backfill as an async process group. Returns CompletedProcess, None (timeout), or 'busy'."""
+    """Run backfill as an async process group. Auto-kills conflicting scan if needed.
+    Returns CompletedProcess, None (timeout), or 'busy' (failed after kill+retry)."""
     _register_backfill(str(tg_uid), username)
+    import subprocess as _sp
 
-    try:
-        # Run backfill directly. If lock is held by scheduled scan,
-        # monitor.py exits 75 immediately (fcntl LOCK_NB), so this is fast either way.
-        proc = await asyncio.create_subprocess_exec(
+    def _kill_scan():
+        result = _sp.run(
+            ["pgrep", "-f", "python3.*/root/civitai-monitor/monitor.py"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pids = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
+        for pid in pids:
+            try:
+                _sp.run(["kill", "-9", pid], capture_output=True, timeout=3)
+                log.info("Killed scan process PID %s for backfill of @%s", pid, username)
+            except Exception as e:
+                log.warning("Failed to kill PID %s: %s", pid, e)
+
+    async def _launch():
+        return await asyncio.create_subprocess_exec(
             sys.executable, str(SCRIPT_DIR / "backfill-memory-wrapper.py"),
             sys.executable, str(MONITOR_SCRIPT), "--mode", "full", "--user", username,
             stdout=asyncio.subprocess.PIPE,
@@ -959,20 +974,20 @@ async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProce
             start_new_session=True,
         )
 
-        # Heartbeat: refresh timestamp every 60 seconds while backfill runs
-        import threading
-        def _heartbeat():
-            while True:
-                time.sleep(60)
-                _register_backfill(str(tg_uid), username)
-        heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
-        heartbeat_thread.start()
+    # Heartbeat
+    import threading
+    def _heartbeat():
+        while True:
+            time.sleep(60)
+            _register_backfill(str(tg_uid), username)
+    heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+    heartbeat_thread.start()
 
+    try:
+        proc = await _launch()
         try:
-            # 2-hour timeout
             out, err = await asyncio.wait_for(proc.communicate(), timeout=7200)
         except asyncio.TimeoutError:
-            # Graceful SIGTERM then SIGKILL the whole process group
             try:
                 os.killpg(proc.get_pid(), signal.SIGTERM)
                 await asyncio.wait_for(proc.wait(), timeout=30)
@@ -986,8 +1001,27 @@ async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProce
             return None
 
         if proc.returncode == 75:
+            # Scan is running — kill it and retry once
+            log.info("Backfill for @%s blocked by scan, killing scan and retrying", username)
+            _kill_scan()
+            await asyncio.sleep(2)
+            proc2 = await _launch()
+            try:
+                out, err = await asyncio.wait_for(proc2.communicate(), timeout=7200)
+            except asyncio.TimeoutError:
+                try:
+                    os.killpg(proc2.get_pid(), signal.SIGTERM)
+                    await asyncio.wait_for(proc2.wait(), timeout=30)
+                except (ProcessLookupError, asyncio.TimeoutError):
+                    try:
+                        os.killpg(proc2.get_pid(), signal.SIGKILL)
+                        await proc2.wait()
+                    except ProcessLookupError:
+                        pass
+                _unregister_backfill(str(tg_uid), username)
+                return None
             _unregister_backfill(str(tg_uid), username)
-            return "busy"
+            return subprocess.CompletedProcess(args=[], returncode=proc2.returncode, stdout=out, stderr=err)
 
         _unregister_backfill(str(tg_uid), username)
         return subprocess.CompletedProcess(args=[], returncode=proc.returncode, stdout=out, stderr=err)
@@ -1118,58 +1152,61 @@ def _human_size(bytes_: int) -> str:
     return f"{bytes_:.1f}TB"
 
 
-def _read_scan_status(target: str = "") -> str:
-    """Read current scan status from status file.
-    If target is provided, calculate queue position.
-    """
+def _is_scan_running() -> bool:
+    """Check if monitor scan is currently running via lock file."""
     try:
-        import json
+        import fcntl, os
+        lock_path = SCRIPT_DIR / ".monitor.lock"
+        if not lock_path.exists():
+            return False
+        fd = os.open(str(lock_path), os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.close(fd)
+            return False
+        except (BlockingIOError, OSError):
+            os.close(fd)
+            return True
+    except Exception:
+        return False
+
+
+def _kill_running_scan() -> list[str]:
+    """Kill any running monitor.py process. Returns list of killed PIDs."""
+    import subprocess as _sp
+    result = _sp.run(
+        ["pgrep", "-f", "python3.*/root/civitai-monitor/monitor.py"],
+        capture_output=True, text=True, timeout=5,
+    )
+    pids = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
+    killed = []
+    for pid in pids:
+        try:
+            _sp.run(["kill", "-9", pid], capture_output=True, timeout=3)
+            killed.append(pid)
+        except Exception:
+            pass
+    return killed
+
+
+def _read_scan_status() -> str:
+    """Check if monitor scan is running. Returns status text or empty string."""
+    if not _is_scan_running():
+        return ""
+    try:
+        import json, os, time
         path = SCRIPT_DIR / "monitor_status.json"
-        if not path.exists():
-            return ""
-        data = json.loads(path.read_text())
-        creator = data.get("current_creator", "")
-        done = data.get("creators_done", 0)
-        total = data.get("creators_total", 0)
-        pushed = data.get("pushed_count", 0)
-        elapsed = data.get("elapsed_seconds", 0)
-        if not creator:
-            return ""
-
-        lines = ["⏳ 定时扫描进行中"]
-        lines.append(f"当前：@{creator} \u00b7 进度 {done}/{total}")
-
-        # Calculate queue position if target is specified
-        if target:
-            try:
-                cfg_creators = []
-                for users in yaml.safe_load(open(CONFIG_PATH)).get("subscriptions", {}).values():
-                    for entry in users:
-                        u = entry.get("name", str(entry)) if isinstance(entry, dict) else str(entry)
-                        cfg_creators.append(u)
-                cur_idx = cfg_creators.index(creator)
-                tgt_idx = cfg_creators.index(target)
-                ahead = tgt_idx - cur_idx - 1
-                if ahead > 0:
-                    # List names ahead
-                    ahead_names = cfg_creators[cur_idx+1:tgt_idx]
-                    names_str = "\u3001".join(f"@{n}" for n in ahead_names)
-                    lines.append(f"@{target} 前面还有 {ahead} 个（{names_str}）")
-                elif ahead == 0:
-                    lines.append(f"→ @{target} 就是下一个！")
-                elif ahead < 0:
-                    lines.append(f"✅ @{target} 已处理，排在当前进度之前，等扫描完即可使用 /backfill")
-            except (ValueError, Exception):
-                pass
-
-        pushed_str = f"已推送 {pushed} 条" if pushed > 0 else "尚未有新推送"
+        elapsed = 0
+        if path.exists():
+            data = json.loads(path.read_text())
+            elapsed = data.get("elapsed_seconds", 0)
+        lines = ["⏳ 定时扫描运行中"]
         if elapsed >= 60:
-            lines.append(f"{pushed_str} \u00b7 已运行 {elapsed//60} 分钟")
+            lines.append(f"已运行 {elapsed//60} 分钟")
         else:
-            lines.append(f"{pushed_str} \u00b7 已运行 {elapsed} 秒")
-
+            lines.append(f"已运行 {elapsed} 秒")
         lines.append("")
-        lines.append("等扫描完成或输入 /stop 中断后即可使用 /backfill")
+        lines.append("输入 /stop 终止扫描后即可 /backfill")
         return "\n".join(lines)
     except Exception:
         log.exception("Error generating status message (non-critical)")
