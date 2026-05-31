@@ -1250,6 +1250,13 @@ async def scheduled_scan_cron() -> None:
     """Run monitor.py every 10 minutes as background task."""
     proc = None
     while not _shutdown_requested:
+        active_backfills = _load_active_backfills()
+        if active_backfills:
+            log.info("Scheduled scan skipped: active backfill(s) %s", list(active_backfills.keys()))
+            if _shutdown_requested:
+                break
+            await asyncio.sleep(_scan_interval)
+            continue
         try:
             log.info("Scheduled scan starting...")
             proc = await asyncio.create_subprocess_exec(
