@@ -972,6 +972,7 @@ async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProce
             stderr=asyncio.subprocess.PIPE,
             cwd=str(SCRIPT_DIR),
             start_new_session=True,
+            encoding=utf-8,
         )
 
     # Heartbeat
