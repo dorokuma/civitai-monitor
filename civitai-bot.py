@@ -972,15 +972,17 @@ async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProce
             stderr=asyncio.subprocess.PIPE,
             cwd=str(SCRIPT_DIR),
             start_new_session=True,
-            encoding="utf-8",
         )
 
     # Heartbeat
     import threading
     def _heartbeat():
         while True:
-            time.sleep(60)
-            _register_backfill(str(tg_uid), username)
+            try:
+                time.sleep(10)
+                _register_backfill(str(tg_uid), username)
+            except Exception as e:
+                log.warning("Backfill heartbeat for @%s failed: %s", username, e)
     heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
     heartbeat_thread.start()
 
@@ -1039,6 +1041,8 @@ def _resume_stale_backfills(application: Application) -> None:
     if not active:
         return
 
+    loop = asyncio.get_running_loop()
+
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
     STALE_THRESHOLD_MINUTES = 30  # consider zombie if no heartbeat for 30 minutes
@@ -1071,13 +1075,12 @@ def _resume_stale_backfills(application: Application) -> None:
             return
 
         # Schedule as a background task
-        loop = asyncio.get_event_loop()
         loop.create_task(_resume_backfill_task(application, tg_id, username))
 
     for tg_id, users_dict in active.items():
         for username, last_active_str in users_dict.items():
             try:
-                _do_resume(tg_id, username, last_active_str)
+                loop.create_task(_do_resume(tg_id, username, last_active_str))
             except Exception as e:
                 log.error("Error resuming backfill @%s: %s", username, e)
 
@@ -1312,8 +1315,7 @@ async def post_init(application: Application) -> None:
     # Auto-resume any backfills that were interrupted by a previous shutdown
     _resume_stale_backfills(application)
     # Start periodic scan as background task (PTBUserWarning is harmless)
-    loop = asyncio.get_event_loop()
-    loop.create_task(scheduled_scan_cron())
+    asyncio.create_task(scheduled_scan_cron())
     log.info(f"Slash commands registered. Scheduled scan every {_scan_interval//60}min. Ready.")
 
 
