@@ -1,18 +1,25 @@
-"""Tests for monitor.py — nsfw_tracks, seen_ids, cleanup_old_caches, atomic writes."""
+"""Tests for monitor.py — nsfw_tracks, seen_ids, cleanup_old_caches, atomic writes,
+plus the safety helpers we just added (fetch_page limit clamp, video size cap,
+signal handler, URL normalization)."""
 
 import os
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from monitor import (
+    _monitor_signal_handler,
     cleanup_old_caches,
+    fetch_page,
     load_pushed_ids,
     load_seen_ids,
     nsfw_tracks,
+    normalize_to_original,
     pushed_file_for_user,
+    save_pushed_ids,
     save_seen_ids,
     seen_file_for_user,
 )
@@ -117,3 +124,192 @@ class TestCleanupOldCaches:
         removed = cleanup_old_caches(tmp_dir, keep_days=0, max_total_gb=0)
         assert f.exists()  # 0 means "don't touch date-based cleanup"
         assert removed == 0
+
+
+# ---------------------------------------------------------------------------
+# normalize_to_original — strip size suffixes to get full-res
+# ---------------------------------------------------------------------------
+
+class TestNormalizeToOriginal:
+    def test_replaces_width_1024(self):
+        url = "https://image.civitai.com/x/abc/width=1024/file.jpeg"
+        assert normalize_to_original(url) == "https://image.civitai.com/x/abc/width=original/file.jpeg"
+
+    def test_replaces_width_450(self):
+        url = "https://image.civitai.com/x/abc/width=450/file.jpeg"
+        assert normalize_to_original(url) == "https://image.civitai.com/x/abc/width=original/file.jpeg"
+
+    def test_replaces_width_640(self):
+        url = "https://image.civitai.com/x/abc/width=640/file.jpeg"
+        assert normalize_to_original(url) == "https://image.civitai.com/x/abc/width=original/file.jpeg"
+
+    def test_passthrough_when_no_known_suffix(self):
+        url = "https://image.civitai.com/x/abc/some_other_url.jpeg"
+        assert normalize_to_original(url) == url
+
+    def test_custom_suffixes(self):
+        url = "https://x.com/y/width=512/file.jpeg"
+        out = normalize_to_original(url, size_suffixes=["/width=512/"])
+        assert out == "https://x.com/y/width=original/file.jpeg"
+
+
+# ---------------------------------------------------------------------------
+# fetch_page — limit clamping, error handling, fallback
+# ---------------------------------------------------------------------------
+
+class TestFetchPageLimitClamp:
+    """The API silently caps or rejects out-of-range `limit` values, so the
+    client must clamp before sending. Regression for an audit finding."""
+
+    def _mock_response(self, items=None, next_cursor=""):
+        resp = MagicMock()
+        resp.json.return_value = {
+            "items": items or [],
+            "metadata": {"nextCursor": next_cursor},
+        }
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    def test_clamps_huge_limit_to_200(self):
+        """If config writes images_per_page: 10000 we must not send it raw."""
+        with patch("monitor.safe_get") as mock_get:
+            mock_get.return_value = self._mock_response()
+            with patch.dict(os.environ, {}, clear=False):
+                fetch_page("alice", limit=10000)
+        sent_params = mock_get.call_args.kwargs["params"]
+        assert sent_params["limit"] == 200
+
+    def test_clamps_zero_or_negative_to_one(self):
+        with patch("monitor.safe_get") as mock_get:
+            mock_get.return_value = self._mock_response()
+            fetch_page("alice", limit=0)
+        assert mock_get.call_args.kwargs["params"]["limit"] == 1
+        mock_get.reset_mock()
+        with patch("monitor.safe_get") as mock_get:
+            mock_get.return_value = self._mock_response()
+            fetch_page("alice", limit=-5)
+        assert mock_get.call_args.kwargs["params"]["limit"] == 1
+
+    def test_preserves_normal_limit(self):
+        with patch("monitor.safe_get") as mock_get:
+            mock_get.return_value = self._mock_response()
+            fetch_page("alice", limit=100)
+        assert mock_get.call_args.kwargs["params"]["limit"] == 100
+
+    def test_uses_civitai_red_when_nsfw_true(self):
+        """NSFW track must hit civitai.red with browsingLevel=8."""
+        with patch("monitor.safe_get") as mock_get:
+            mock_get.return_value = self._mock_response()
+            fetch_page("alice", nsfw=True, sort="Newest")
+        called_url = mock_get.call_args.args[0]
+        assert called_url.startswith("https://civitai.red/api/v1/images")
+        sent = mock_get.call_args.kwargs["params"]
+        assert sent["nsfw"] == "true"
+        assert sent["browsingLevel"] == 8
+
+    def test_falls_back_to_unsorted_when_newest_returns_empty(self):
+        """Some users (e.g. PotatoMan760) have the Newest-sort bug — retry
+        without sort when first call returns 0 items."""
+        empty = self._mock_response(items=[])
+        items = self._mock_response(items=[{"id": 1, "url": "x"}])
+        with patch("monitor.safe_get") as mock_get:
+            mock_get.side_effect = [empty, items]
+            fetched, cursor = fetch_page("alice", nsfw=False, sort="Newest")
+        assert mock_get.call_count == 2
+        # Second call must not have `sort` parameter
+        second_params = mock_get.call_args_list[1].kwargs["params"]
+        assert "sort" not in second_params
+        assert len(fetched) == 1
+
+    def test_returns_empty_and_no_cursor_on_empty_response(self):
+        """When both attempts return 0 items, return ([], '') so the loop terminates."""
+        with patch("monitor.safe_get") as mock_get:
+            mock_get.return_value = self._mock_response(items=[])
+            fetched, cursor = fetch_page("alice", nsfw=False, sort="Newest")
+        assert fetched == []
+        assert cursor == ""
+
+    def test_network_error_returns_empty(self):
+        """A 5xx must not crash the loop — return ([], '') and let the caller skip."""
+        import requests as _req
+        with patch("monitor.safe_get", side_effect=_req.RequestException("boom")):
+            fetched, cursor = fetch_page("alice", nsfw=False, sort="Newest")
+        assert fetched == []
+        assert cursor == ""
+
+
+# ---------------------------------------------------------------------------
+# save_pushed_ids / load_pushed_ids — already partially covered, finish the loop
+# ---------------------------------------------------------------------------
+
+class TestPushedIdsRoundTrip:
+    @pytest.fixture
+    def tmp_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            yield Path(d)
+
+    def test_save_and_load_pushed_ids(self, tmp_dir):
+        save_pushed_ids(tmp_dir, "tg1", "alice", {100, 200, 300})
+        assert load_pushed_ids(tmp_dir, "tg1", "alice") == {100, 200, 300}
+
+    def test_pushed_ids_atomic_write_no_tmp_leftover(self, tmp_dir):
+        path = pushed_file_for_user(tmp_dir, "tg1", "alice")
+        save_pushed_ids(tmp_dir, "tg1", "alice", {1, 2})
+        assert path.exists()
+        assert not path.with_suffix(".tmp").exists()
+
+    def test_pushed_ids_load_missing_returns_empty(self, tmp_dir):
+        assert load_pushed_ids(tmp_dir, "tg1", "missing") == set()
+
+
+# ---------------------------------------------------------------------------
+# _monitor_signal_handler — sets the shutdown flag on SIGTERM/SIGINT
+# ---------------------------------------------------------------------------
+
+class TestMonitorSignalHandler:
+    def setup_method(self):
+        # Reset module-level flag between tests
+        import monitor as _m
+        _m._monitor_shutdown_requested = False
+
+    def test_first_signal_sets_flag(self):
+        import monitor as _m
+        _monitor_signal_handler(15, None)  # 15 = SIGTERM
+        assert _m._monitor_shutdown_requested is True
+
+    def test_second_signal_is_idempotent(self):
+        import monitor as _m
+        _m._monitor_shutdown_requested = False
+        _monitor_signal_handler(15, None)
+        _monitor_signal_handler(15, None)  # second time should be no-op
+        # Flag stays True; second call is a no-op (just to confirm it doesn't crash)
+        assert _m._monitor_shutdown_requested is True
+
+
+# ---------------------------------------------------------------------------
+# IncrementalConfig — guards against first-run-flood on big-history creators
+# ---------------------------------------------------------------------------
+
+class TestIncrementalMaxPages:
+    """Regression: a 1k+ item creator used to push their entire history
+    on the very first scan. ``max_pages`` caps this per track."""
+
+    def test_default_is_five(self):
+        from monitor import IncrementalConfig
+        cfg = IncrementalConfig()
+        assert cfg.max_pages == 5
+
+    def test_zero_means_no_extra_cap_relies_on_caught_up(self):
+        """max_pages=0 makes the inner while loop run 0 times — no pages fetched.
+
+        Useful as a disable switch; relies on the next scan catching up via
+        the seen-id overlap.
+        """
+        from monitor import IncrementalConfig
+        assert IncrementalConfig(max_pages=0).max_pages == 0
+
+    def test_monitor_config_includes_incremental_section(self):
+        from monitor import MonitorConfig
+        cfg = MonitorConfig(telegram={"bot_token": "t", "chat_id": "c"})
+        assert cfg.incremental.max_pages == 5
+

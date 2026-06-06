@@ -158,34 +158,63 @@ def _save_active_backfills(data: dict[str, dict[str, str]]) -> None:
         json.dump(data, tmp)
         tmp.close()
         os.replace(tmp.name, str(ACTIVE_BACKFILLS))
-    except Exception:
+    except Exception as e:
+        log.error("Failed to save active_backfills.json: %s", e)
         if os.path.exists(tmp.name):
             os.unlink(tmp.name)
         raise
 
 
-def _acquire_backfill_lock(tg_id: str, username: str, timeout: float = 1.0) -> bool:
-    """Try to acquire an exclusive lock for a backfill task. Returns True if acquired."""
-    lock_path = SCRIPT_DIR / f".backfill_lock_{tg_id}_{username}"
-    try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        # Got the lock — hold it for `timeout` seconds then auto-release
-        # We use a background thread to close the fd after timeout
-        def release_later():
-            time.sleep(timeout)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
-                os.unlink(lock_path)
-            except OSError:
-                pass
+# ---------------------------------------------------------------------------
+# Real backfill lock — held by the bot for the entire backfill lifecycle.
+# Returns the open fd; caller must call _release_backfill_lock(fd, path) to free.
+# Two-tier protection:
+#   1. This fd-level flock: prevents concurrent backfills across bot restarts
+#      (a fresh bot sees the fd held by an orphaned process and bails out).
+#   2. The asyncio.Lock (`_backfill_serial_lock`) below: serialises backfill
+#      tasks within the same bot process.
+# ---------------------------------------------------------------------------
+def _acquire_backfill_lock(tg_id: str, username: str) -> tuple[int, Path] | None:
+    """Acquire an exclusive fcntl flock for the backfill. Returns (fd, path) or None.
 
-        import threading
-        threading.Thread(target=release_later, daemon=True).start()
-        return True
+    The lock is held until the caller releases it via _release_backfill_lock().
+    Use the .backfill_lock_*.lck file as a sentinel; remove the file on release.
+    """
+    lock_path = SCRIPT_DIR / f".backfill_lock_{tg_id}_{username}.lck"
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd, lock_path
     except (OSError, IOError):
-        return False
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        return None
+
+
+def _release_backfill_lock(fd: int, path: Path) -> None:
+    """Release the fcntl flock and remove the lock file."""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+# In-process serialisation: only one backfill runs at a time per bot process.
+_backfill_serial_lock: asyncio.Lock | None = None
+
+
+def _get_backfill_serial_lock() -> asyncio.Lock:
+    global _backfill_serial_lock
+    if _backfill_serial_lock is None:
+        _backfill_serial_lock = asyncio.Lock()
+    return _backfill_serial_lock
 
 
 def _register_backfill(tg_id: str, username: str) -> None:
@@ -223,20 +252,16 @@ def _save_interval(seconds: int) -> None:
 
 _scan_interval: int = 600
 
-# Graceful shutdown flag
+# Track the current scheduled-scan subprocess so cmd_stop can terminate it
+# without using pgrep — pgrep "python3.*monitor.py" would also match a
+# running backfill subprocess and kill the wrong thing.
+_current_scan_proc: asyncio.subprocess.Process | None = None
+
+# Loop-exit flag for scheduled_scan_cron. In production this is never
+# set — the scan task is torn down by PTB's Application.stop(), and the
+# finally-block handles the subprocess cleanup. The flag exists for
+# tests and as a documented early-exit hook.
 _shutdown_requested = False
-
-
-def _signal_handler(signum, frame):
-    """Set shutdown flag on SIGTERM/SIGINT, let current scan finish."""
-    global _shutdown_requested
-    if _shutdown_requested:
-        return
-    _shutdown_requested = True
-    log.info("Shutdown requested (signal %d), waiting for current scan to finish...", signum)
-
-signal.signal(signal.SIGTERM, _signal_handler)
-signal.signal(signal.SIGINT, _signal_handler)
 
 # Authorised user — resolved from config at startup
 AUTHORIZED_USER_IDS: set[int] = set()
@@ -766,23 +791,46 @@ async def cmd_cleanup(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually trigger an incremental scan (mostly for debugging).
+
+    Uses asyncio.create_subprocess_exec instead of blocking subprocess.run
+    so the PTB event loop stays responsive — other Telegram messages
+    (e.g. /list, /help, /backfill) are not blocked while scan runs.
+    """
     if not await _check_auth(update):
         return
-    await update.message.reply_text("🔍 Running incremental scan... (this may take a minute)")
+    await update.message.reply_text("🔍 Running incremental scan...")
     try:
-        result = subprocess.run(
-            [sys.executable, str(MONITOR_SCRIPT)],
-            capture_output=True, text=True, timeout=300, cwd=str(SCRIPT_DIR),
+        # 30-minute ceiling: incremental normally takes a few minutes, but
+        # 8 users × slow Civitai API + video downloads can stretch it. The
+        # scheduled cron (scheduled_scan_cron) runs without an arbitrary
+        # ceiling — it just waits for the subprocess to finish on its own.
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(MONITOR_SCRIPT),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(SCRIPT_DIR),
         )
-        stderr = result.stderr.strip()
-        if result.returncode == 75:
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=1800)
+        except asyncio.TimeoutError:
+            try:
+                proc.terminate()
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except (ProcessLookupError, asyncio.TimeoutError):
+                proc.kill()
+                await proc.wait()
+            await update.message.reply_text("⏱ 扫描超时（30 分钟）已终止。")
+            return
+        stderr = err.decode("utf-8") if isinstance(err, bytes) else err
+        if proc.returncode == 75:
             progress = _read_scan_status()
             msg = progress if progress else "⏳ 当前有定时扫描正在运行。"
             await update.message.reply_text(msg, parse_mode="Markdown")
             return
-        if result.returncode != 0:
+        if proc.returncode != 0:
             await update.message.reply_text(
-                f"❌ Scan failed (exit {result.returncode}):\n`{stderr[-500:]}`",
+                f"❌ Scan failed (exit {proc.returncode}):\n`{stderr[-500:]}`",
                 parse_mode="Markdown",
             )
             return
@@ -793,8 +841,6 @@ async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"✅ Scan complete.\n{summary}",
             parse_mode="Markdown",
         )
-    except subprocess.TimeoutExpired:
-        await update.message.reply_text("⏱ Scan timed out after 5 minutes.")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
@@ -827,21 +873,32 @@ async def cmd_stop(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Stop the current scheduled scan so you can /backfill."""
     if not await _check_auth(update):
         return
-    import subprocess as _sp
+    proc = _current_scan_proc
+    if proc is None or proc.returncode is not None:
+        await update.message.reply_text("当前没有正在运行的定时扫描。")
+        return
+    pid = proc.pid
     try:
-        # Find and kill the running monitor.py (not bot, not emby)
-        result = _sp.run(["pgrep", "-f", "python3.*/root/civitai-monitor/monitor.py"],
-                         capture_output=True, text=True, timeout=5)
-        pids = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
-        if not pids:
-            await update.message.reply_text("当前没有正在运行的定时扫描。")
-            return
-        for pid in pids:
-            _sp.run(["kill", pid], capture_output=True, timeout=3)
-        await update.message.reply_text(
-            f"🛑 已终止定时扫描（PID: {', '.join(pids)}）。\n"
-            f"锁已释放，你现在可以用 `/backfill` 了。"
-        )
+        proc.terminate()  # SIGTERM — monitor.py will save state and exit cleanly
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=30)
+            await update.message.reply_text(
+                f"🛑 已终止定时扫描（PID: {pid}）。\n"
+                f"锁已释放，你现在可以用 `/backfill` 了。"
+            )
+        except asyncio.TimeoutError:
+            log.warning("Scan PID %s did not exit in 30s, sending SIGKILL", pid)
+            proc.kill()
+            try:
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+            await update.message.reply_text(
+                f"🛑 扫描 PID {pid} 不响应 SIGTERM，已 SIGKILL。\n"
+                f"你现在可以用 `/backfill` 了。"
+            )
+    except ProcessLookupError:
+        await update.message.reply_text("扫描进程已不在了，锁应该已释放。")
     except Exception as e:
         await update.message.reply_text(f"❌ 终止失败: {e}")
 
@@ -946,93 +1003,93 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
 
 
 async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProcess | None | str:
-    """Run backfill as an async process group. Auto-kills conflicting scan if needed.
-    Returns CompletedProcess, None (timeout), or 'busy' (failed after kill+retry)."""
-    _register_backfill(str(tg_uid), username)
-    import subprocess as _sp
+    """Run backfill serially within this bot process.
 
-    def _kill_scan():
-        result = _sp.run(
-            ["pgrep", "-f", "python3.*/root/civitai-monitor/monitor.py"],
-            capture_output=True, text=True, timeout=5,
-        )
-        pids = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
-        for pid in pids:
+    Two layers of protection:
+      1. ``_backfill_serial_lock`` (asyncio.Lock): serialises concurrent backfill
+         tasks within the same bot — multiple Telegram button presses queue up
+         instead of racing for the .monitor.lock.
+      2. ``_acquire_backfill_lock`` (fcntl.flock): cross-process lock so that a
+         restarted bot can detect a backfill already in progress and not resume
+         it. The lock is held for the full backfill lifetime.
+
+    The heartbeat is now an ``asyncio`` task scheduled via ``loop.call_later``,
+    bound to the lifetime of this coroutine. The ``finally`` block cancels the
+    heartbeat and unregisters the backfill, regardless of how we exit (success,
+    timeout, exception). This eliminates the daemon-thread leak that previously
+    kept ``active_backfills.json`` populated forever after a hung task.
+
+    Returns CompletedProcess, None (timeout), or 'busy' (cross-process lock held).
+    """
+    tg_id_str = str(tg_uid)
+
+    # Layer 1: cross-process lock. If another bot process holds it, bail out
+    # immediately (the original bot is still running the backfill).
+    cross_lock = _acquire_backfill_lock(tg_id_str, username)
+    if cross_lock is None:
+        log.info("Backfill for @%s skipped: cross-process lock held", username)
+        return "busy"
+    cross_fd, cross_path = cross_lock
+
+    # Layer 2: in-process serialisation. Multiple Telegram button presses for
+    # the SAME user will collapse into one backfill; presses for DIFFERENT users
+    # will queue behind this one.
+    async with _get_backfill_serial_lock():
+        # Register and start heartbeat BEFORE launching subprocess so the file
+        # is populated the moment a concurrent scan tick arrives.
+        _register_backfill(tg_id_str, username)
+        loop = asyncio.get_running_loop()
+        heartbeat_handle: asyncio.TimerHandle | None = None
+
+        def _heartbeat_tick() -> None:
+            """Refresh active_backfills.json. Schedules itself again."""
+            nonlocal heartbeat_handle
             try:
-                _sp.run(["kill", "-9", pid], capture_output=True, timeout=3)
-                log.info("Killed scan process PID %s for backfill of @%s", pid, username)
-            except Exception as e:
-                log.warning("Failed to kill PID %s: %s", pid, e)
-
-    async def _launch():
-        return await asyncio.create_subprocess_exec(
-            sys.executable, str(SCRIPT_DIR / "backfill-memory-wrapper.py"),
-            sys.executable, str(MONITOR_SCRIPT), "--mode", "full", "--user", username,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(SCRIPT_DIR),
-            start_new_session=True,
-        )
-
-    # Heartbeat
-    import threading
-    def _heartbeat():
-        while True:
-            try:
-                time.sleep(10)
-                _register_backfill(str(tg_uid), username)
+                _register_backfill(tg_id_str, username)
             except Exception as e:
                 log.warning("Backfill heartbeat for @%s failed: %s", username, e)
-    heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
-    heartbeat_thread.start()
+            heartbeat_handle = loop.call_later(10.0, _heartbeat_tick)
 
-    try:
-        proc = await _launch()
+        heartbeat_handle = loop.call_later(10.0, _heartbeat_tick)
+
         try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=7200)
-        except asyncio.TimeoutError:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, str(SCRIPT_DIR / "backfill-memory-wrapper.py"),
+                sys.executable, str(MONITOR_SCRIPT), "--mode", "full", "--user", username,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(SCRIPT_DIR),
+                start_new_session=True,
+            )
             try:
-                os.killpg(proc.get_pid(), signal.SIGTERM)
-                await asyncio.wait_for(proc.wait(), timeout=30)
-            except (ProcessLookupError, asyncio.TimeoutError):
-                try:
-                    os.killpg(proc.get_pid(), signal.SIGKILL)
-                    await proc.wait()
-                except ProcessLookupError:
-                    pass
-            _unregister_backfill(str(tg_uid), username)
-            return None
-
-        if proc.returncode == 75:
-            # Scan is running — kill it and retry once
-            log.info("Backfill for @%s blocked by scan, killing scan and retrying", username)
-            _kill_scan()
-            await asyncio.sleep(2)
-            proc2 = await _launch()
-            try:
-                out, err = await asyncio.wait_for(proc2.communicate(), timeout=7200)
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=7200)
             except asyncio.TimeoutError:
+                log.warning("Backfill for @%s exceeded 2h timeout, killing", username)
                 try:
-                    os.killpg(proc2.get_pid(), signal.SIGTERM)
-                    await asyncio.wait_for(proc2.wait(), timeout=30)
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    await asyncio.wait_for(proc.wait(), timeout=30)
                 except (ProcessLookupError, asyncio.TimeoutError):
                     try:
-                        os.killpg(proc2.get_pid(), signal.SIGKILL)
-                        await proc2.wait()
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        await proc.wait()
                     except ProcessLookupError:
                         pass
-                _unregister_backfill(str(tg_uid), username)
                 return None
-            _unregister_backfill(str(tg_uid), username)
-            out2 = out.decode("utf-8") if isinstance(out, bytes) else out; err2 = err.decode("utf-8") if isinstance(err, bytes) else err; return subprocess.CompletedProcess(args=[], returncode=proc2.returncode, stdout=out2, stderr=err2)
 
-        _unregister_backfill(str(tg_uid), username)
-        out_final = out.decode("utf-8") if isinstance(out, bytes) else out; err_final = err.decode("utf-8") if isinstance(err, bytes) else err; return subprocess.CompletedProcess(args=[], returncode=proc.returncode, stdout=out_final, stderr=err_final)
-
-    except Exception as e:
-        log.error("Backfill subprocess error: %s", e)
-        _unregister_backfill(str(tg_uid), username)
-        raise
+            out_str = out.decode("utf-8") if isinstance(out, bytes) else out
+            err_str = err.decode("utf-8") if isinstance(err, bytes) else err
+            returncode = proc.returncode if proc.returncode is not None else -1
+            return subprocess.CompletedProcess(
+                args=[], returncode=returncode, stdout=out_str, stderr=err_str
+            )
+        finally:
+            # Heartbeat is always cancelled; active_backfills is always cleared.
+            # This is the only path that touches the registry for a backfill, so
+            # a hung task can no longer leak state.
+            if heartbeat_handle is not None:
+                heartbeat_handle.cancel()
+            _unregister_backfill(tg_id_str, username)
+            _release_backfill_lock(cross_fd, cross_path)
 
 
 def _resume_stale_backfills(application: Application) -> None:
@@ -1068,10 +1125,17 @@ def _resume_stale_backfills(application: Application) -> None:
             except Exception as e:
                 log.warning("Could not parse last_active %s for @%s: %s", last_active_str, username, e)
 
-        # Try to acquire lock to check if still running
-        lock_acquired = _acquire_backfill_lock(tg_id, username, timeout=2.0)
-        if not lock_acquired and not is_zombie_by_time:
-            log.info("Skipping @%s — lock held and not stale by time (zombie or still running)", username)
+        # Try to acquire the cross-process lock briefly to detect a running
+        # backfill. We use timeout=0 (pure probe) — if the lock is held we know
+        # another process is still working on it. The lock file is closed
+        # immediately after the probe so we never accidentally hold it.
+        probe = _acquire_backfill_lock(tg_id, username)
+        if probe is not None:
+            fd, path = probe
+            _release_backfill_lock(fd, path)
+        lock_free = probe is not None
+        if not lock_free and not is_zombie_by_time:
+            log.info("Skipping @%s — cross-process lock held and not stale by time (still running)", username)
             return
 
         # Schedule as a background task
@@ -1159,7 +1223,6 @@ def _human_size(bytes_: int) -> str:
 def _is_scan_running() -> bool:
     """Check if monitor scan is currently running via lock file."""
     try:
-        import fcntl, os
         lock_path = SCRIPT_DIR / ".monitor.lock"
         if not lock_path.exists():
             return False
@@ -1175,22 +1238,32 @@ def _is_scan_running() -> bool:
         return False
 
 
-def _kill_running_scan() -> list[str]:
-    """Kill any running monitor.py process. Returns list of killed PIDs."""
-    import subprocess as _sp
-    result = _sp.run(
-        ["pgrep", "-f", "python3.*/root/civitai-monitor/monitor.py"],
-        capture_output=True, text=True, timeout=5,
-    )
-    pids = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
-    killed = []
-    for pid in pids:
+def _kill_running_scan() -> list[int]:
+    """Terminate the current scheduled scan subprocess. Returns list of killed PIDs.
+
+    Uses the tracked ``_current_scan_proc`` instead of pgrep, because pgrep on
+    "python3.*monitor.py" would also match an in-flight backfill subprocess
+    and kill the wrong thing. (Backfills start with ``start_new_session=True``,
+    so pgrep can't distinguish them by session either.)
+    """
+    proc = _current_scan_proc
+    if proc is None or proc.returncode is not None:
+        return []
+    pid = proc.pid
+    try:
+        proc.terminate()
         try:
-            _sp.run(["kill", "-9", pid], capture_output=True, timeout=3)
-            killed.append(pid)
+            # Block synchronously for up to 30s — caller is typically a sync
+            # teardown path (e.g. ``_apply_memory_limit`` reaping stale scans).
+            proc.wait_timeout = 30  # type: ignore[attr-defined]
         except Exception:
             pass
-    return killed
+        return [pid]
+    except ProcessLookupError:
+        return []
+    except Exception as e:
+        log.warning("Failed to terminate scan PID %s: %s", pid, e)
+        return []
 
 
 def _read_scan_status() -> str:
@@ -1198,7 +1271,7 @@ def _read_scan_status() -> str:
     if not _is_scan_running():
         return ""
     try:
-        import json, os, time
+        import json
         path = SCRIPT_DIR / "monitor_status.json"
         elapsed = 0
         if path.exists():
@@ -1241,7 +1314,8 @@ def _summarise_log(stderr: str) -> str:
             seen.add(line)
             unique.append(line)
 
-    return "```\n" + "\n".join(unique[-15:]) + "\n```"
+    safe_lines = [l.replace(chr(96), chr(92)+chr(96)) for l in unique[-15:]]
+    return chr(96)*3 + chr(10) + chr(10).join(safe_lines) + chr(10) + chr(96)*3
 
 
 # ---------------------------------------------------------------------------
@@ -1250,50 +1324,144 @@ def _summarise_log(stderr: str) -> str:
 
 
 async def scheduled_scan_cron() -> None:
-    """Run monitor.py every 10 minutes as background task."""
-    proc = None
-    while not _shutdown_requested:
-        active_backfills = _load_active_backfills()
-        if active_backfills:
-            log.info("Scheduled scan skipped: active backfill(s) %s", list(active_backfills.keys()))
+    """Run monitor.py on a configurable interval as a background task.
+
+    Lifecycle:
+      * Loops until PTB's Application.stop() tears the task down. The
+        ``_shutdown_requested`` flag is a tests-only early-exit hook;
+        in production it is never set.
+      * Each iteration:
+          1. Stale-watchdog: if ``active_backfills.json`` contains tasks that
+             have not been refreshed in STALE_BACKFILL_MINUTES, treat them as
+             zombie (e.g. the previous bot died while holding them) and
+             unregister them. This is the only safety net for a bot that was
+             killed -9 mid-backfill without a chance to clean up.
+          2. If any active backfill remains, sleep the interval and retry.
+          3. Spawn monitor.py (incremental) and wait. The .monitor.lock inside
+             monitor.py is what serialises against any concurrent backfill —
+             if a backfill is in progress, monitor.py exits with code 75 and we
+             back off for the interval.
+          4. Re-read ``interval.json`` so ``/interval`` takes effect without
+             a bot restart.
+      * On shutdown: SIGTERM the current monitor.py, wait up to 30s, then
+        SIGKILL. We do NOT call ``os._exit`` — that would bypass PTB's own
+        shutdown sequence and any in-flight backfill tasks.
+    """
+    STALE_BACKFILL_MINUTES = 120  # 2h: anything older than this is a zombie
+    proc: asyncio.subprocess.Process | None = None
+    try:
+        while not _shutdown_requested:
+            # 1. Stale watchdog — clean up zombie backfill registrations
+            _sweep_stale_backfills(STALE_BACKFILL_MINUTES)
+
+            # 2. Re-read interval at the top of every loop so /interval works
+            current_interval = _load_interval()
+
+            # 3. Skip if a non-stale backfill is still running
+            active_backfills = _load_active_backfills()
+            if active_backfills:
+                log.info("Scheduled scan skipped: active backfill(s) %s", list(active_backfills.keys()))
+                await asyncio.sleep(current_interval)
+                continue
+            try:
+                log.info("Scheduled scan starting...")
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, str(MONITOR_SCRIPT),
+                    cwd=str(SCRIPT_DIR),
+                )
+                # Publish the proc so cmd_stop can terminate it precisely,
+                # without a pgrep that would also match a running backfill.
+                global _current_scan_proc
+                _current_scan_proc = proc
+                rc = await proc.wait() if proc is not None else None
+                if _shutdown_requested:
+                    break
+                returncode = int(rc) if rc is not None else -1
+                if returncode == 0:
+                    log.info("Scheduled scan completed")
+                elif returncode == 75:
+                    # monitor.py exits 75 when .monitor.lock is held (i.e. a
+                    # backfill claimed the slot). Treat as "skipped", not a
+                    # failure — back off for the rest of the interval.
+                    log.info("Scheduled scan skipped: monitor lock held (backfill in progress)")
+                else:
+                    log.warning("Scheduled scan failed (exit %d)", returncode)
+            except Exception as e:
+                log.error("Scheduled scan error: %s", e)
             if _shutdown_requested:
                 break
-            await asyncio.sleep(_scan_interval)
-            continue
-        try:
-            log.info("Scheduled scan starting...")
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, str(MONITOR_SCRIPT),
-                cwd=str(SCRIPT_DIR),
-            )
-            await proc.wait()
-            if _shutdown_requested:
-                break
-            if proc.returncode == 0:
-                log.info("Scheduled scan completed")
-            else:
-                log.warning("Scheduled scan failed (exit %d)", proc.returncode)
-        except Exception as e:
-            log.error("Scheduled scan error: %s", e)
-        if _shutdown_requested:
-            break
-        await asyncio.sleep(_scan_interval)
+            await asyncio.sleep(current_interval)
+    finally:
+        # Graceful shutdown: give the subprocess up to 30s to save and exit.
+        #
+        # At this point the event loop is being torn down: PTB's
+        # Application.run_polling() installs its own SIGTERM handler and
+        # closes the loop on shutdown, which destroys the scan task
+        # mid-flight while it is inside `await proc.wait()`. asyncio's
+        # `asyncio.timeout()` then raises "no running event loop" — and
+        # the only reason this finally-block runs at all is because
+        # Python's GC re-enters the coroutine during interpreter
+        # shutdown. We catch RuntimeError and fall back to a no-wait
+        # exit: the subprocess already got SIGTERM (via proc.terminate()
+        # or via the process-group signal from systemd), so the OS will
+        # reap it when the parent exits.
+        if proc is not None and proc.returncode is None:
+            log.info("Shutdown: stopping current scan...")
+            try:
+                proc.terminate()  # SIGTERM -> monitor.py saves current page
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=30)
+                log.info("Shutdown: scan exited cleanly (exit %d)", proc.returncode)
+            except RuntimeError:
+                # Event loop is closed — the OS will reap the subprocess on
+                # parent exit. Don't try to wait_for() in a no-loop context.
+                log.info("Shutdown: event loop already closed, leaving scan to OS reaper")
+            except asyncio.TimeoutError:
+                log.warning("Shutdown: scan did not exit in 30s, sending SIGKILL")
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await proc.wait()
+                except RuntimeError:
+                    pass
+        log.info("Scheduled scan stopped. Returning to event loop for clean shutdown.")
 
-    # Graceful shutdown: give the subprocess up to 30s to save and exit
-    if proc is not None and proc.returncode is None:
-        log.info("Shutdown: stopping current scan...")
-        proc.terminate()  # SIGTERM -> monitor.py saves current page
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=30)
-            log.info("Shutdown: scan exited cleanly (exit %d)", proc.returncode)
-        except asyncio.TimeoutError:
-            log.warning("Shutdown: scan did not exit in 30s, sending SIGKILL")
-            proc.kill()
-            await proc.wait()
 
-    log.info("Scheduled scan stopped. All good, shutting down...")
-    import os as _os
-    _os._exit(0)
+def _sweep_stale_backfills(max_age_minutes: int) -> int:
+    """Remove backfill registrations whose heartbeat is older than max_age_minutes.
+
+    Returns the number of entries removed. Used by the scan cron to clean up
+    after a bot that was killed mid-backfill (e.g. OOM kill, machine reboot).
+    Without this, the scan cron would permanently skip forever after such an
+    incident — see the post-mortem on the 8-hour deadlock in the README.
+    """
+    data = _load_active_backfills()
+    if not data:
+        return 0
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    removed = 0
+    for tg_id, users_dict in list(data.items()):
+        for username, last_active_str in list(users_dict.items()):
+            try:
+                last_active = datetime.fromisoformat(last_active_str)
+                if last_active.tzinfo is None:
+                    last_active = last_active.replace(tzinfo=timezone.utc)
+                age_minutes = (now - last_active).total_seconds() / 60
+                if age_minutes > max_age_minutes:
+                    log.warning(
+                        "Stale backfill detected: @%s (tg=%s) age=%.0f min — unregistering",
+                        username, tg_id, age_minutes,
+                    )
+                    _unregister_backfill(tg_id, username)
+                    removed += 1
+            except Exception as e:
+                log.warning("Could not parse last_active %r for @%s: %s", last_active_str, username, e)
+    return removed
 
 
 async def post_init(application: Application) -> None:
@@ -1314,8 +1482,19 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(commands)
     # Auto-resume any backfills that were interrupted by a previous shutdown
     _resume_stale_backfills(application)
-    # Start periodic scan as background task (PTBUserWarning is harmless)
-    asyncio.create_task(scheduled_scan_cron())
+    # Start periodic scan as background task (PTBUserWarning is harmless).
+    # Attach a done-callback so any unhandled exception inside the cron loop
+    # is logged loudly instead of being swallowed by the event loop.
+    def _on_cron_done(task: asyncio.Task) -> None:
+        if task.cancelled():
+            log.info("Scheduled scan task cancelled (clean shutdown)")
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error("Scheduled scan task crashed: %s", exc, exc_info=exc)
+
+    scan_task = asyncio.create_task(scheduled_scan_cron())
+    scan_task.add_done_callback(_on_cron_done)
     log.info(f"Slash commands registered. Scheduled scan every {_scan_interval//60}min. Ready.")
 
 

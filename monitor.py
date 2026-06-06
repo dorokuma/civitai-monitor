@@ -29,14 +29,17 @@ import load_env  # noqa: F401  # 自动加载同目录下的 civitai-bot.env（t
 
 
 import argparse
+import atexit
+import datetime as _dt
 import fcntl
 import json
 import logging
 import os
+import signal
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 import yaml
@@ -96,6 +99,18 @@ class DataConfig(BaseModel):
     seen_ids_file: str = "seen_ids.json"
 
 
+class IncrementalConfig(BaseModel):
+    """Limits that apply to incremental mode (the cron-scheduled scan).
+
+    Incremental is designed to surface *new* content, not to walk an entire
+    creator's history. ``max_pages`` caps how many pages we fetch per track
+    (SFW/NSFW) on any given scan, so a creator with 1k+ items does not push
+    the whole history on the very first run. To backfill the full history,
+    use the ``/backfill <user>`` command (which runs ``--mode full``).
+    """
+    max_pages: int = 5
+
+
 class MonitorConfig(BaseModel):
     users: list = Field(default_factory=list)
     subscriptions: dict[str, list] = Field(default_factory=dict)
@@ -106,6 +121,7 @@ class MonitorConfig(BaseModel):
     download: DownloadConfig = Field(default_factory=DownloadConfig)
     telegram: TelegramConfig
     data: DataConfig = Field(default_factory=DataConfig)
+    incremental: IncrementalConfig = Field(default_factory=IncrementalConfig)
     http: HttpConfig = Field(default_factory=HttpConfig)
     video_enabled: bool = True
     max_video_size_mb: int = 1024
@@ -125,6 +141,26 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 
 VALID_NSFW = {"sfw_only", "nsfw_only", "both"}
 VALID_MODES = {"incremental", "full"}
+
+# Page-size safety: Civitai's /images endpoint silently caps or rejects
+# out-of-range `limit` values, so we clamp before sending. 200 is the highest
+# value the API reliably accepts.
+MAX_API_PAGE_LIMIT = 200
+MIN_API_PAGE_LIMIT = 1
+
+# Telegram send limits
+TELEGRAM_PHOTO_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+TELEGRAM_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024  # 50 MB; larger is rejected
+
+# Per-item timeouts (seconds) for downloads
+IMAGE_DOWNLOAD_TIMEOUT = 120
+VIDEO_DOWNLOAD_TIMEOUT = 120
+HTTP_REQUEST_TIMEOUT = 30
+
+# Filesystem layout sentinel
+DATA_DIR_NAME = "seen_ids"  # directory holding per-user ID files
+STATUS_FILE_NAME = "monitor_status.json"
+LOCK_FILE_NAME = ".monitor.lock"
 
 # ---------------------------------------------------------------------------
 # Global HTTP session (enforces Referer + User-Agent on every request)
@@ -261,6 +297,11 @@ def fetch_page(
               Falls back to None automatically when "Newest" returns 0 items
               (some users have a Civitai API bug where Newest sort returns empty).
     """
+    # Clamp `limit` to the Civitai-allowed range. The API silently caps at
+    # 100 for some endpoints and rejects out-of-range values for others, so
+    # we always coerce to a safe [MIN_API_PAGE_LIMIT, MAX_API_PAGE_LIMIT] window
+    # before sending.
+    limit = max(MIN_API_PAGE_LIMIT, min(int(limit), MAX_API_PAGE_LIMIT))
     params: dict[str, Any] = {
         "username": username,
         "limit": limit,
@@ -328,8 +369,8 @@ def normalize_to_original(
 # ---------------------------------------------------------------------------
 
 
-LOCK_PATH = SCRIPT_DIR / "seen_ids.lock"
-STATUS_PATH = SCRIPT_DIR / "monitor_status.json"
+LOCK_PATH = SCRIPT_DIR / LOCK_FILE_NAME
+STATUS_PATH = SCRIPT_DIR / STATUS_FILE_NAME
 
 
 def seen_file_for_user(seen_dir: Path, tg_id: str, username: str) -> Path:
@@ -348,16 +389,26 @@ def load_seen_ids(seen_dir: Path, tg_id: str, username: str) -> set[int]:
     return set(json.loads(path.read_text())) if path.exists() else set()
 
 
+def _save_lock_path(seen_dir: Path) -> Path:
+    """Per-seen_dir lock file. Keeping the lock inside the data directory
+    means the global bot lock doesn't serialize unrelated writes; only
+    writers targeting the same seen_dir (which is the only case that can
+    actually race) contend."""
+    seen_dir.mkdir(parents=True, exist_ok=True)
+    return seen_dir / ".save.lock"
+
+
 def save_seen_ids(seen_dir: Path, tg_id: str, username: str, ids: set[int]) -> None:
     """Save seen IDs for a specific (Telegram user, Civitai user) pair."""
     path = seen_file_for_user(seen_dir, tg_id, username)
-    lock = FileLock(str(LOCK_PATH), timeout=10)
+    lock = FileLock(str(_save_lock_path(seen_dir)), timeout=10)
     try:
         with lock:
             # Atomic write: temp file + rename to prevent corruption on crash
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(sorted(ids), indent=2))
             tmp.rename(path)
+            path.chmod(0o600)
         log.info("Saved %d seen IDs for @%s", len(ids), username)
     except Timeout:
         log.warning("Timeout saving %d seen IDs for @%s, skipped", len(ids), username)
@@ -375,12 +426,13 @@ def load_pushed_ids(pushed_dir: Path, tg_id: str, username: str) -> set[int]:
 
 def save_pushed_ids(pushed_dir: Path, tg_id: str, username: str, ids: set[int]) -> None:
     path = pushed_file_for_user(pushed_dir, tg_id, username)
-    lock = FileLock(str(LOCK_PATH), timeout=10)
+    lock = FileLock(str(_save_lock_path(pushed_dir)), timeout=10)
     try:
         with lock:
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(sorted(ids), indent=2))
             tmp.rename(path)
+            path.chmod(0o600)
         log.info("Saved %d pushed IDs for @%s", len(ids), username)
     except Timeout:
         log.warning("Timeout saving %d pushed IDs for @%s, skipped", len(ids), username)
@@ -424,6 +476,12 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
       1. Follow redirect from image.civitai.com → B2 /default (cover)
       2. Rewrite /default → /original on B2 to get the real video
       3. If /original is 404 (video no longer available), skip
+
+    ``max_size_mb`` semantics:
+      * ``> 0``  — skip videos whose Content-Length exceeds the cap.
+      * ``<= 0`` — disable the size cap (download every video regardless of
+                    size). The config example shows ``max_video_size_mb:
+                    1024``; set to 0 to opt out of the cap entirely.
     """
     try:
         # Step 1: follow redirect to find the real CDN URL (don't download body)
@@ -454,12 +512,14 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
             resp = safe_get(url, stream=True, timeout=120)
             resp.raise_for_status()
 
-        # Check size
+        # Check size — skip only when a positive cap is configured
         cl = resp.headers.get("content-length")
-        if cl and int(cl) > max_size_mb * 1024 * 1024:
+        if max_size_mb > 0 and cl and int(cl) > max_size_mb * 1024 * 1024:
             log.warning("Video too large (%.1f MB > %d MB), skipping",
                         int(cl) / 1024 / 1024, max_size_mb)
             return False
+        if not cl and max_size_mb > 0:
+            log.info("Video size unknown (no Content-Length), downloading anyway up to %d MB cap", max_size_mb)
 
         save_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
@@ -714,12 +774,18 @@ def run_incremental(
     limit: int,
     video_enabled: bool,
     max_video_size_mb: int,
+    max_pages: int = 5,
 ) -> set[int]:
     """Check latest content using cursor pagination.
 
-    Fetches pages until we hit an already-seen ID (meaning we've caught up
-    to previously processed content). Saves seen_ids after each track.
-    Returns the set of all image IDs seen on the latest page(s).
+    Fetches pages until we hit an already-pushed ID (meaning we've caught up
+    to previously processed content) or until ``max_pages`` is reached
+    (whichever comes first). The page cap exists so that the very first
+    run on a creator with a large history (e.g. 1k+ items) does not push
+    every historical item to Telegram — that is what ``full`` mode is for.
+
+    Saves seen_ids after each track. Returns the set of all image IDs seen
+    on the pages we actually fetched.
     """
     all_seen: set[int] = set(seen_ids)
     tracks = nsfw_tracks(nsfw_setting)
@@ -728,7 +794,7 @@ def run_incremental(
         label = "NSFW" if nsfw_flag else "SFW"
         cursor = ""
         page = 0
-        while True:
+        while page < max_pages:
             page += 1
             pushed_ids = load_pushed_ids(seen_dir, tg_id, username)
             new_on_page, page_ids, next_cursor = _fetch_and_process_page(
@@ -791,10 +857,13 @@ def run_full(
     video_enabled: bool,
     max_video_size_mb: int,
     seen_dir: Path,
+    shutdown_flag: Callable[[], bool] = lambda: False,
 ) -> set[int]:
     """Walk every page of the user's gallery for the requested tracks.
 
-    Returns the consolidated set of all image IDs seen.
+    Returns the consolidated set of all image IDs seen. ``shutdown_flag`` is
+    a zero-arg callable polled between pages so SIGTERM can stop a long
+    backfill promptly without losing already-saved progress.
     """
     all_seen: set[int] = set(seen_ids)
     tracks = nsfw_tracks(nsfw_setting)
@@ -806,6 +875,9 @@ def run_full(
         page = 0
 
         while True:
+            if shutdown_flag():
+                log.info("%s: shutdown requested, stopping at page %d", label, page)
+                break
             page += 1
             pushed_ids = load_pushed_ids(seen_dir, tg_id, username)
             new_on_page, page_ids, next_cursor = _fetch_and_process_page(
@@ -906,20 +978,169 @@ def cleanup_old_caches(output_dir: Path, keep_days: int, max_total_gb: int = 0) 
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    # Process lock: prevent concurrent cron runs
-    lock_file = SCRIPT_DIR / ".monitor.lock"
+# Graceful shutdown flag — set by SIGTERM/SIGINT handler so the main loop
+# can finish the current page (saving seen_ids) before exiting, rather than
+# losing in-flight progress.
+_monitor_shutdown_requested = False
+
+
+def _monitor_signal_handler(signum, _frame):
+    global _monitor_shutdown_requested
+    if _monitor_shutdown_requested:
+        return  # second signal → force exit on next call site
+    _monitor_shutdown_requested = True
+    log.info("monitor.py: signal %d received, finishing current page then exiting", signum)
+
+
+signal.signal(signal.SIGTERM, _monitor_signal_handler)
+signal.signal(signal.SIGINT, _monitor_signal_handler)
+
+
+def _acquire_process_lock() -> int | None:
+    """Acquire the .monitor.lock file with an exclusive fcntl lock.
+
+    Returns the file descriptor on success, or None if another monitor.py
+    process already holds the lock (in which case the caller should exit 75
+    so the bot's scheduled cron knows to back off).
+
+    Cleanup is registered with atexit: the lock is released and the
+    sentinel file is removed when this process exits, even on hard kills.
+    """
+    lock_file = SCRIPT_DIR / LOCK_FILE_NAME
     try:
         lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (BlockingIOError, OSError):
-        log.warning("Another monitor process is already running - skipping this cron tick")
         try:
             os.close(lock_fd)
-        except Exception as e:
-            log.warning("Failed to close lock file descriptor: %s", e)
+        except (OSError, UnboundLocalError):
+            pass
+        return None
+
+    def _release_lock() -> None:
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(lock_file)
+        except OSError:
+            pass
+    atexit.register(_release_lock)
+    return lock_fd
+
+
+def _write_status(
+    *,
+    start_time: "_dt.datetime",
+    mode: str,
+    current_creator: str,
+    creators_done: int,
+    creators_total: int,
+    pushed_count: int,
+) -> None:
+    """Write a single status snapshot for /status consumers to read."""
+    payload = {
+        "status": "running",
+        "started_at": start_time.strftime("%H:%M:%S"),
+        "mode": mode,
+        "current_creator": current_creator,
+        "creators_done": creators_done,
+        "creators_total": creators_total,
+        "pushed_count": pushed_count,
+        "elapsed_seconds": int((_dt.datetime.now() - start_time).total_seconds()),
+    }
+    STATUS_PATH.write_text(json.dumps(payload))
+
+
+def _clear_status(interrupted: bool, start_time: "_dt.datetime") -> None:
+    """Remove the status file, optionally leaving an "interrupted" snapshot
+    for operators to inspect. Safe to call from a finally block."""
+    try:
+        if interrupted:
+            STATUS_PATH.write_text(json.dumps({
+                "status": "interrupted",
+                "elapsed_seconds": int((_dt.datetime.now() - start_time).total_seconds()),
+            }))
+        STATUS_PATH.unlink()
+    except OSError:
+        pass
+
+
+def _build_backfill_summary(username: str, new_count: int, mode: str, nsfw: str, video_enabled: bool) -> str:
+    """Compose the Telegram message that announces a backfill completion."""
+    return (
+        f"✅ *Backfill complete for @{username}*\n"
+        f"📸 Mode: {mode} · NSFW: {nsfw} · Video: {video_enabled}\n"
+        f"🆕 New items: {new_count}"
+    )
+
+
+def _process_single_creator(
+    username: str,
+    tg_id_str: str,
+    seen_dir: Path,
+    output_dir: Path,
+    *,
+    mode: str,
+    nsfw: str,
+    size_suffixes: list[str],
+    bot_token: str,
+    chat_id: str,
+    base_url: str,
+    page_limit: int,
+    video_enabled: bool,
+    max_video_size_mb: int,
+    incremental_max_pages: int,
+) -> tuple[set[int], int]:
+    """Run a single creator through incremental or full mode.
+
+    Returns ``(all_seen, new_count)`` where ``new_count`` is how many IDs
+    were net-new compared to the on-disk seen_ids file.
+    """
+    seen_ids = load_seen_ids(seen_dir, tg_id_str, username)
+    common: dict[str, Any] = {
+        "username": username,
+        "seen_ids": seen_ids,
+        "tg_id": tg_id_str,
+        "seen_dir": seen_dir,
+        "nsfw_setting": nsfw,
+        "output_dir": output_dir,
+        "size_suffixes": size_suffixes,
+        "bot_token": bot_token,
+        "chat_id": chat_id,
+        "base_url": base_url,
+        "limit": page_limit,
+        "video_enabled": video_enabled,
+        "max_video_size_mb": max_video_size_mb,
+    }
+    if mode == "full":
+        user_seen = run_full(
+            **common,
+            shutdown_flag=lambda: _monitor_shutdown_requested,
+        )
+    else:
+        user_seen = run_incremental(**common, max_pages=incremental_max_pages)
+
+    if not user_seen:
+        return seen_ids, 0
+    union = seen_ids | user_seen
+    if len(union) <= len(seen_ids):
+        return seen_ids, 0
+    save_seen_ids(seen_dir, tg_id_str, username, union)
+    new_count = len(union) - len(seen_ids)
+    log.info("Merged %d new IDs for @%s (TG:%s) (total: %d)",
+             new_count, username, tg_id_str, len(union))
+    return union, new_count
+
+
+def main() -> None:
+    # Step 1: process lock. Bails out cleanly if another monitor.py is running.
+    if _acquire_process_lock() is None:
+        log.warning("Another monitor process is already running - skipping this cron tick")
         sys.exit(75)
 
+    # Step 2: parse CLI + load config
     parser = argparse.ArgumentParser(description="Civitai Monitor — civitai.com user gallery monitor")
     parser.add_argument("--config", type=str, help="Path to config.yaml (default: auto-search)")
     parser.add_argument("--mode", type=str, choices=["incremental", "full"], help="Override scan mode")
@@ -933,127 +1154,85 @@ def main() -> None:
     if args.mode:
         cfg.mode = args.mode
 
-    log.info("Mode: %s | NSFW: %s | Video: %s", cfg.mode, cfg.nsfw, cfg.video_enabled)
+    log.info("Mode: %s | NSFW: %s | Video: %s | Incremental max_pages: %d",
+             cfg.mode, cfg.nsfw, cfg.video_enabled, cfg.incremental.max_pages)
 
-    # -- Paths --
+    # Step 3: prepare filesystem layout
     data_dir = Path(cfg.data.data_dir) if cfg.data.data_dir else SCRIPT_DIR
     output_dir = data_dir / cfg.download.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    seen_dir = data_dir / "seen_ids"
+    seen_dir = data_dir / DATA_DIR_NAME
     seen_dir.mkdir(parents=True, exist_ok=True)
 
-    # -- Per-Telegram-user processing (each TG user has independent seen_ids) --
     subs = cfg.subscriptions or {}
-    # -- Write initial scan status --
-    import datetime as _dt
-    _start_time = _dt.datetime.now()
-    _total_creators = sum(len(v) for v in subs.values()) if subs else 0
-    STATUS_PATH.write_text(json.dumps({
-        "status": "running",
-        "started_at": _start_time.strftime("%H:%M:%S"),
-        "mode": cfg.mode,
-        "current_creator": "",
-        "creators_done": 0,
-        "creators_total": _total_creators,
-        "pushed_count": 0,
-        "elapsed_seconds": 0,
-    }))
-
     if not subs:
         log.error("No subscriptions configured in config.yaml")
         sys.exit(1)
 
+    # Step 4: write initial status, then walk every (TG user, creator) pair.
+    start_time = _dt.datetime.now()
+    total_creators = sum(len(v) for v in subs.values())
+    _write_status(
+        start_time=start_time, mode=cfg.mode, current_creator="",
+        creators_done=0, creators_total=total_creators, pushed_count=0,
+    )
+
     pushed_count = 0
-    _creator_idx = 0
-    for idx, (tg_id, user_list) in enumerate(subs.items()):
-        tg_id_str = str(tg_id)
-        for entry in user_list:
-            username = entry.get("name", str(entry)) if isinstance(entry, dict) else str(entry)
-            if args.user and username != args.user:
-                log.info("Skipping @%s (--user filter active)", username)
-                continue
-            STATUS_PATH.write_text(json.dumps({
-                "status": "running",
-                "started_at": _start_time.strftime("%H:%M:%S"),
-                "mode": cfg.mode,
-                "current_creator": username,
-                "creators_done": _creator_idx + 1,
-                "creators_total": _total_creators,
-                "pushed_count": pushed_count,
-                "elapsed_seconds": int((_dt.datetime.now() - _start_time).total_seconds()),
-            }))
-            log.info("=" * 50)
-            log.info("Processing @%s (TG:%s, %s mode)...", username, tg_id_str, cfg.mode)
-
-            # Load this (TG user, Civitai user) pair's own seen IDs
-            seen_ids = load_seen_ids(seen_dir, tg_id_str, username)
-
-            if cfg.mode == "full":
-                user_seen = run_full(
-                    username,
-                    seen_ids=seen_ids,
-                    nsfw_setting=cfg.nsfw,
-                    output_dir=output_dir,
-                    size_suffixes=cfg.download.size_suffixes,
-                    bot_token=cfg.telegram.bot_token,
-                    chat_id=cfg.telegram.chat_id,
-                    base_url=cfg.api.base_url,
-                    limit=cfg.api.images_per_page,
-                    video_enabled=cfg.video_enabled,
-                    max_video_size_mb=cfg.max_video_size_mb,
-                    seen_dir=seen_dir,
-                    tg_id=tg_id_str,
-                )
-            else:
-                user_seen = run_incremental(
-                    username,
-                    seen_ids=seen_ids,
-                    tg_id=tg_id_str,
-                    seen_dir=seen_dir,
-                    nsfw_setting=cfg.nsfw,
-                    output_dir=output_dir,
-                    size_suffixes=cfg.download.size_suffixes,
-                    bot_token=cfg.telegram.bot_token,
-                    chat_id=cfg.telegram.chat_id,
-                    base_url=cfg.api.base_url,
-                    limit=cfg.api.images_per_page,
-                    video_enabled=cfg.video_enabled,
-                    max_video_size_mb=cfg.max_video_size_mb,
-                )
-
-            _creator_idx += 1
-
-            # Save per-(TG user, Civitai user) progress immediately
-            if user_seen:
-                union = seen_ids | user_seen
-                if len(union) > len(seen_ids):
-                    save_seen_ids(seen_dir, tg_id_str, username, union)
-                    new_count = len(union) - len(seen_ids)
-                    pushed_count += new_count
-                    log.info("Merged %d new IDs for @%s (TG:%s) (total: %d)", new_count, username, tg_id_str, len(union))
-
-                    # Full mode: per-user completion message
-                    if cfg.mode == "full":
-                        log.info("Full backfill complete for @%s (TG:%s): %d new items", username, tg_id_str, new_count)
-                        summary = (
-                            f"✅ *Backfill complete for @{username}*\n"
-                            f"📸 Mode: {cfg.mode} · NSFW: {cfg.nsfw} · Video: {cfg.video_enabled}\n"
-                            f"🆕 New items: {new_count}"
-                        )
-                        send_to_telegram(cfg.telegram.bot_token, cfg.telegram.chat_id, summary)
-
-    # -- Cleanup old caches --
-    removed = cleanup_old_caches(output_dir, cfg.download.keep_days, cfg.download.max_total_gb)
-    if removed:
-        log.info("Cleaned %d cached files older than %d days", removed, cfg.download.keep_days)
-
-    # Mark complete and clear status
+    creator_idx = 0
     try:
-        elapsed = int((_dt.datetime.now() - _start_time).total_seconds())
-        STATUS_PATH.write_text(json.dumps({"status": "completed", "elapsed_seconds": elapsed}))
-        STATUS_PATH.unlink()
-    except Exception:
-        log.exception("Failed to write final status file (non-critical)")
+        for tg_id, user_list in subs.items():
+            if _monitor_shutdown_requested:
+                log.info("monitor.py: shutdown requested, stopping user loop")
+                break
+            tg_id_str = str(tg_id)
+            for entry in user_list:
+                if _monitor_shutdown_requested:
+                    log.info("monitor.py: shutdown requested, stopping creator loop")
+                    break
+                username = entry.get("name", str(entry)) if isinstance(entry, dict) else str(entry)
+                if args.user and username != args.user:
+                    log.info("Skipping @%s (--user filter active)", username)
+                    continue
+                creator_idx += 1
+                _write_status(
+                    start_time=start_time, mode=cfg.mode, current_creator=username,
+                    creators_done=creator_idx, creators_total=total_creators,
+                    pushed_count=pushed_count,
+                )
+                log.info("=" * 50)
+                log.info("Processing @%s (TG:%s, %s mode)...", username, tg_id_str, cfg.mode)
+                _seen_after, new_count = _process_single_creator(
+                    username, tg_id_str, seen_dir, output_dir,
+                    mode=cfg.mode, nsfw=cfg.nsfw,
+                    size_suffixes=cfg.download.size_suffixes,
+                    bot_token=cfg.telegram.bot_token,
+                    chat_id=cfg.telegram.chat_id,
+                    base_url=cfg.api.base_url,
+                    page_limit=cfg.api.images_per_page,
+                    video_enabled=cfg.video_enabled,
+                    max_video_size_mb=cfg.max_video_size_mb,
+                    incremental_max_pages=cfg.incremental.max_pages,
+                )
+                pushed_count += new_count
+                # Per-user completion message in full mode
+                if cfg.mode == "full" and new_count > 0:
+                    log.info("Full backfill complete for @%s (TG:%s): %d new items",
+                             username, tg_id_str, new_count)
+                    send_to_telegram(
+                        cfg.telegram.bot_token, cfg.telegram.chat_id,
+                        _build_backfill_summary(username, new_count, cfg.mode, cfg.nsfw, cfg.video_enabled),
+                    )
+    finally:
+        # Status is cleared even on early shutdown so /status never sees a
+        # stale "running" file forever.
+        _clear_status(_monitor_shutdown_requested, start_time)
+
+    # Step 5: cache cleanup. Skipped if we were interrupted — exit fast instead.
+    if not _monitor_shutdown_requested:
+        removed = cleanup_old_caches(output_dir, cfg.download.keep_days, cfg.download.max_total_gb)
+        if removed:
+            log.info("Cleaned %d cached files older than %d days",
+                     removed, cfg.download.keep_days)
 
 
 if __name__ == "__main__":
