@@ -94,6 +94,7 @@ class ApiConfig(BaseModel):
 class TelegramConfig(BaseModel):
     bot_token: str
     chat_id: str
+    api_base_url: str = "https://api.telegram.org"
 
 
 class DataConfig(BaseModel):
@@ -544,13 +545,15 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
 # ---------------------------------------------------------------------------
 
 
+_tg_api_base = "https://api.telegram.org"
+
 def send_to_telegram(
     bot_token: str,
     chat_id: str,
     text: str,
     file_paths: list[Path] | None = None,
 ) -> bool:
-    api_base = f"https://api.telegram.org/bot{bot_token}"
+    api_base = f"{_tg_api_base}/bot{bot_token}"
 
     if file_paths:
         valid_files = [fp for fp in file_paths if fp.exists()]
@@ -1163,6 +1166,8 @@ def main() -> None:
     cfg = load_config(Path(args.config) if args.config else None)
     if cfg is None:
         sys.exit(1)
+    global _tg_api_base
+    _tg_api_base = cfg.telegram.api_base_url
     if args.mode:
         cfg.mode = args.mode
 
