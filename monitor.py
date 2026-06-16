@@ -616,19 +616,21 @@ def send_to_telegram(
 
 
 def _send_telegram_video(api_base: str, chat_id: str, text: str, video_path: Path) -> bool:
-    """Send a video to Telegram. Compresses if over 50 MB, falls back to text on error."""
-    send_path = video_path
-    compressed = None
+    """Send a video to Telegram. <=50 MB: sendVideo (inline play). >50 MB: sendDocument (2 GB, no quality loss)."""
+    size_mb = video_path.stat().st_size / 1048576
     try:
-        if video_path.stat().st_size > TELEGRAM_VIDEO_MAX_MB * 1024 * 1024:
-            compressed = compress_video_for_telegram(video_path)
-            if compressed and compressed != video_path:
-                send_path = compressed
-        with open(send_path, "rb") as f:
+        if size_mb <= TELEGRAM_VIDEO_MAX_MB:
+            endpoint = f"{api_base}/sendVideo"
+            field_name = "video"
+        else:
+            endpoint = f"{api_base}/sendDocument"
+            field_name = "document"
+            log.info("Video %.1f MB > %d MB, sending as document (2 GB limit)", size_mb, TELEGRAM_VIDEO_MAX_MB)
+        with open(video_path, "rb") as f:
             resp = requests.post(
-                f"{api_base}/sendVideo",
+                endpoint,
                 data={"chat_id": chat_id, "caption": text, "parse_mode": "Markdown"},
-                files={"video": (send_path.name, f, "video/mp4")},
+                files={field_name: (video_path.name, f, "video/mp4")},
                 timeout=300,
             )
         if resp.ok:
@@ -636,9 +638,6 @@ def _send_telegram_video(api_base: str, chat_id: str, text: str, video_path: Pat
         log.warning("Video send failed: %s", resp.text[:200])
     except requests.RequestException as e:
         log.warning("Video send error: %s", e)
-    finally:
-        if compressed and compressed != video_path:
-            compressed.unlink(missing_ok=True)
     return _send_telegram_text(api_base, chat_id, text)
 
 
