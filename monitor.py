@@ -540,53 +540,6 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Video compression for Telegram (50 MB limit)
-# ---------------------------------------------------------------------------
-TELEGRAM_VIDEO_MAX_MB = 48
-
-def compress_video_for_telegram(video_path, target_mb=TELEGRAM_VIDEO_MAX_MB):
-    orig_size = video_path.stat().st_size
-    target_bytes = target_mb * 1024 * 1024
-    if orig_size <= target_bytes:
-        return video_path
-    try:
-        import json as _json
-        probe = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(video_path)],
-            capture_output=True, text=True, timeout=30)
-        info = _json.loads(probe.stdout)
-        duration = float(info["format"].get("duration", 0))
-        if duration <= 0:
-            return None
-    except Exception as e:
-        log.warning("ffprobe failed for %s: %s", video_path.name, e)
-        return None
-    target_bitrate = int(target_bytes * 8 * 0.9 / duration)
-    video_bitrate_k = target_bitrate // 1000
-    compressed_path = video_path.with_suffix(".compressed.mp4")
-    cmd = ["ffmpeg", "-y", "-i", str(video_path),
-           "-c:v", "libx264", "-b:v", f"{video_bitrate_k}k",
-           "-preset", "fast", "-c:a", "aac", "-b:a", "128k",
-           "-movflags", "+faststart", str(compressed_path)]
-    try:
-        log.info("Compressing %s: %d MB -> target %d MB (%d kbps, %.0fs)",
-                 video_path.name, orig_size // 1048576, target_mb, video_bitrate_k, duration)
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode != 0:
-            log.warning("ffmpeg failed for %s: %s", video_path.name, result.stderr[:300])
-            compressed_path.unlink(missing_ok=True)
-            return None
-        compressed_size = compressed_path.stat().st_size
-        log.info("Compressed %s: %.1f MB -> %.1f MB", video_path.name,
-                 orig_size / 1048576, compressed_size / 1048576)
-        if compressed_size > target_bytes:
-            compressed_path.unlink(missing_ok=True)
-            return None
-        return compressed_path
-    except Exception as e:
-        log.warning("Compression error for %s: %s", video_path.name, e)
-        compressed_path.unlink(missing_ok=True)
-        return None
 # Telegram push
 # ---------------------------------------------------------------------------
 
