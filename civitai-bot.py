@@ -33,6 +33,8 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from collections import defaultdict
+from functools import wraps
 
 import requests
 import yaml
@@ -55,6 +57,31 @@ log = logging.getLogger("civitai-bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+_user_last_call: dict[str, float] = defaultdict(float)
+
+def rate_limit(min_interval: float = 5.0):
+    """Per-user rate limiter: at least min_interval seconds between calls."""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(update, context, *args, **kwargs):
+            user_id = str(update.effective_user.id)
+            now = time.time()
+            elapsed = now - _user_last_call.get(user_id, 0)
+            if elapsed < min_interval:
+                remaining = int(min_interval - elapsed) + 1
+                await update.message.reply_text(
+                    f"⏳ 请等 {remaining} 秒后再试"
+                )
+                return
+            _user_last_call[user_id] = now
+            return await func(update, context, *args, **kwargs)
+        return wrapper
+    return decorator
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -75,7 +102,7 @@ ACTIVE_BACKFILLS = SCRIPT_DIR / "active_backfills.json"
 # -----------------------------------------------------------------------
 
 # Memory limit constants
-_MEMORY_HARD_LIMIT = 1800 * 1024 * 1024  # 1800 MB hard cap in bytes
+_MEMORY_HARD_LIMIT = 2048 * 1024 * 1024  # 2048 MB (2G) hard cap in bytes
 
 
 def _get_system_memory_mb() -> int:
@@ -137,7 +164,7 @@ def _apply_memory_limit(service_name: str = "civitai-bot.service") -> None:
             log.info("Set MemoryMax=%d MB (%d bytes) on %s", mem_mb, mem_bytes, service_name)
         else:
             log.warning("Failed to set MemoryMax: %s", result.stderr.strip())
-    except Exception as e:
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as e:
         log.warning("Could not apply MemoryMax via systemctl: %s", e)
 
 
@@ -404,7 +431,7 @@ def validate_username_exists(username: str) -> tuple[bool, str]:
                 params: dict = {"username": username, "limit": 5}
                 if nsfw_flag:
                     params["nsfw"] = "true"
-                    params["browsingLevel"] = 8
+                    # browsingLevel omitted — cookies provide the user level
                 resp = s.get(api_url, params=params, timeout=10)
                 if resp.status_code == 404:
                     return False, f"❌ 用户 @{username} 不存在（Civitai 返回 404）"
@@ -453,6 +480,7 @@ async def _check_auth(update: Update) -> bool:
 # ---------------------------------------------------------------------------
 
 
+@rate_limit(min_interval=3.0)
 async def cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _check_auth(update):
         return
@@ -472,6 +500,7 @@ async def cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+@rate_limit(min_interval=3.0)
 async def cmd_add(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _check_auth(update):
         return
@@ -534,6 +563,7 @@ async def cmd_add(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+@rate_limit(min_interval=3.0)
 async def cmd_remove(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _check_auth(update):
         return
@@ -575,6 +605,7 @@ async def _show_remove_list(message, telegram_user_id: int, page: int = 0) -> No
     )
 
 
+@rate_limit(min_interval=3.0)
 async def cmd_remove_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle remove button presses."""
     if not await _check_auth(update):
@@ -616,11 +647,11 @@ async def cmd_remove_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -
             else:
                 await query.edit_message_text(f"✅ 已取消关注 @{username}\n📭 监控列表已清空", reply_markup=None)
     except Exception as e:
-        log.error("Remove callback error: %s", e)
+        log.exception("Remove callback error: %s", e)
         try:
             await query.edit_message_text("❌ 操作失败，请重试 /remove", reply_markup=None)
         except Exception as e:
-            log.warning("Nested error in remove callback: %s", e)
+            log.exception("Nested error in remove callback: %s", e)
 
 
 async def _render_remove_page(query, users: list[str], page: int) -> None:
@@ -652,6 +683,7 @@ async def _render_remove_page(query, users: list[str], page: int) -> None:
     )
 
 
+@rate_limit(min_interval=3.0)
 async def cmd_list(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _check_auth(update):
         return
@@ -665,6 +697,7 @@ async def cmd_list(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+@rate_limit(min_interval=3.0)
 async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _check_auth(update):
         return
@@ -685,7 +718,7 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     seen_count += len(data) if isinstance(data, list) else 0
                     if f.stat().st_mtime > latest_mtime:
                         latest_mtime = f.stat().st_mtime
-                except Exception as e:
+                except OSError as e:
                     log.warning("Error checking file mtime: %s", e)
         if latest_mtime:
             from zoneinfo import ZoneInfo
@@ -790,6 +823,7 @@ async def cmd_cleanup(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"📂 No cached images older than {days} days.")
 
 
+@rate_limit(min_interval=10.0)
 async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Manually trigger an incremental scan (mostly for debugging).
 
@@ -842,6 +876,7 @@ async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="Markdown",
         )
     except Exception as e:
+        log.exception("Scan command error: %s", e)
         await update.message.reply_text(f"❌ Error: {e}")
 
 
@@ -900,9 +935,11 @@ async def cmd_stop(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     except ProcessLookupError:
         await update.message.reply_text("扫描进程已不在了，锁应该已释放。")
     except Exception as e:
+        log.exception("Backfill cancel error: %s", e)
         await update.message.reply_text(f"❌ 终止失败: {e}")
 
 
+@rate_limit(min_interval=10.0)
 async def cmd_backfill(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _check_auth(update):
         return
@@ -944,6 +981,7 @@ async def _show_backfill_list(message, telegram_user_id: int, page: int = 0) -> 
     )
 
 
+@rate_limit(min_interval=3.0)
 async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle backfill button presses."""
     if not await _check_auth(update):
@@ -996,10 +1034,10 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
                     parse_mode="Markdown",
                 )
             except Exception as e:
-                log.error("Backfill error: %s", e)
+                log.exception("Backfill error: %s", e)
                 await query.message.reply_text(f"❌ 回填出错: {e}")
     except Exception as e:
-        log.error("Backfill callback outer error: %s", e)
+        log.exception("Backfill callback outer error: %s", e)
 
 
 async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProcess | None | str:
@@ -1047,7 +1085,7 @@ async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProce
             try:
                 _register_backfill(tg_id_str, username)
             except Exception as e:
-                log.warning("Backfill heartbeat for @%s failed: %s", username, e)
+                log.exception("Backfill heartbeat for @%s failed: %s", username, e)
             heartbeat_handle = loop.call_later(10.0, _heartbeat_tick)
 
         heartbeat_handle = loop.call_later(10.0, _heartbeat_tick)
@@ -1066,14 +1104,21 @@ async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProce
             except asyncio.TimeoutError:
                 log.warning("Backfill for @%s exceeded 2h timeout, killing", username)
                 try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    await asyncio.wait_for(proc.wait(), timeout=30)
-                except (ProcessLookupError, asyncio.TimeoutError):
+                    # Check if process already exited before killpg
+                    if proc.returncode is not None:
+                        log.info("Backfill for @%s already exited (rc=%s), skipping killpg", username, proc.returncode)
+                    else:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                        await asyncio.wait_for(proc.wait(), timeout=30)
+                except (ProcessLookupError, ChildProcessError, asyncio.TimeoutError):
                     try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                        await proc.wait()
-                    except ProcessLookupError:
-                        pass
+                        if proc.returncode is not None:
+                            log.info("Backfill for @%s exited during SIGTERM wait", username)
+                        else:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                            await proc.wait()
+                    except (ProcessLookupError, ChildProcessError):
+                        log.info("Backfill for @%s process group already gone", username)
                 return None
 
             out_str = out.decode("utf-8") if isinstance(out, bytes) else out
@@ -1122,7 +1167,7 @@ def _resume_stale_backfills(application: Application) -> None:
                 if age_minutes > STALE_THRESHOLD_MINUTES:
                     is_zombie_by_time = True
                     log.info("Task @%s is stale by time (%.1f min old) — will resume", username, age_minutes)
-            except Exception as e:
+            except (KeyError, ValueError, json.JSONDecodeError) as e:
                 log.warning("Could not parse last_active %s for @%s: %s", last_active_str, username, e)
 
         # Try to acquire the cross-process lock briefly to detect a running
@@ -1146,7 +1191,7 @@ def _resume_stale_backfills(application: Application) -> None:
             try:
                 loop.create_task(_do_resume(tg_id, username, last_active_str))
             except Exception as e:
-                log.error("Error resuming backfill @%s: %s", username, e)
+                log.exception("Error resuming backfill @%s: %s", username, e)
 
 
 async def _resume_backfill_task(application: Application, tg_id: str, username: str) -> None:
@@ -1173,9 +1218,9 @@ async def _resume_backfill_task(application: Application, tg_id: str, username: 
                 parse_mode="Markdown",
             )
         except Exception as e:
-            log.warning("Could not notify user %s: %s", tg_id, e)
+            log.exception("Could not notify user %s: %s", tg_id, e)
     except Exception as e:
-        log.error("Resumed backfill @%s error: %s", username, e)
+        log.exception("Resumed backfill @%s error: %s", username, e)
 
 
 async def _render_backfill_page(query, users: list[str], page: int) -> None:
@@ -1234,7 +1279,7 @@ def _is_scan_running() -> bool:
         except (BlockingIOError, OSError):
             os.close(fd)
             return True
-    except Exception:
+    except (BlockingIOError, OSError):
         return False
 
 
@@ -1252,16 +1297,10 @@ def _kill_running_scan() -> list[int]:
     pid = proc.pid
     try:
         proc.terminate()
-        try:
-            # Block synchronously for up to 30s — caller is typically a sync
-            # teardown path (e.g. ``_apply_memory_limit`` reaping stale scans).
-            proc.wait_timeout = 30  # type: ignore[attr-defined]
-        except Exception:
-            pass
         return [pid]
     except ProcessLookupError:
         return []
-    except Exception as e:
+    except OSError as e:
         log.warning("Failed to terminate scan PID %s: %s", pid, e)
         return []
 
@@ -1387,7 +1426,7 @@ async def scheduled_scan_cron() -> None:
                 else:
                     log.warning("Scheduled scan failed (exit %d)", returncode)
             except Exception as e:
-                log.error("Scheduled scan error: %s", e)
+                log.exception("Scheduled scan error: %s", e)
             if _shutdown_requested:
                 break
             await asyncio.sleep(current_interval)
@@ -1460,7 +1499,7 @@ def _sweep_stale_backfills(max_age_minutes: int) -> int:
                     _unregister_backfill(tg_id, username)
                     removed += 1
             except Exception as e:
-                log.warning("Could not parse last_active %r for @%s: %s", last_active_str, username, e)
+                log.exception("Could not parse last_active %r for @%s: %s", last_active_str, username, e)
     return removed
 
 

@@ -34,6 +34,7 @@ import datetime as _dt
 import fcntl
 import json
 import logging
+import re
 import os
 import signal
 import sys
@@ -154,6 +155,7 @@ MIN_API_PAGE_LIMIT = 1
 # Telegram send limits
 TELEGRAM_PHOTO_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 TELEGRAM_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024  # 50 MB; larger is rejected
+TELEGRAM_VIDEO_MAX_MB = 2048  # Telegram sendDocument limit; sendVideo only for small previews
 
 # Per-item timeouts (seconds) for downloads
 IMAGE_DOWNLOAD_TIMEOUT = 120
@@ -170,6 +172,7 @@ LOCK_FILE_NAME = ".monitor.lock"
 # ---------------------------------------------------------------------------
 
 session = requests.Session()
+session.verify = True
 
 
 def init_session(http_cfg: HttpConfig) -> None:
@@ -382,8 +385,9 @@ def seen_file_for_user(seen_dir: Path, tg_id: str, username: str) -> Path:
     Each (Telegram user, Civitai user) pair has its own independent file
     so that different Telegram accounts have separate download progress.
     """
+    safe_username = re.sub(r"[^a-zA-Z0-9]", "_", username)
     seen_dir.mkdir(parents=True, exist_ok=True)
-    return seen_dir / f"seen_ids_{tg_id}_{username}.json"
+    return seen_dir / f"seen_ids_{tg_id}_{safe_username}.json"
 
 
 def load_seen_ids(seen_dir: Path, tg_id: str, username: str) -> set[int]:
@@ -392,19 +396,19 @@ def load_seen_ids(seen_dir: Path, tg_id: str, username: str) -> set[int]:
     return set(json.loads(path.read_text())) if path.exists() else set()
 
 
-def _save_lock_path(seen_dir: Path) -> Path:
+def _save_lock_path(seen_dir: Path, name: str = "save") -> Path:
     """Per-seen_dir lock file. Keeping the lock inside the data directory
     means the global bot lock doesn't serialize unrelated writes; only
     writers targeting the same seen_dir (which is the only case that can
     actually race) contend."""
     seen_dir.mkdir(parents=True, exist_ok=True)
-    return seen_dir / ".save.lock"
+    return seen_dir / f".{name}.lock"
 
 
 def save_seen_ids(seen_dir: Path, tg_id: str, username: str, ids: set[int]) -> None:
     """Save seen IDs for a specific (Telegram user, Civitai user) pair."""
     path = seen_file_for_user(seen_dir, tg_id, username)
-    lock = FileLock(str(_save_lock_path(seen_dir)), timeout=10)
+    lock = FileLock(str(_save_lock_path(seen_dir, name="seen")), timeout=10)
     try:
         with lock:
             # Atomic write: temp file + rename to prevent corruption on crash
@@ -418,8 +422,9 @@ def save_seen_ids(seen_dir: Path, tg_id: str, username: str, ids: set[int]) -> N
 
 
 def pushed_file_for_user(pushed_dir: Path, tg_id: str, username: str) -> Path:
+    safe_username = re.sub(r"[^a-zA-Z0-9]", "_", username)
     pushed_dir.mkdir(parents=True, exist_ok=True)
-    return pushed_dir / f"pushed_ids_{tg_id}_{username}.json"
+    return pushed_dir / f"pushed_ids_{tg_id}_{safe_username}.json"
 
 
 def load_pushed_ids(pushed_dir: Path, tg_id: str, username: str) -> set[int]:
@@ -429,7 +434,7 @@ def load_pushed_ids(pushed_dir: Path, tg_id: str, username: str) -> set[int]:
 
 def save_pushed_ids(pushed_dir: Path, tg_id: str, username: str, ids: set[int]) -> None:
     path = pushed_file_for_user(pushed_dir, tg_id, username)
-    lock = FileLock(str(_save_lock_path(pushed_dir)), timeout=10)
+    lock = FileLock(str(_save_lock_path(pushed_dir, name="pushed")), timeout=10)
     try:
         with lock:
             tmp = path.with_suffix(".tmp")
@@ -451,13 +456,16 @@ def download_image(url: str, save_path: Path, timeout: int = 120) -> bool:
         log.info("Already exists: %s, skipped", save_path.name)
         return True
     try:
-        resp = safe_get(url, timeout=timeout)
+        resp = safe_get(url, stream=True, timeout=timeout)
         resp.raise_for_status()
         save_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
-        tmp_path.write_bytes(resp.content)
+        with open(tmp_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                if chunk:
+                    f.write(chunk)
         tmp_path.rename(save_path)
-        log.info("Downloaded: %s (%d bytes)", save_path.name, len(resp.content))
+        log.info("Downloaded: %s (%d bytes)", save_path.name, save_path.stat().st_size)
         return True
     except requests.RequestException as e:
         log.warning("Image download failed for %s: %s", url, e)
@@ -600,20 +608,23 @@ def _send_telegram_video(api_base: str, chat_id: str, text: str, video_path: Pat
 def _send_telegram_media_group(api_base: str, chat_id: str, text: str, file_paths: list[Path]) -> bool:
     media = []
     files: dict[str, tuple] = {}
-    for i, fp in enumerate(file_paths[:10]):  # Telegram limit: 10 per group
-        if fp.exists():
-            media.append({
-                "type": "photo",
-                "media": f"attach://img{i}",
-                "caption": text if i == 0 else "",
-                "parse_mode": "Markdown",
-            })
-            files[f"img{i}"] = (fp.name, fp.read_bytes(), "image/jpeg")
-
-    if not media:
-        return False
-
+    open_handles: list = []
     try:
+        for i, fp in enumerate(file_paths[:10]):  # Telegram limit: 10 per group
+            if fp.exists():
+                media.append({
+                    "type": "photo",
+                    "media": f"attach://img{i}",
+                    "caption": text if i == 0 else "",
+                    "parse_mode": "Markdown",
+                })
+                fh = open(fp, "rb")
+                open_handles.append(fh)
+                files[f"img{i}"] = (fp.name, fh, "image/jpeg")
+
+        if not media:
+            return False
+
         resp = requests.post(
             f"{api_base}/sendMediaGroup",
             data={"chat_id": chat_id, "media": json.dumps(media)},
@@ -625,6 +636,9 @@ def _send_telegram_media_group(api_base: str, chat_id: str, text: str, file_path
         log.warning("Media group send failed: %s", resp.text[:200])
     except requests.RequestException as e:
         log.warning("Media group error: %s", e)
+    finally:
+        for fh in open_handles:
+            fh.close()
     return _send_telegram_text(api_base, chat_id, text)
 
 
