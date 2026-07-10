@@ -408,17 +408,22 @@ def _save_lock_path(seen_dir: Path, name: str = "save") -> Path:
 def save_seen_ids(seen_dir: Path, tg_id: str, username: str, ids: set[int]) -> None:
     """Save seen IDs for a specific (Telegram user, Civitai user) pair."""
     path = seen_file_for_user(seen_dir, tg_id, username)
-    lock = FileLock(str(_save_lock_path(seen_dir, name="seen")), timeout=10)
-    try:
-        with lock:
-            # Atomic write: temp file + rename to prevent corruption on crash
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(sorted(ids), indent=2))
-            tmp.rename(path)
-            path.chmod(0o600)
-        log.info("Saved %d seen IDs for @%s", len(ids), username)
-    except Timeout:
-        log.warning("Timeout saving %d seen IDs for @%s, skipped", len(ids), username)
+    lock_path = _save_lock_path(seen_dir, name="seen")
+    for attempt in range(3):
+        try:
+            with FileLock(str(lock_path), timeout=10):
+                # Atomic write: temp file + rename to prevent corruption on crash
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(sorted(ids), indent=2))
+                tmp.rename(path)
+                path.chmod(0o600)
+            log.info("Saved %d seen IDs for @%s", len(ids), username)
+            break
+        except Timeout:
+            if attempt < 2:
+                time.sleep(2)
+            else:
+                log.warning("Timeout saving %d seen IDs for @%s, skipped after 3 attempts", len(ids), username)
 
 
 def pushed_file_for_user(pushed_dir: Path, tg_id: str, username: str) -> Path:
@@ -434,16 +439,21 @@ def load_pushed_ids(pushed_dir: Path, tg_id: str, username: str) -> set[int]:
 
 def save_pushed_ids(pushed_dir: Path, tg_id: str, username: str, ids: set[int]) -> None:
     path = pushed_file_for_user(pushed_dir, tg_id, username)
-    lock = FileLock(str(_save_lock_path(pushed_dir, name="pushed")), timeout=10)
-    try:
-        with lock:
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(sorted(ids), indent=2))
-            tmp.rename(path)
-            path.chmod(0o600)
-        log.info("Saved %d pushed IDs for @%s", len(ids), username)
-    except Timeout:
-        log.warning("Timeout saving %d pushed IDs for @%s, skipped", len(ids), username)
+    lock_path = _save_lock_path(pushed_dir, name="pushed")
+    for attempt in range(3):
+        try:
+            with FileLock(str(lock_path), timeout=10):
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(sorted(ids), indent=2))
+                tmp.rename(path)
+                path.chmod(0o600)
+            log.info("Saved %d pushed IDs for @%s", len(ids), username)
+            break
+        except Timeout:
+            if attempt < 2:
+                time.sleep(2)
+            else:
+                log.warning("Timeout saving %d pushed IDs for @%s, skipped after 3 attempts", len(ids), username)
 
 
 # ---------------------------------------------------------------------------
