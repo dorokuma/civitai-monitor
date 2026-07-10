@@ -1046,6 +1046,14 @@ def _acquire_process_lock() -> int | None:
             pass
         return None
 
+    # Write PID to lock file so _is_scan_running can detect stale locks
+    try:
+        os.ftruncate(lock_fd, 0)
+        os.write(lock_fd, str(os.getpid()).encode())
+        os.fsync(lock_fd)
+    except OSError:
+        pass
+
     def _release_lock() -> None:
         try:
             os.close(lock_fd)
@@ -1057,6 +1065,23 @@ def _acquire_process_lock() -> int | None:
             pass
     atexit.register(_release_lock)
     return lock_fd
+
+
+def _is_scan_running() -> bool:
+    # Check if a monitor scan is already running by probing the lock file PID.
+    # Reads the PID from .monitor.lock and checks if that process is alive.
+    # This catches stale locks left by SIGKILL where the kernel released
+    # the flock but the sentinel file was not unlinked by the atexit handler.
+    lock_file = SCRIPT_DIR / LOCK_FILE_NAME
+    try:
+        pid_str = lock_file.read_text().strip()
+        if pid_str:
+            pid = int(pid_str)
+            os.kill(pid, 0)
+            return True
+    except (ValueError, ProcessLookupError, OSError, FileNotFoundError):
+        pass
+    return False
 
 
 def _write_status(
