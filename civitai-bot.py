@@ -215,8 +215,8 @@ def _acquire_backfill_lock(tg_id: str, username: str) -> tuple[int, Path] | None
     except (OSError, IOError):
         try:
             os.close(fd)
-        except Exception:
-            pass
+        except OSError:
+            log.exception("Failed to close lock fd")
         return None
 
 
@@ -1577,7 +1577,7 @@ def main() -> None:
         log.error("No authorized users configured (set authorized_users or telegram.chat_id)")
         sys.exit(1)
 
-    log.info("Authorised user IDs: %s", AUTHORIZED_USER_IDS)
+    log.info("Authorised %d user(s) configured", len(AUTHORIZED_USER_IDS))
 
     app = (
         Application.builder()

@@ -42,7 +42,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import requests
 import yaml
@@ -119,8 +119,8 @@ class MonitorConfig(BaseModel):
     users: list = Field(default_factory=list)
     subscriptions: dict[str, list] = Field(default_factory=dict)
     authorized_users: list[int] = Field(default_factory=list)
-    mode: str = "incremental"
-    nsfw: str = "both"
+    mode: Literal["incremental", "full"] = "incremental"
+    nsfw: Literal["sfw_only", "nsfw_only", "both"] = "both"
     api: ApiConfig = Field(default_factory=ApiConfig)
     download: DownloadConfig = Field(default_factory=DownloadConfig)
     telegram: TelegramConfig

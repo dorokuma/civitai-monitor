@@ -3,7 +3,17 @@ from pathlib import Path
 
 def load_dotenv(env_path: str | Path | None = None) -> bool:
     if env_path is None:
-        env_path = Path(__file__).parent / "civitai-bot.env"
+        # Try ~/.civitai-monitor/.env first, then legacy project-root path
+        candidates = [
+            Path.home() / ".civitai-monitor" / ".env",
+            Path(__file__).parent / "civitai-bot.env",
+        ]
+        for p in candidates:
+            if p.exists():
+                env_path = p
+                break
+        if env_path is None:
+            return False
     else:
         env_path = Path(env_path)
 
