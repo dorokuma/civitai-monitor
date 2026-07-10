@@ -1386,7 +1386,8 @@ async def scheduled_scan_cron() -> None:
         SIGKILL. We do NOT call ``os._exit`` — that would bypass PTB's own
         shutdown sequence and any in-flight backfill tasks.
     """
-    STALE_BACKFILL_MINUTES = 120  # 2h: anything older than this is a zombie
+    cfg = read_config()
+    STALE_BACKFILL_MINUTES = cfg.backfill.stale_backfill_minutes
     proc: asyncio.subprocess.Process | None = None
     try:
         while not _shutdown_requested:

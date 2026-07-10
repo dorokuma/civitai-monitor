@@ -115,6 +115,15 @@ class IncrementalConfig(BaseModel):
     max_pages: int = 5
 
 
+
+class BackfillConfig(BaseModel):
+    """Configuration for full backfill mode."""
+    stale_backfill_minutes: int = Field(
+        default=120,
+        description="Minutes after which an active backfill is considered stale/zombie"
+    )
+
+
 class MonitorConfig(BaseModel):
     users: list = Field(default_factory=list)
     subscriptions: dict[str, list] = Field(default_factory=dict)
@@ -127,6 +136,7 @@ class MonitorConfig(BaseModel):
     data: DataConfig = Field(default_factory=DataConfig)
     incremental: IncrementalConfig = Field(default_factory=IncrementalConfig)
     http: HttpConfig = Field(default_factory=HttpConfig)
+    backfill: BackfillConfig = Field(default_factory=BackfillConfig)
     video_enabled: bool = True
     max_video_size_mb: int = 1024
 
