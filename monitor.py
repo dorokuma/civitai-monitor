@@ -182,6 +182,7 @@ LOCK_FILE_NAME = ".monitor.lock"
 # ---------------------------------------------------------------------------
 
 session = requests.Session()
+session.timeout = 30
 session.verify = True
 
 
@@ -223,7 +224,7 @@ class RateLimitError(requests.RequestException):
 # ---------------------------------------------------------------------------
 
 
-def _rate_limit_wait(retry_state):
+def _rate_limit_wait(retry_state) -> float:
     """Respect Retry-After header when rate-limited, fall back to exponential backoff."""
     exc = retry_state.outcome.exception()
     if isinstance(exc, RateLimitError):
@@ -798,7 +799,7 @@ def _fetch_and_process_page(
             if pushed:
                 pushed_ids.add(img["id"])
                 save_pushed_ids(pushed_dir, tg_id, username, pushed_ids)
-            time.sleep(0.5)
+            time.sleep(2.0 + random.random() * 1.0)
 
     return new_on_page, page_ids, next_cursor
 
@@ -956,7 +957,7 @@ def run_full(
                 log.info("%s: completed after %d pages", label, page)
                 break
             cursor = next_cursor
-            time.sleep(0.5)
+            time.sleep(2.0 + random.random() * 1.0)
 
     return all_seen
 
