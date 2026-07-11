@@ -9,19 +9,30 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from monitor import (
+    PENDING_CONFIRM_SECONDS,
+    PENDING_MAX_RETRIES,
     _monitor_signal_handler,
+    adopt_stale_inflight,
     cleanup_old_caches,
+    clear_pending,
     fetch_page,
+    load_pending_map,
+    load_push_timestamps,
     load_pushed_ids,
     load_seen_ids,
+    mark_inflight,
+    mark_pending,
     nsfw_tracks,
     normalize_to_original,
     pushed_file_for_user,
     save_pushed_ids,
     save_seen_ids,
     seen_file_for_user,
+    update_pending_map,
+    update_push_timestamps,
 )
 
 
@@ -260,6 +271,156 @@ class TestPushedIdsRoundTrip:
 
     def test_pushed_ids_load_missing_returns_empty(self, tmp_dir):
         assert load_pushed_ids(tmp_dir, "tg1", "missing") == set()
+
+    def test_save_pushed_ids_merges_with_on_disk(self, tmp_dir):
+        """Merge-on-write: in-memory subset must not clobber IDs already on disk."""
+        save_pushed_ids(tmp_dir, "tg1", "alice", {1, 2, 3})
+        # Simulate a partial in-memory set (e.g. reloaded mid-run missing older IDs)
+        partial = {3, 4}
+        save_pushed_ids(tmp_dir, "tg1", "alice", partial)
+        assert load_pushed_ids(tmp_dir, "tg1", "alice") == {1, 2, 3, 4}
+        # Caller set is updated in place to the merged view
+        assert partial == {1, 2, 3, 4}
+
+
+# ---------------------------------------------------------------------------
+# Telegram media send — anti-duplicate on timeout
+# ---------------------------------------------------------------------------
+
+class TestTelegramMediaAntiDuplicate:
+    """Timeout after media upload must NOT fall back to a second text message."""
+
+    def test_video_timeout_returns_uncertain_no_text(self, monkeypatch, tmp_path):
+        import monitor as m
+
+        video = tmp_path / "1.mp4"
+        video.write_bytes(b"fake-video")
+
+        def boom(*_a, **_k):
+            raise requests.Timeout("read timed out")
+
+        text_calls: list = []
+        monkeypatch.setattr(m.requests, "post", boom)
+        monkeypatch.setattr(
+            m, "_send_telegram_text",
+            lambda *a, **k: text_calls.append(1) or True,
+        )
+        ok = m._send_telegram_video("http://api/botT", "chat", "caption", video)
+        assert ok is None  # uncertain, not false success
+        assert text_calls == []
+
+    def test_media_group_timeout_returns_uncertain_no_text(self, monkeypatch, tmp_path):
+        import monitor as m
+
+        img = tmp_path / "1.jpeg"
+        img.write_bytes(b"fake-img")
+
+        def boom(*_a, **_k):
+            raise requests.Timeout("read timed out")
+
+        text_calls: list = []
+        monkeypatch.setattr(m.requests, "post", boom)
+        monkeypatch.setattr(
+            m, "_send_telegram_text",
+            lambda *a, **k: text_calls.append(1) or True,
+        )
+        ok = m._send_telegram_media_group("http://api/botT", "chat", "caption", [img])
+        assert ok is None
+        assert text_calls == []
+
+    def test_video_http_error_still_falls_back_to_text(self, monkeypatch, tmp_path):
+        import monitor as m
+
+        video = tmp_path / "1.mp4"
+        video.write_bytes(b"fake-video")
+
+        class FakeResp:
+            ok = False
+            text = "bad request"
+
+        monkeypatch.setattr(m.requests, "post", lambda *a, **k: FakeResp())
+        text_calls: list = []
+        monkeypatch.setattr(
+            m, "_send_telegram_text",
+            lambda *a, **k: text_calls.append(1) or True,
+        )
+        ok = m._send_telegram_video("http://api/botT", "chat", "caption", video)
+        assert ok is True
+        assert text_calls == [1]
+
+
+class TestPushLifecycleState:
+    """Inflight pre-claim + pending light-confirm bookkeeping."""
+
+    def test_mark_and_clear_pending(self, tmp_path):
+        mark_pending(tmp_path, "tg1", "alice", 42, ts=1000.0, retries=0)
+        data = load_pending_map(tmp_path, "tg1", "alice")
+        assert data == {42: (1000.0, 0)}
+        clear_pending(tmp_path, "tg1", "alice", 42)
+        assert load_pending_map(tmp_path, "tg1", "alice") == {}
+
+    def test_adopt_stale_inflight_moves_to_pending(self, tmp_path):
+        mark_inflight(tmp_path, "tg1", "alice", 7)
+        mark_inflight(tmp_path, "tg1", "alice", 8)
+        pending = adopt_stale_inflight(tmp_path, "tg1", "alice")
+        assert set(pending.keys()) == {7, 8}
+        assert all(r == 0 for _, r in pending.values())
+        assert load_push_timestamps(tmp_path, "inflight", "tg1", "alice") == {}
+
+    def test_update_pending_merge_and_remove(self, tmp_path):
+        update_pending_map(tmp_path, "tg1", "bob", add={1: (10.0, 0), 2: (20.0, 1)})
+        update_pending_map(tmp_path, "tg1", "bob", add={3: (30.0, 0)}, remove={1})
+        data = load_pending_map(tmp_path, "tg1", "bob")
+        assert data == {2: (20.0, 1), 3: (30.0, 0)}
+
+    def test_pending_legacy_float_loads_as_retries_zero(self, tmp_path):
+        """Old on-disk format was id→float; must still load."""
+        path = tmp_path / "pending_push_tg1_alice.json"
+        path.write_text('{"42": 1000.5}')
+        data = load_pending_map(tmp_path, "tg1", "alice")
+        assert data == {42: (1000.5, 0)}
+
+    def test_pending_confirm_window_constant(self):
+        assert PENDING_CONFIRM_SECONDS == 30 * 60
+        assert PENDING_MAX_RETRIES == 1
+
+    def test_finalize_uncertain_parks_pending(self, tmp_path):
+        import monitor as m
+
+        pushed: set[int] = set()
+        ok = m._finalize_send_outcome(
+            None, 99, "alice",
+            pushed_ids=pushed, pushed_dir=tmp_path, tg_id="tg1",
+        )
+        assert ok is False
+        assert 99 not in pushed
+        assert 99 in load_pending_map(tmp_path, "tg1", "alice")
+
+    def test_finalize_ok_records_pushed_and_clears_pending(self, tmp_path):
+        import monitor as m
+
+        mark_pending(tmp_path, "tg1", "alice", 99, ts=1.0, retries=1)
+        mark_inflight(tmp_path, "tg1", "alice", 99)
+        pushed: set[int] = set()
+        ok = m._finalize_send_outcome(
+            True, 99, "alice",
+            pushed_ids=pushed, pushed_dir=tmp_path, tg_id="tg1",
+        )
+        assert ok is True
+        assert pushed == {99}
+        assert load_pending_map(tmp_path, "tg1", "alice") == {}
+        assert load_push_timestamps(tmp_path, "inflight", "tg1", "alice") == {}
+
+    def test_finalize_fail_clears_pending(self, tmp_path):
+        import monitor as m
+
+        mark_pending(tmp_path, "tg1", "alice", 5, ts=1.0, retries=1)
+        ok = m._finalize_send_outcome(
+            False, 5, "alice",
+            pushed_ids=set(), pushed_dir=tmp_path, tg_id="tg1",
+        )
+        assert ok is False
+        assert load_pending_map(tmp_path, "tg1", "alice") == {}
 
 
 # ---------------------------------------------------------------------------

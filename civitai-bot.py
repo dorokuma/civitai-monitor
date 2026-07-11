@@ -67,14 +67,25 @@ def rate_limit(min_interval: float = 5.0):
     def decorator(func):
         @wraps(func)
         async def wrapper(update, context, *args, **kwargs):
-            user_id = str(update.effective_user.id)
+            user = update.effective_user
+            if user is None:
+                return
+            user_id = str(user.id)
             now = time.time()
             elapsed = now - _user_last_call.get(user_id, 0)
             if elapsed < min_interval:
                 remaining = int(min_interval - elapsed) + 1
-                await update.message.reply_text(
-                    f"⏳ 请等 {remaining} 秒后再试"
-                )
+                notice = f"⏳ 请等 {remaining} 秒后再试"
+                # Callback queries have no update.message — use effective_message
+                # or answer the callback so the bot never crashes on button taps.
+                msg = update.effective_message
+                if msg is not None:
+                    await msg.reply_text(notice)
+                elif update.callback_query is not None:
+                    try:
+                        await update.callback_query.answer(notice, show_alert=True)
+                    except Exception:
+                        log.debug("rate_limit: callback answer failed", exc_info=True)
                 return
             _user_last_call[user_id] = now
             return await func(update, context, *args, **kwargs)

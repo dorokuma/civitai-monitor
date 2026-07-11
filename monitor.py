@@ -449,22 +449,290 @@ def load_pushed_ids(pushed_dir: Path, tg_id: str, username: str) -> set[int]:
 
 
 def save_pushed_ids(pushed_dir: Path, tg_id: str, username: str, ids: set[int]) -> None:
+    """Persist pushed IDs, merging with any on-disk set under the lock.
+
+    Merge-on-write avoids clobbering IDs saved by an earlier crash-recovery
+    path or a concurrent writer. The caller's ``ids`` set is updated in place
+    to the merged result so in-memory state stays consistent with disk.
+    """
     path = pushed_file_for_user(pushed_dir, tg_id, username)
     lock_path = _save_lock_path(pushed_dir, name="pushed")
     for attempt in range(3):
         try:
             with FileLock(str(lock_path), timeout=10):
+                on_disk: set[int] = set()
+                if path.exists():
+                    try:
+                        on_disk = set(json.loads(path.read_text()))
+                    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+                        log.warning(
+                            "Corrupt pushed IDs file for @%s, rewriting from memory",
+                            username,
+                        )
+                merged = on_disk | set(ids)
                 tmp = path.with_suffix(".tmp")
-                tmp.write_text(json.dumps(sorted(ids), indent=2))
+                tmp.write_text(json.dumps(sorted(merged), indent=2))
                 tmp.rename(path)
                 path.chmod(0o600)
-            log.info("Saved %d pushed IDs for @%s", len(ids), username)
+                # Keep caller set in sync with the merged disk view.
+                ids.clear()
+                ids.update(merged)
+            log.info("Saved %d pushed IDs for @%s", len(merged), username)
             break
         except Timeout:
             if attempt < 2:
                 time.sleep(2)
             else:
                 log.warning("Timeout saving %d pushed IDs for @%s, skipped after 3 attempts", len(ids), username)
+
+
+# ---------------------------------------------------------------------------
+# Push lifecycle state: inflight (pre-claim) + pending (timeout / uncertain)
+# ---------------------------------------------------------------------------
+#
+# Timeline for one item:
+#   1. mark inflight  →  2. send to Telegram  →  3a. OK: pushed + clear inflight
+#                                              →  3b. timeout: pending + clear inflight
+#                                              →  3c. fail: clear inflight only
+#                                              →  3d. crash mid-send: inflight left on disk
+# Next scan:
+#   - leftover inflight is promoted to pending (treat as uncertain)
+#   - pending younger than PENDING_CONFIRM_SECONDS → assume delivered, promote to pushed
+#   - pending older → one retry push
+#
+# Telegram has no cheap "did bot message X land?" check for outbound media, so the
+# "light confirm" is age-based: fresh uncertain stays non-retrying; stale retries once.
+
+PENDING_CONFIRM_SECONDS = 30 * 60  # 30 minutes
+# After one expired retry that is still uncertain, promote without further re-sends
+# (caps the "maybe already delivered" loop at a single extra push attempt).
+PENDING_MAX_RETRIES = 1
+
+
+def _safe_user_token(username: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]", "_", username)
+
+
+def _push_state_file(state_dir: Path, kind: str, tg_id: str, username: str) -> Path:
+    """kind is 'pending' or 'inflight'."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir / f"{kind}_push_{tg_id}_{_safe_user_token(username)}.json"
+
+
+def load_push_timestamps(state_dir: Path, kind: str, tg_id: str, username: str) -> dict[int, float]:
+    """Load id → unix-ts map for inflight (simple floats). Corrupt/missing → empty."""
+    path = _push_state_file(state_dir, kind, tg_id, username)
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text())
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[int, float] = {}
+        for k, v in raw.items():
+            try:
+                # Allow legacy pending-style dicts if misread as inflight.
+                if isinstance(v, dict):
+                    out[int(k)] = float(v.get("ts", 0))
+                else:
+                    out[int(k)] = float(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        log.warning("Corrupt %s push state for @%s, starting empty", kind, username)
+        return {}
+
+
+def _write_push_timestamps(path: Path, data: dict[int, float]) -> None:
+    """Atomic rewrite of an id→ts map (caller must hold the lock)."""
+    serializable = {str(k): v for k, v in sorted(data.items())}
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(serializable, indent=2))
+    tmp.rename(path)
+    path.chmod(0o600)
+
+
+def update_push_timestamps(
+    state_dir: Path,
+    kind: str,
+    tg_id: str,
+    username: str,
+    *,
+    add: dict[int, float] | None = None,
+    remove: set[int] | None = None,
+) -> dict[int, float]:
+    """Merge add / remove into an inflight-style float map under a file lock."""
+    path = _push_state_file(state_dir, kind, tg_id, username)
+    lock_path = _save_lock_path(state_dir, name=f"{kind}_push")
+    for attempt in range(3):
+        try:
+            with FileLock(str(lock_path), timeout=10):
+                data = load_push_timestamps(state_dir, kind, tg_id, username)
+                if add:
+                    data.update(add)
+                if remove:
+                    for iid in remove:
+                        data.pop(iid, None)
+                if data:
+                    _write_push_timestamps(path, data)
+                elif path.exists():
+                    try:
+                        path.unlink()
+                    except OSError:
+                        _write_push_timestamps(path, {})
+                return data
+        except Timeout:
+            if attempt < 2:
+                time.sleep(2)
+            else:
+                log.warning(
+                    "Timeout updating %s push state for @%s after 3 attempts",
+                    kind, username,
+                )
+    return load_push_timestamps(state_dir, kind, tg_id, username)
+
+
+def mark_inflight(state_dir: Path, tg_id: str, username: str, item_id: int) -> None:
+    """Pre-claim an item ID before the Telegram request leaves the process."""
+    update_push_timestamps(
+        state_dir, "inflight", tg_id, username,
+        add={item_id: time.time()},
+    )
+
+
+def clear_inflight(state_dir: Path, tg_id: str, username: str, item_id: int) -> None:
+    update_push_timestamps(
+        state_dir, "inflight", tg_id, username,
+        remove={item_id},
+    )
+
+
+# Pending records: id → (ts, retries). Legacy on-disk value may be a bare float.
+PendingMap = dict[int, tuple[float, int]]
+
+
+def _parse_pending_value(v: Any) -> tuple[float, int] | None:
+    try:
+        if isinstance(v, dict):
+            return float(v.get("ts", 0)), int(v.get("retries", 0))
+        return float(v), 0
+    except (TypeError, ValueError):
+        return None
+
+
+def load_pending_map(state_dir: Path, tg_id: str, username: str) -> PendingMap:
+    """Load pending id → (ts, retries). Supports legacy float-only values."""
+    path = _push_state_file(state_dir, "pending", tg_id, username)
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text())
+        if not isinstance(raw, dict):
+            return {}
+        out: PendingMap = {}
+        for k, v in raw.items():
+            parsed = _parse_pending_value(v)
+            if parsed is None:
+                continue
+            try:
+                out[int(k)] = parsed
+            except (TypeError, ValueError):
+                continue
+        return out
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        log.warning("Corrupt pending push state for @%s, starting empty", username)
+        return {}
+
+
+def _write_pending_map(path: Path, data: PendingMap) -> None:
+    serializable = {
+        str(k): {"ts": ts, "retries": retries}
+        for k, (ts, retries) in sorted(data.items())
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(serializable, indent=2))
+    tmp.rename(path)
+    path.chmod(0o600)
+
+
+def update_pending_map(
+    state_dir: Path,
+    tg_id: str,
+    username: str,
+    *,
+    add: PendingMap | None = None,
+    remove: set[int] | None = None,
+) -> PendingMap:
+    """Merge add/remove into the pending map under lock; atomic rewrite."""
+    path = _push_state_file(state_dir, "pending", tg_id, username)
+    lock_path = _save_lock_path(state_dir, name="pending_push")
+    for attempt in range(3):
+        try:
+            with FileLock(str(lock_path), timeout=10):
+                data = load_pending_map(state_dir, tg_id, username)
+                if add:
+                    data.update(add)
+                if remove:
+                    for iid in remove:
+                        data.pop(iid, None)
+                if data:
+                    _write_pending_map(path, data)
+                elif path.exists():
+                    try:
+                        path.unlink()
+                    except OSError:
+                        _write_pending_map(path, {})
+                return data
+        except Timeout:
+            if attempt < 2:
+                time.sleep(2)
+            else:
+                log.warning(
+                    "Timeout updating pending push state for @%s after 3 attempts",
+                    username,
+                )
+    return load_pending_map(state_dir, tg_id, username)
+
+
+def mark_pending(
+    state_dir: Path,
+    tg_id: str,
+    username: str,
+    item_id: int,
+    *,
+    ts: float | None = None,
+    retries: int = 0,
+) -> None:
+    """Record uncertain delivery (timeout or leftover inflight after crash)."""
+    update_pending_map(
+        state_dir, tg_id, username,
+        add={item_id: (ts if ts is not None else time.time(), int(retries))},
+    )
+
+
+def clear_pending(state_dir: Path, tg_id: str, username: str, item_id: int) -> None:
+    update_pending_map(state_dir, tg_id, username, remove={item_id})
+
+
+def adopt_stale_inflight(state_dir: Path, tg_id: str, username: str) -> PendingMap:
+    """Move any leftover inflight IDs into pending (crash mid-send recovery).
+
+    Returns the pending map after adoption.
+    """
+    inflight = load_push_timestamps(state_dir, "inflight", tg_id, username)
+    if not inflight:
+        return load_pending_map(state_dir, tg_id, username)
+    log.warning(
+        "Adopting %d leftover inflight ID(s) as pending for @%s (crash recovery)",
+        len(inflight), username,
+    )
+    update_pending_map(
+        state_dir, tg_id, username,
+        add={iid: (ts, 0) for iid, ts in inflight.items()},
+    )
+    update_push_timestamps(state_dir, "inflight", tg_id, username, remove=set(inflight.keys()))
+    return load_pending_map(state_dir, tg_id, username)
 
 
 # ---------------------------------------------------------------------------
@@ -581,7 +849,14 @@ def send_to_telegram(
     chat_id: str,
     text: str,
     file_paths: list[Path] | None = None,
-) -> bool:
+) -> bool | None:
+    """Send a Telegram message.
+
+    Returns:
+      True  — confirmed delivery
+      False — confirmed failure (safe to retry)
+      None  — uncertain (timeout after request left; may already be delivered)
+    """
     api_base = f"{_tg_api_base}/bot{bot_token}"
 
     if file_paths:
@@ -600,8 +875,15 @@ def send_to_telegram(
     return _send_telegram_text(api_base, chat_id, text)
 
 
-def _send_telegram_video(api_base: str, chat_id: str, text: str, video_path: Path) -> bool:
-    """Send a video to Telegram. <=50 MB: sendVideo (inline play). >50 MB: sendDocument (2 GB, no quality loss)."""
+def _send_telegram_video(api_base: str, chat_id: str, text: str, video_path: Path) -> bool | None:
+    """Send a video to Telegram. <=50 MB: sendVideo (inline play). >50 MB: sendDocument (2 GB, no quality loss).
+
+    Delivery policy (anti-duplicate):
+      * HTTP success → True
+      * Clear HTTP error → text-only fallback (media was rejected; safe to notify)
+      * Timeout after the request left the client → None (uncertain; no text fallback)
+      * Other transport errors → False without text (retry media next scan)
+    """
     size_mb = video_path.stat().st_size / 1048576
     try:
         if size_mb <= TELEGRAM_VIDEO_MAX_MB:
@@ -621,12 +903,26 @@ def _send_telegram_video(api_base: str, chat_id: str, text: str, video_path: Pat
         if resp.ok:
             return True
         log.warning("Video send failed: %s", resp.text[:200])
+        # Media rejected by API — text notify is safe (no prior delivery).
+        return _send_telegram_text(api_base, chat_id, text)
+    except requests.Timeout as e:
+        log.warning(
+            "Video send timeout (may already be delivered); marking uncertain, no text fallback: %s",
+            e,
+        )
+        return None
     except requests.RequestException as e:
-        log.warning("Video send error: %s", e)
-    return _send_telegram_text(api_base, chat_id, text)
+        log.warning("Video send error (will retry later, no text fallback): %s", e)
+        return False
 
 
-def _send_telegram_media_group(api_base: str, chat_id: str, text: str, file_paths: list[Path]) -> bool:
+def _send_telegram_media_group(api_base: str, chat_id: str, text: str, file_paths: list[Path]) -> bool | None:
+    """Send images as a media group.
+
+    Same anti-duplicate policy as ``_send_telegram_video``: never append a
+    text message after a transport timeout (the photo may already be in the chat).
+    Timeout returns None (uncertain) so the caller can park the ID as pending.
+    """
     media = []
     files: dict[str, tuple] = {}
     open_handles: list = []
@@ -655,12 +951,20 @@ def _send_telegram_media_group(api_base: str, chat_id: str, text: str, file_path
         if resp.ok:
             return True
         log.warning("Media group send failed: %s", resp.text[:200])
+        # Clear rejection — safe to fall back to text-only.
+        return _send_telegram_text(api_base, chat_id, text)
+    except requests.Timeout as e:
+        log.warning(
+            "Media group timeout (may already be delivered); marking uncertain, no text fallback: %s",
+            e,
+        )
+        return None
     except requests.RequestException as e:
-        log.warning("Media group error: %s", e)
+        log.warning("Media group error (will retry later, no text fallback): %s", e)
+        return False
     finally:
         for fh in open_handles:
             fh.close()
-    return _send_telegram_text(api_base, chat_id, text)
 
 
 def _send_telegram_text(api_base: str, chat_id: str, text: str) -> bool:
@@ -681,6 +985,64 @@ def _send_telegram_text(api_base: str, chat_id: str, text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _record_push_success(
+    item_id: int,
+    username: str,
+    *,
+    pushed_ids: set[int] | None,
+    pushed_dir: Path | None,
+    tg_id: str | None,
+) -> None:
+    """Mark ``item_id`` as pushed and flush to disk immediately.
+
+    Also clears pending/inflight for the same ID when state dir is available.
+    """
+    if pushed_ids is None or pushed_dir is None or tg_id is None:
+        return
+    pushed_ids.add(item_id)
+    save_pushed_ids(pushed_dir, tg_id, username, pushed_ids)
+    clear_pending(pushed_dir, tg_id, username, item_id)
+    clear_inflight(pushed_dir, tg_id, username, item_id)
+
+
+def _finalize_send_outcome(
+    outcome: bool | None,
+    item_id: int,
+    username: str,
+    *,
+    pushed_ids: set[int] | None,
+    pushed_dir: Path | None,
+    tg_id: str | None,
+) -> bool:
+    """Apply lifecycle bookkeeping for a send outcome. Returns confirmed-success bool."""
+    if pushed_dir is not None and tg_id is not None:
+        clear_inflight(pushed_dir, tg_id, username, item_id)
+    if outcome is True:
+        _record_push_success(
+            item_id, username,
+            pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
+        )
+        return True
+    if outcome is None:
+        # Uncertain delivery — park as pending; next scan will light-confirm or
+        # allow at most one expired retry (see PENDING_MAX_RETRIES).
+        if pushed_dir is not None and tg_id is not None:
+            existing = load_pending_map(pushed_dir, tg_id, username)
+            prev_retries = existing[item_id][1] if item_id in existing else 0
+            # If a retry was pre-marked (retries already >= 1), keep that count.
+            retries = max(prev_retries, 0)
+            mark_pending(pushed_dir, tg_id, username, item_id, retries=retries)
+            log.info(
+                "Parked id=%d for @%s as pending (uncertain delivery, retries=%d)",
+                item_id, username, retries,
+            )
+        return False
+    # Confirmed failure — drop any pending so a later scan can try cleanly.
+    if pushed_dir is not None and tg_id is not None:
+        clear_pending(pushed_dir, tg_id, username, item_id)
+    return False
+
+
 def process_and_push(
     item: dict[str, Any],
     username: str,
@@ -691,8 +1053,16 @@ def process_and_push(
     chat_id: str,
     video_enabled: bool,
     max_video_size_mb: int,
+    pushed_ids: set[int] | None = None,
+    pushed_dir: Path | None = None,
+    tg_id: str | None = None,
 ) -> bool:
-    """Download a single item (image or video) and push to Telegram."""
+    """Download a single item (image or video) and push to Telegram.
+
+    Pre-claims the item as inflight before the Telegram request so a hard kill
+    mid-send leaves a recoverable marker. Confirmed success is flushed to
+    ``pushed_ids`` immediately; timeouts become pending instead of false success.
+    """
     item_id = item["id"]
     civitai_url = f"https://civitai.com/images/{item_id}"
     created_at = item.get("createdAt", "")
@@ -705,6 +1075,15 @@ def process_and_push(
             or str(item.get("url", "")).lower().endswith((".mp4", ".webm", ".mov"))
         )
     )
+
+    def _send(text: str, files: list[Path] | None) -> bool:
+        if pushed_dir is not None and tg_id is not None:
+            mark_inflight(pushed_dir, tg_id, username, item_id)
+        outcome = send_to_telegram(bot_token, chat_id, text, files)
+        return _finalize_send_outcome(
+            outcome, item_id, username,
+            pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
+        )
 
     if is_video:
         # Video path
@@ -722,7 +1101,7 @@ def process_and_push(
             f"🔗 [View on Civitai]({civitai_url})\n"
             f"🕐 {created_at}"
         )
-        pushed = send_to_telegram(bot_token, chat_id, text, [filepath] if success else None)
+        pushed = _send(text, [filepath] if success else None)
         log.info("Pushed %s %s to @%s | id=%d file=%s success=%s push=%s",
                  "video", "✅" if pushed else "❌", username, item_id,
                  filepath.name if success else "none", success, pushed)
@@ -740,7 +1119,7 @@ def process_and_push(
             f"🔗 [View on Civitai]({civitai_url})\n"
             f"🕐 {created_at}"
         )
-    pushed = send_to_telegram(bot_token, chat_id, text, [filepath] if success else None)
+    pushed = _send(text, [filepath] if success else None)
     log.info("Pushed %s %s to @%s | id=%d file=%s success=%s push=%s",
              "image", "✅" if pushed else "❌", username, item_id,
              filepath.name if success else "none", success, pushed)
@@ -775,19 +1154,73 @@ def _fetch_and_process_page(
 
     Returns (new_items_processed, all_item_ids_on_page, next_cursor).
     The caller is responsible for checkpoint-saving seen_ids and cursor-looping.
+
+    Pending / inflight handling (anti-duplicate edge cases):
+      * Leftover inflight (crash mid-send) is adopted as pending.
+      * Pending younger than PENDING_CONFIRM_SECONDS → light-confirm: promote
+        to pushed without re-sending (assume delivered).
+      * Pending older with retries < PENDING_MAX_RETRIES → exactly one retry push
+        (retries pre-bumped so a second timeout will not re-arm forever).
+      * Pending older with retries >= PENDING_MAX_RETRIES → promote, no more sends.
+      * If the page only needed light-confirms/promotes (no real push attempt),
+        return an empty "new" list so incremental mode stops paging early.
     """
     items, next_cursor = fetch_page(username, base_url=base_url, limit=limit, cursor=cursor, nsfw=nsfw_flag, sort=sort)
     if not items:
         return [], set(), next_cursor
 
     page_ids = {img["id"] for img in items}
+    # Crash recovery: inflight left by a hard kill becomes pending.
+    pending = adopt_stale_inflight(pushed_dir, tg_id, username)
+    now = time.time()
     new_on_page = [img for img in items if img["id"] not in pushed_ids]
+    did_push_attempt = False
 
     if new_on_page:
         for img in reversed(new_on_page):
-            if img["id"] in pushed_ids:
+            item_id = img["id"]
+            if item_id in pushed_ids:
                 continue
-            pushed = process_and_push(
+
+            # Light-confirm / capped-retry path for uncertain prior sends.
+            if item_id in pending:
+                ts, retries = pending[item_id]
+                age = now - float(ts)
+                if age < PENDING_CONFIRM_SECONDS:
+                    log.info(
+                        "Pending id=%d for @%s is fresh (%.0fs < %ds); promoting to pushed without re-send",
+                        item_id, username, age, PENDING_CONFIRM_SECONDS,
+                    )
+                    _record_push_success(
+                        item_id, username,
+                        pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
+                    )
+                    continue
+                if retries >= PENDING_MAX_RETRIES:
+                    log.info(
+                        "Pending id=%d for @%s expired with retries=%d; promoting without further re-send",
+                        item_id, username, retries,
+                    )
+                    _record_push_success(
+                        item_id, username,
+                        pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
+                    )
+                    continue
+                # First expiry: pre-bump retries so a second timeout parks at max
+                # and will not schedule yet another re-push next time.
+                log.info(
+                    "Pending id=%d for @%s expired (%.0fs, retries=%d); one retry push",
+                    item_id, username, age, retries,
+                )
+                mark_pending(
+                    pushed_dir, tg_id, username, item_id,
+                    ts=now, retries=retries + 1,
+                )
+                pending[item_id] = (now, retries + 1)
+
+            # process_and_push pre-claims inflight, then records pushed/pending.
+            did_push_attempt = True
+            process_and_push(
                 img, username,
                 size_suffixes=size_suffixes,
                 output_dir=output_dir,
@@ -795,12 +1228,15 @@ def _fetch_and_process_page(
                 chat_id=chat_id,
                 video_enabled=video_enabled,
                 max_video_size_mb=max_video_size_mb,
+                pushed_ids=pushed_ids,
+                pushed_dir=pushed_dir,
+                tg_id=tg_id,
             )
-            if pushed:
-                pushed_ids.add(img["id"])
-                save_pushed_ids(pushed_dir, tg_id, username, pushed_ids)
             time.sleep(2.0 + random.random() * 1.0)
 
+    # Only pending promotes / already-handled items → signal catch-up to caller.
+    if not did_push_attempt:
+        return [], page_ids, next_cursor
     return new_on_page, page_ids, next_cursor
 
 
