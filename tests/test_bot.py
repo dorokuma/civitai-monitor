@@ -7,9 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from pathlib import Path
+
 # Load civitai-bot.py as a module (hyphenated name needs importlib)
 _spec = importlib.util.spec_from_file_location(
-    "civitai_bot_module", "/root/civitai-monitor/civitai-bot.py"
+    "civitai_bot_module", str(Path(__file__).parent.parent / "civitai-bot.py")
 )
 civitai_bot = importlib.util.module_from_spec(_spec)
 sys.modules["civitai_bot_module"] = civitai_bot

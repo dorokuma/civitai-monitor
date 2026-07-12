@@ -1298,8 +1298,22 @@ def run_incremental(
             # If all items on this page are already pushed, we've caught up
             all_seen.update(page_ids)
             if not new_on_page:
-                log.info("%s: caught up after %d pages (track: %s)", username, page, label)
-                break
+                safe_lower_bound = 0
+                if pushed_ids:
+                    sorted_pushed = sorted(pushed_ids, reverse=True)
+                    window_size = max_pages * limit
+                    safe_lower_bound = sorted_pushed[min(len(sorted_pushed) - 1, window_size - 1)]
+
+                page_min_id = min(page_ids) if page_ids else 0
+                if page_min_id <= safe_lower_bound:
+                    log.info("%s: caught up after %d pages (track: %s)", username, page, label)
+                    break
+                else:
+                    log.info(
+                        "%s: page %d has no new items, but min_id %d > safe_lower_bound %d. "
+                        "Continuing to search for potential holes.",
+                        username, page, page_min_id, safe_lower_bound
+                    )
 
             log.info("%s: +%d new (page %d, track: %s)", username, len(new_on_page), page, label)
 

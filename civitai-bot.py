@@ -219,15 +219,17 @@ def _acquire_backfill_lock(tg_id: str, username: str) -> tuple[int, Path] | None
     Use the .backfill_lock_*.lck file as a sentinel; remove the file on release.
     """
     lock_path = SCRIPT_DIR / f".backfill_lock_{tg_id}_{username}.lck"
+    fd = None
     try:
         fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return fd, lock_path
     except (OSError, IOError):
-        try:
-            os.close(fd)
-        except OSError:
-            log.exception("Failed to close lock fd")
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                log.exception("Failed to close lock fd")
         return None
 
 
@@ -550,7 +552,7 @@ async def cmd_add(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     verifying_msg = await update.message.reply_text(f"⏳ 正在验证 @{username} 是否存在...")
 
     # 存在性校验
-    ok, msg = validate_username_exists(username)
+    ok, msg = await asyncio.to_thread(validate_username_exists, username)
     if not ok:
         await verifying_msg.edit_text(msg)
         return

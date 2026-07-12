@@ -83,14 +83,14 @@ def test_monitor_config_nested_subscriptions():
     assert cfg.subscriptions["123"][1]["name"] == "user2"
 
 
-def test_monitor_config_mode_nsfw_any_string():
-    """mode and nsfw accept any string (no pattern validation at model level)."""
+def test_monitor_config_mode_nsfw_valid():
+    """mode and nsfw accept valid strings."""
     cfg = MonitorConfig(
         telegram={"bot_token": "t", "chat_id": "c"},
-        mode="anything",
-        nsfw="anything",
+        mode="incremental",
+        nsfw="sfw_only",
         subscriptions={},
         authorized_users=[],
     )
-    assert cfg.mode == "anything"
-    assert cfg.nsfw == "anything"
+    assert cfg.mode == "incremental"
+    assert cfg.nsfw == "sfw_only"

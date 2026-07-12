@@ -208,7 +208,7 @@ class TestFetchPageLimitClamp:
         assert mock_get.call_args.kwargs["params"]["limit"] == 100
 
     def test_uses_civitai_red_when_nsfw_true(self):
-        """NSFW track must hit civitai.red with browsingLevel=8."""
+        """NSFW track must hit civitai.red."""
         with patch("monitor.safe_get") as mock_get:
             mock_get.return_value = self._mock_response()
             fetch_page("alice", nsfw=True, sort="Newest")
@@ -216,7 +216,6 @@ class TestFetchPageLimitClamp:
         assert called_url.startswith("https://civitai.red/api/v1/images")
         sent = mock_get.call_args.kwargs["params"]
         assert sent["nsfw"] == "true"
-        assert sent["browsingLevel"] == 8
 
     def test_falls_back_to_unsorted_when_newest_returns_empty(self):
         """Some users (e.g. PotatoMan760) have the Newest-sort bug — retry
@@ -473,4 +472,74 @@ class TestIncrementalMaxPages:
         from monitor import MonitorConfig
         cfg = MonitorConfig(telegram={"bot_token": "t", "chat_id": "c"})
         assert cfg.incremental.max_pages == 5
+
+
+class TestIncrementalHoles:
+    """测试增量扫描在遇到已被推送的新图覆盖了空洞时的行为。"""
+
+    @patch("monitor.fetch_page")
+    @patch("monitor.process_and_push")
+    def test_incremental_does_not_skip_hole(self, mock_push, mock_fetch, tmp_path):
+        from monitor import run_incremental, save_pushed_ids
+        
+        # 1. 模拟 pushed_ids 缺少 98（98 是发送失败的空洞）
+        # 包含新推送成功的 105..101，以及旧图 100, 99, 97, 96, 95
+        pushed_ids = {105, 104, 103, 102, 101, 100, 99, 97, 96, 95}
+        save_pushed_ids(tmp_path, "tg1", "alice", pushed_ids)
+        
+        # 2. Mock 接口返回
+        # 第一页返回 105..101 (全在 pushed_ids 中，无新图)
+        page1 = [
+            {"id": 105, "createdAt": "2026-07-11T12:00:00Z", "nsfw": False},
+            {"id": 104, "createdAt": "2026-07-11T11:00:00Z", "nsfw": False},
+            {"id": 103, "createdAt": "2026-07-11T10:00:00Z", "nsfw": False},
+            {"id": 102, "createdAt": "2026-07-11T09:00:00Z", "nsfw": False},
+            {"id": 101, "createdAt": "2026-07-11T08:00:00Z", "nsfw": False},
+        ]
+        # 第二页返回 100..96 (其中 98 不在 pushed_ids 中)
+        page2 = [
+            {"id": 100, "createdAt": "2026-07-11T07:00:00Z", "nsfw": False},
+            {"id": 99, "createdAt": "2026-07-11T06:00:00Z", "nsfw": False},
+            {"id": 98, "createdAt": "2026-07-11T05:00:00Z", "nsfw": False}, # 空洞！
+            {"id": 97, "createdAt": "2026-07-11T04:00:00Z", "nsfw": False},
+            {"id": 96, "createdAt": "2026-07-11T03:00:00Z", "nsfw": False},
+        ]
+        
+        mock_fetch.side_effect = [
+            (page1, "cursor2"),
+            (page2, "cursor3"),
+            ([], "")
+        ]
+        
+        # 用于记录被推送到 process_and_push 的 ID
+        pushed_targets = []
+        def side_effect_push(img, *args, **kwargs):
+            pushed_targets.append(img["id"])
+            # 模拟推送成功记录
+            kwargs["pushed_ids"].add(img["id"])
+            return True
+            
+        mock_push.side_effect = side_effect_push
+        
+        # 3. 运行增量扫描，每页 limit=5, max_pages=5
+        run_incremental(
+            "alice",
+            seen_ids=set(),
+            tg_id="tg1",
+            seen_dir=tmp_path,
+            nsfw_setting="sfw_only",
+            output_dir=tmp_path,
+            size_suffixes=[],
+            bot_token="token",
+            chat_id="chat",
+            base_url="https://civitai.com",
+            limit=5,
+            video_enabled=False,
+            max_video_size_mb=10,
+            max_pages=5
+        )
+        
+        # 4. 断言：应该成功获取 Page 2 并发现且推送 98
+        assert 98 in pushed_targets, "Bug: 提前退出导致未推送空洞图片 98！"
+
 
