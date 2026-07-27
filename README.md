@@ -1,8 +1,10 @@
 # Civitai Monitor
 
 <p align="center">
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">中文</a>
+  <a href="README.md">English</a> | <a href="README.zh-CN.md">Chinese</a>
 </p>
+
+[中文文档](README.zh-CN.md)
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
