@@ -51,10 +51,81 @@ from monitor import MonitorConfig, load_config
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%m-%d %H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S %z",
 )
 log = logging.getLogger("civitai-bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# ---------------------------------------------------------------------------
+# Background task tracking & clean shutdown
+# ---------------------------------------------------------------------------
+# Long-lived asyncio tasks (scheduled scan, auto-resumed backfills) must be kept
+# referenced and cancelled on shutdown. Without this they can be garbage-collected
+# mid-flight, producing "Task was destroyed but it is pending!" warnings on exit.
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _track_task(task: asyncio.Task) -> asyncio.Task:
+    """Register a background task; auto-discard it from the registry on completion."""
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+async def _shutdown_background_tasks() -> None:
+    """Cancel every tracked background task and wait for them to finish."""
+    pending = [t for t in _background_tasks if not t.done()]
+    if not pending:
+        return
+    for t in pending:
+        t.cancel()
+    try:
+        await asyncio.gather(*pending, return_exceptions=True)
+    except asyncio.CancelledError:
+        # The shutdown sequence itself was cancelled; the loop close will reap
+        # any still-pending tasks. Swallow so we never mask the real shutdown.
+        pass
+
+
+# Admin chat ids to alert on unhandled errors (populated from config in main()).
+_ADMIN_CHAT_IDS: list[int] = []
+
+# Debounce identical admin error alerts (once per error class / 5 minutes).
+_last_error_alert: dict[str, float] = {}
+_ERROR_ALERT_INTERVAL = 300.0
+
+
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error handler: always log; best-effort, debounced admin alert."""
+    exc = context.error
+    if exc is not None:
+        log.error("Unhandled exception in update handler (update=%r)", update, exc_info=exc)
+    else:
+        log.error("Unhandled exception in update handler (update=%r); no error attached", update)
+
+    # Best-effort admin alert, debounced by exception class to avoid flooding.
+    try:
+        if not _ADMIN_CHAT_IDS or exc is None:
+            return
+        now = time.time()
+        key = type(exc).__name__
+        if now - _last_error_alert.get(key, 0.0) < _ERROR_ALERT_INTERVAL:
+            return
+        _last_error_alert[key] = now
+        text = (
+            "⚠️ Bot 未处理异常\n"
+            f"类型: {type(exc).__name__}\n"
+            f"信息: {str(exc)[:500]}"
+        )
+        for cid in _ADMIN_CHAT_IDS:
+            try:
+                await context.bot.send_message(chat_id=cid, text=text)
+            except Exception:
+                log.debug("Failed to deliver error alert to admin %s", cid, exc_info=True)
+    except Exception:
+        # Never let the error handler itself crash the dispatcher.
+        log.debug("error_handler: admin-alert dispatch failed", exc_info=True)
 
 # ---------------------------------------------------------------------------
 # Rate limiting
@@ -106,77 +177,6 @@ INTERVAL_CONFIG = SCRIPT_DIR / "interval.json"
 
 # Active backfills state file (persists running backfill tasks across restarts)
 ACTIVE_BACKFILLS = SCRIPT_DIR / "active_backfills.json"
-
-
-# -----------------------------------------------------------------------
-# Dynamic Memory Limit
-# -----------------------------------------------------------------------
-
-# Memory limit constants
-_MEMORY_HARD_LIMIT = 2048 * 1024 * 1024  # 2048 MB (2G) hard cap in bytes
-
-
-def _get_system_memory_mb() -> int:
-    """Read total system memory in MB from /proc/meminfo."""
-    try:
-        with open("/proc/meminfo", "r") as f:
-            for line in f:
-                if line.startswith("MemTotal:"):
-                    # Line format: "MemTotal:       16384084 kB"
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        kb = int(parts[1])
-                        return kb // 1024  # Convert kB to MB
-        return 0
-    except (OSError, ValueError):
-        return 0
-
-
-def _compute_memory_max_mb() -> int:
-    """Compute the MemoryMax for this service based on total system RAM.
-
-    Rules:
-      total <= 1GB  -> 55%
-      total 1-2GB   -> 60%
-      total >= 2GB  -> 65%  (capped at 1800 MB)
-    """
-    total_mb = _get_system_memory_mb()
-    if total_mb <= 0:
-        log.warning("Could not detect system memory, defaulting to 1500 MB")
-        return 1500
-
-    if total_mb <= 1024:
-        pct = 0.55
-    elif total_mb <= 2048:
-        pct = 0.60
-    else:
-        pct = 0.65
-
-    calculated = int(total_mb * pct)
-    capped = min(calculated, _MEMORY_HARD_LIMIT // (1024 * 1024))
-    log.info(
-        "Memory policy: detected %d MB total | %.0f%% = %d MB | hard cap = %d MB | final = %d MB",
-        total_mb, pct * 100, calculated, _MEMORY_HARD_LIMIT // (1024 * 1024), capped,
-    )
-    return capped
-
-
-def _apply_memory_limit(service_name: str = "civitai-bot.service") -> None:
-    """Apply MemoryMax limit to the systemd service via systemctl set-property."""
-    import subprocess as _sp
-    mem_mb = _compute_memory_max_mb()
-    mem_bytes = mem_mb * 1024 * 1024
-    try:
-        result = _sp.run(
-            ["systemctl", "set-property", "--now", service_name, f"MemoryMax={mem_bytes}"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            log.info("Set MemoryMax=%d MB (%d bytes) on %s", mem_mb, mem_bytes, service_name)
-        else:
-            log.warning("Failed to set MemoryMax: %s", result.stderr.strip())
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as e:
-        log.warning("Could not apply MemoryMax via systemctl: %s", e)
 
 
 def _load_active_backfills() -> dict[str, dict[str, str]]:
@@ -408,7 +408,7 @@ def parse_username_input(raw: str) -> str | None:
     return None
 
 
-def validate_username_exists(username: str) -> tuple[bool, str]:
+def validate_username_exists(username: str, cookies_path: str | Path | None = None) -> tuple[bool, str]:
     """Check if a Civitai username exists and has public content.
 
     Since NSFW content moved to civitai.red, we query both domains
@@ -418,7 +418,11 @@ def validate_username_exists(username: str) -> tuple[bool, str]:
     # Try to load cookies for NSFW API access
     s = requests.Session()
     s.headers.update({"User-Agent": "CivitaiMonitor/2.0"})
-    cookies_path = SCRIPT_DIR / "civitai_cookies.txt"
+    if cookies_path is None:
+        # Backwards-compatible fallback when no config cookies path is supplied
+        cookies_path = SCRIPT_DIR / "civitai_cookies.txt"
+    else:
+        cookies_path = Path(cookies_path)
     if cookies_path.exists():
         try:
             cj = http.cookiejar.MozillaCookieJar(str(cookies_path))
@@ -551,8 +555,9 @@ async def cmd_add(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # 发送验证中提示
     verifying_msg = await update.message.reply_text(f"⏳ 正在验证 @{username} 是否存在...")
 
-    # 存在性校验
-    ok, msg = await asyncio.to_thread(validate_username_exists, username)
+    # 存在性校验（使用 config 配置的 cookies 路径做 NSFW 检测）
+    cookies_file = read_config().http.cookies_file or None
+    ok, msg = await asyncio.to_thread(validate_username_exists, username, cookies_file)
     if not ok:
         await verifying_msg.edit_text(msg)
         return
@@ -836,6 +841,63 @@ async def cmd_cleanup(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"📂 No cached images older than {days} days.")
 
 
+async def communicate_with_idle_timeout(proc: asyncio.subprocess.Process, timeout: float = 1800.0) -> tuple[bytes, bytes]:
+    """
+    Read stdout and stderr of proc in a streaming fashion.
+    If no data is received on either stdout or stderr for `timeout` seconds,
+    raises asyncio.TimeoutError.
+    Returns (stdout_bytes, stderr_bytes).
+    """
+    out_chunks = []
+    err_chunks = []
+    queue = asyncio.Queue()
+
+    async def read_stream(stream, stream_type):
+        try:
+            while True:
+                data = await stream.read(4096)
+                if not data:
+                    break
+                await queue.put((stream_type, data))
+        except Exception as e:
+            await queue.put(("error", e))
+        finally:
+            await queue.put((stream_type, None))
+
+    # Start reading tasks
+    stdout_task = asyncio.create_task(read_stream(proc.stdout, "stdout"))
+    stderr_task = asyncio.create_task(read_stream(proc.stderr, "stderr"))
+
+    finished_streams = 0
+    try:
+        while finished_streams < 2:
+            try:
+                # Wait for data with idle timeout
+                stream_type, data = await asyncio.wait_for(queue.get(), timeout=timeout)
+            except asyncio.TimeoutError:
+                # Idle timeout reached! Cancel reading tasks and propagate exception
+                stdout_task.cancel()
+                stderr_task.cancel()
+                raise asyncio.TimeoutError()
+
+            if stream_type == "error":
+                raise data
+            elif data is None:
+                finished_streams += 1
+            else:
+                if stream_type == "stdout":
+                    out_chunks.append(data)
+                elif stream_type == "stderr":
+                    err_chunks.append(data)
+    finally:
+        # Ensure tasks are cleaned up
+        stdout_task.cancel()
+        stderr_task.cancel()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+
+    return b"".join(out_chunks), b"".join(err_chunks)
+
+
 @rate_limit(min_interval=10.0)
 async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Manually trigger an incremental scan (mostly for debugging).
@@ -859,7 +921,7 @@ async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             cwd=str(SCRIPT_DIR),
         )
         try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=1800)
+            out, err = await communicate_with_idle_timeout(proc, timeout=1800)
         except asyncio.TimeoutError:
             try:
                 proc.terminate()
@@ -867,7 +929,7 @@ async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             except (ProcessLookupError, asyncio.TimeoutError):
                 proc.kill()
                 await proc.wait()
-            await update.message.reply_text("⏱ 扫描超时（30 分钟）已终止。")
+            await update.message.reply_text("⏱ 扫描空闲超时（30 分钟无输出）已终止。")
             return
         stderr = err.decode("utf-8") if isinstance(err, bytes) else err
         if proc.returncode == 75:
@@ -1113,9 +1175,9 @@ async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProce
                 start_new_session=True,
             )
             try:
-                out, err = await asyncio.wait_for(proc.communicate(), timeout=7200)
+                out, err = await communicate_with_idle_timeout(proc, timeout=1800)
             except asyncio.TimeoutError:
-                log.warning("Backfill for @%s exceeded 2h timeout, killing", username)
+                log.warning("Backfill for @%s idle timeout (30 min without output), killing", username)
                 try:
                     # Check if process already exited before killpg
                     if proc.returncode is not None:
@@ -1196,13 +1258,13 @@ def _resume_stale_backfills(application: Application) -> None:
             log.info("Skipping @%s — cross-process lock held and not stale by time (still running)", username)
             return
 
-        # Schedule as a background task
-        loop.create_task(_resume_backfill_task(application, tg_id, username))
+        # Schedule as a background task (tracked for clean shutdown)
+        _track_task(loop.create_task(_resume_backfill_task(application, tg_id, username)))
 
     for tg_id, users_dict in active.items():
         for username, last_active_str in users_dict.items():
             try:
-                loop.create_task(_do_resume(tg_id, username, last_active_str))
+                _track_task(loop.create_task(_do_resume(tg_id, username, last_active_str)))
             except Exception as e:
                 log.exception("Error resuming backfill @%s: %s", username, e)
 
@@ -1546,7 +1608,7 @@ async def post_init(application: Application) -> None:
         if exc is not None:
             log.error("Scheduled scan task crashed: %s", exc, exc_info=exc)
 
-    scan_task = asyncio.create_task(scheduled_scan_cron())
+    scan_task = _track_task(asyncio.create_task(scheduled_scan_cron()))
     scan_task.add_done_callback(_on_cron_done)
     log.info(f"Slash commands registered. Scheduled scan every {_scan_interval//60}min. Ready.")
 
@@ -1558,9 +1620,6 @@ async def post_init(application: Application) -> None:
 
 def main() -> None:
     global AUTHORIZED_USER_IDS
-
-    # Apply dynamic memory limit before anything else
-    _apply_memory_limit()
 
     cfg = read_config()
     global _scan_interval
@@ -1593,12 +1652,21 @@ def main() -> None:
 
     log.info("Authorised %d user(s) configured", len(AUTHORIZED_USER_IDS))
 
+    # Admins to notify on unhandled errors (resolved from config above).
+    global _ADMIN_CHAT_IDS
+    _ADMIN_CHAT_IDS = sorted(AUTHORIZED_USER_IDS)
+
     app = (
         Application.builder()
         .token(token)
         .post_init(post_init)
+        .post_shutdown(_shutdown_background_tasks)
         .build()
     )
+
+    # Global error handler so exceptions in update handlers are logged loudly
+    # instead of being silently swallowed ("No error handlers are registered").
+    app.add_error_handler(_error_handler)
 
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("add", cmd_add))

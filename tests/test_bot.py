@@ -433,11 +433,17 @@ class TestRunBackfillRegression:
         # Pre-populate active_backfills to simulate "backfill starting"
         civitai_bot._register_backfill("111", "alice")
 
-        # Mock the subprocess to return success
+        # Mock the subprocess to return success. The real _run_backfill reads
+        # proc.stdout / proc.stderr via `await stream.read(4096)` inside
+        # communicate_with_idle_timeout, so those streams must be AsyncMock —
+        # a plain MagicMock cannot be awaited and would raise TypeError.
         proc = MagicMock()
         proc.returncode = 0
-        proc.communicate = AsyncMock(return_value=(b"", b""))
         proc.pid = 12345
+        proc.stdout = MagicMock()
+        proc.stdout.read = AsyncMock(return_value=b"")  # EOF -> reader loop ends
+        proc.stderr = MagicMock()
+        proc.stderr.read = AsyncMock(return_value=b"")
 
         async def _no_launch(*_a, **_k):
             return proc
@@ -491,16 +497,29 @@ class TestRunBackfillRegression:
         monkeypatch.setattr(civitai_bot, "ACTIVE_BACKFILLS", tmp_path / "active_backfills.json")
         civitai_bot._register_backfill("111", "alice")
 
+        # Subprocess that "hangs": it never produces output and never exits.
+        # communicate_with_idle_timeout spins up reader tasks that `await
+        # stream.read(4096)`, so the stream mocks must be AsyncMock.
         proc = MagicMock()
         proc.returncode = None  # still running
         proc.pid = 99999
-        proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+        proc.stdout = MagicMock()
+        proc.stdout.read = AsyncMock(return_value=b"")  # readers terminate cleanly
+        proc.stderr = MagicMock()
+        proc.stderr.read = AsyncMock(return_value=b"")
         proc.wait = AsyncMock(return_value=None)
 
         async def _no_launch(*_a, **_k):
             return proc
 
         monkeypatch.setattr(civitai_bot.asyncio, "create_subprocess_exec", _no_launch)
+        # The genuine idle-timeout is asyncio.wait_for(queue.get(), timeout=1800).
+        # Compress it to fire immediately so we exercise the real TimeoutError
+        # path (kill -> finally cleanup) without a 30-minute wait.
+        monkeypatch.setattr(
+            civitai_bot.asyncio, "wait_for",
+            AsyncMock(side_effect=asyncio.TimeoutError()),
+        )
         monkeypatch.setattr(
             civitai_bot, "_acquire_backfill_lock",
             lambda tg, user: (42, tmp_path / f".lck_{tg}_{user}")

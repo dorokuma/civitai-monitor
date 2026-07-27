@@ -48,7 +48,7 @@ import requests
 import yaml
 from filelock import FileLock, Timeout
 from pydantic import BaseModel, Field, ValidationError
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_exception
 import random
 
 # ---------------------------------------------------------------------------
@@ -58,7 +58,7 @@ import random
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%m-%d %H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S %z",
 )
 log = logging.getLogger("civitai-monitor")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -232,13 +232,43 @@ def _rate_limit_wait(retry_state) -> float:
     return wait_exponential(multiplier=1, min=2, max=30)(retry_state)
 
 
+def _should_retry_api(exc: BaseException) -> bool:
+    """Retry transient / 5xx / network errors; never retry 4xx client errors.
+
+    Fix #2: the previous predicate retried *every* ``requests.RequestException``,
+    which includes 4xx via ``raise_for_status()`` (e.g. a 404 would be retried
+    needlessly). We now restrict retries to network failures (connection/timeout),
+    429 (handled via Retry-After), and 5xx server errors.
+    """
+    if isinstance(exc, RateLimitError):
+        return True  # 429 → Retry-After honored by _rate_limit_wait
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return True
+    if isinstance(exc, requests.exceptions.Timeout):
+        return True
+    if isinstance(exc, requests.exceptions.HTTPError):
+        resp = getattr(exc, "response", None)
+        if resp is not None and 500 <= resp.status_code < 600:
+            return True
+        return False  # 4xx (404/403/...) → client error, do not retry
+    if isinstance(exc, requests.RequestException):
+        return True
+    return False
+
+
 @retry(
     stop=stop_after_attempt(5),
     wait=_rate_limit_wait,
-    retry=retry_if_exception_type((requests.RequestException, RateLimitError)),
+    retry=retry_if_exception(_should_retry_api),
     reraise=True,
 )
 def safe_get(url: str, **kwargs) -> requests.Response:
+    """HTTP GET with tenacity retry + exponential backoff (Fix #2).
+
+    * 5xx and network errors are retried with exponential backoff (min 2s, max 30s).
+    * 429 honors the upstream ``Retry-After`` header (plus a little jitter).
+    * 4xx are never retried — they are client errors that won't succeed on retry.
+    """
     resp = session.get(url, timeout=kwargs.pop("timeout", 30), **kwargs)
     if resp.status_code == 429:
         raise RateLimitError(resp)
@@ -745,17 +775,19 @@ def download_image(url: str, save_path: Path, timeout: int = 120) -> bool:
         log.info("Already exists: %s, skipped", save_path.name)
         return True
     try:
-        resp = safe_get(url, stream=True, timeout=timeout)
-        resp.raise_for_status()
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
-        with open(tmp_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=65536):
-                if chunk:
-                    f.write(chunk)
-        tmp_path.rename(save_path)
-        log.info("Downloaded: %s (%d bytes)", save_path.name, save_path.stat().st_size)
-        return True
+        # Fix #1: streamed response must be closed — use `with` so the
+        # connection is released even on error (avoids CLOSE-WAIT leaks).
+        with safe_get(url, stream=True, timeout=timeout) as resp:
+            resp.raise_for_status()
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+            tmp_path.rename(save_path)
+            log.info("Downloaded: %s (%d bytes)", save_path.name, save_path.stat().st_size)
+            return True
     except requests.RequestException as e:
         log.warning("Image download failed for %s: %s", url, e)
         return False
@@ -767,9 +799,6 @@ def download_image(url: str, save_path: Path, timeout: int = 120) -> bool:
 
 
 def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
-    if save_path.exists():
-        log.info("Already exists: %s, skipped", save_path.name)
-        return True
     """Download a full-quality video from Civitai CDN.
 
     Strategy:
@@ -783,53 +812,61 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
                     size). The config example shows ``max_video_size_mb:
                     1024``; set to 0 to opt out of the cap entirely.
     """
+    if save_path.exists():
+        log.info("Already exists: %s, skipped", save_path.name)
+        return True
     try:
         # Step 1: follow redirect to find the real CDN URL (don't download body)
-        resp = safe_get(url, stream=True)
-        resp.raise_for_status()
-        b2_url = str(resp.url)
-        resp.close()
+        # Fix #1: streamed response wrapped in `with` so the connection is
+        # always released (no CLOSE-WAIT leak).
+        with safe_get(url, stream=True) as resp:
+            resp.raise_for_status()
+            b2_url = str(resp.url)
 
         # Step 2: resolve the actual video content URL
         if "image-b2.civitai.com" in b2_url and b2_url.endswith("/default"):
             resolved_url = b2_url[:-8] + "/original"
             log.info("B2: /default → /original")
-            # Retry up to 3 times on transient errors, but not on 404
-            for attempt in range(3):
-                resp = safe_get(resolved_url, stream=True, timeout=120)
+            content_url = resolved_url
+        else:
+            # Non-B2 CDN (e.g. civitai.red): re-fetch original URL with fresh connection
+            log.info("Non-B2 video CDN: %s...", b2_url[:80])
+            content_url = url
+
+        # Fetch + stream the real video body. Each attempt is wrapped in
+        # `with` so every connection (including failed/abandoned ones) is
+        # closed; we only copy bytes to disk on a 200 response.
+        last_status = None
+        for attempt in range(3):
+            with safe_get(content_url, stream=True, timeout=120) as resp:
                 if resp.status_code == 200:
-                    break
+                    # Check size — skip only when a positive cap is configured
+                    cl = resp.headers.get("content-length")
+                    if max_size_mb > 0 and cl and int(cl) > max_size_mb * 1024 * 1024:
+                        log.warning("Video too large (%.1f MB > %d MB), skipping",
+                                    int(cl) / 1024 / 1024, max_size_mb)
+                        return False
+                    if not cl and max_size_mb > 0:
+                        log.info("Video size unknown (no Content-Length), downloading anyway up to %d MB cap", max_size_mb)
+                    save_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
+                    with open(tmp_path, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    tmp_path.rename(save_path)
+                    log.info("Video downloaded: %s (%.1f MB)", save_path.name, save_path.stat().st_size / 1024 / 1024)
+                    return True
+                last_status = resp.status_code
                 if resp.status_code == 404:
                     log.warning("B2 /original 404 — video file not available on CDN")
                     return False
                 if attempt < 2:
                     log.info("B2 /original returned %d, retrying (%d/3)...", resp.status_code, attempt + 2)
                     time.sleep(2 ** attempt)
-            resp.raise_for_status()
-        else:
-            # Non-B2 CDN (e.g. civitai.red): re-fetch original URL with fresh connection
-            log.info("Non-B2 video CDN: %s...", b2_url[:80])
-            resp = safe_get(url, stream=True, timeout=120)
-            resp.raise_for_status()
-
-        # Check size — skip only when a positive cap is configured
-        cl = resp.headers.get("content-length")
-        if max_size_mb > 0 and cl and int(cl) > max_size_mb * 1024 * 1024:
-            log.warning("Video too large (%.1f MB > %d MB), skipping",
-                        int(cl) / 1024 / 1024, max_size_mb)
-            return False
-        if not cl and max_size_mb > 0:
-            log.info("Video size unknown (no Content-Length), downloading anyway up to %d MB cap", max_size_mb)
-
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
-        with open(tmp_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-        tmp_path.rename(save_path)
-        log.info("Video downloaded: %s (%.1f MB)", save_path.name, save_path.stat().st_size / 1024 / 1024)
-        return True
+        # Exhausted retries without a 200 → surface as an error so the caller
+        # records an uncertain/failed outcome (rather than silently succeeding).
+        raise requests.HTTPError(f"Video fetch failed (last status {last_status})")
     except requests.RequestException as e:
         log.warning("Video download failed for %s: %s", url, e)
         return False
@@ -1176,6 +1213,38 @@ def _fetch_and_process_page(
     new_on_page = [img for img in items if img["id"] not in pushed_ids]
     did_push_attempt = False
 
+    # --- Fix #5: reconcile pending entries that are NOT on this page. ---
+    # Previously a pending id was only processed when it reappeared on a freshly
+    # fetched page (inside the `if new_on_page` loop below). Old pending ids that
+    # had scrolled off the first pages (or users with no new content) were never
+    # reconciled and stalled forever (e.g. the 4 stuck pending_push entries).
+    # Here we sweep every pending id that isn't on the current page and apply the
+    # age/retry policy so they get digested by the normal flow instead.
+    for item_id, (ts, retries) in list(pending.items()):
+        if item_id in page_ids:
+            continue  # handled by the in-page loop below (has data to (re)send)
+        age = now - float(ts)
+        if age < PENDING_CONFIRM_SECONDS:
+            # Fresh → assume delivered, promote without re-send.
+            _record_push_success(
+                item_id, username,
+                pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
+            )
+            continue
+        # Expired but off-window: the item data is no longer available (it isn't
+        # on the current page), so a real retry-send isn't possible. After this
+        # long we assume delivery and promote; in-page expired items still get
+        # one genuine retry-send below.
+        log.info(
+            "Pending id=%d for @%s is off-window and expired (%.0fs, retries=%d); "
+            "promoting without re-send",
+            item_id, username, age, retries,
+        )
+        _record_push_success(
+            item_id, username,
+            pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
+        )
+
     if new_on_page:
         for img in reversed(new_on_page):
             item_id = img["id"]
@@ -1445,30 +1514,32 @@ def cleanup_old_caches(output_dir: Path, keep_days: int, max_total_gb: int = 0) 
                     pass
 
     # 第二步：按总大小清理（如果设置了上限）
+    # Fix #3: 旧实现每删一个文件就重新 os.walk 全目录 + 排序（O(n²)）。
+    # 改为一次 walk 收集全部文件、按 mtime 排序、一次性从最旧开始删除直到低于阈值。
     if max_total_gb > 0:
         max_bytes = max_total_gb * 1024 * 1024 * 1024
-        while True:
-            all_files = []
-            for root, dirs, files in os.walk(output_dir):
-                for fname in files:
-                    fpath = Path(root) / fname
-                    try:
-                        all_files.append((fpath.stat().st_mtime, fpath.stat().st_size, fpath))
-                    except OSError:
-                        pass
-
-            total_size = sum(f[1] for f in all_files)
-            if total_size <= max_bytes:
-                break
-
-            # 删除最旧的文件
-            all_files.sort()  # 按 mtime 排序，最旧的在前
-            oldest = all_files[0][2]
-            try:
-                oldest.unlink()
-                removed += 1
-            except OSError:
-                break
+        all_files = []
+        for root, dirs, files in os.walk(output_dir):
+            for fname in files:
+                fpath = Path(root) / fname
+                try:
+                    st = fpath.stat()
+                    all_files.append((st.st_mtime, st.st_size, fpath))
+                except OSError:
+                    pass
+        total_size = sum(f[1] for f in all_files)
+        if total_size > max_bytes:
+            # 按 (mtime, size, path) 排序，最旧的排在前面
+            all_files.sort()
+            for _, size, fpath in all_files:
+                if total_size <= max_bytes:
+                    break
+                try:
+                    fpath.unlink()
+                    removed += 1
+                    total_size -= size
+                except OSError:
+                    pass
 
     return removed
 
