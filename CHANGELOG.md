@@ -2,6 +2,13 @@
 
 This file follows the [Keep a Changelog](https://keepachangelog.com/) format, and version numbers follow [SemVer](https://semver.org/).
 
+## [1.1.1] - 2026-07-29
+
+### Fixed
+- Admin Bot no longer pages admins for transient Telegram transport errors (`NetworkError` / `httpx.ReadError` / `TimedOut` / `RetryAfter`) that PTB already retries during long-polling.
+- Admin Bot now uses `telegram.api_base_url` (local Bot API Server at `http://127.0.0.1:8081`) for polling and replies — same endpoint monitor already used for media pushes. This avoids flaky direct connections to `api.telegram.org`.
+- Increased HTTP/getUpdates timeouts for the PTB Application to reduce spurious read errors under load.
+
 ## [1.1.0] - 2026-07-27
 
 ### Added

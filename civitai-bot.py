@@ -39,10 +39,19 @@ from functools import wraps
 import requests
 import yaml
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 # Import unified config from monitor
 from monitor import MonitorConfig, load_config
+
+# Transient Telegram transport failures during long-polling / send. PTB already
+# retries these in its network loop; they must not page admins as "unhandled".
+_TRANSIENT_TG_ERRORS: tuple[type[BaseException], ...] = (
+    NetworkError,
+    TimedOut,
+    RetryAfter,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -96,9 +105,33 @@ _last_error_alert: dict[str, float] = {}
 _ERROR_ALERT_INTERVAL = 300.0
 
 
+def _is_transient_telegram_error(exc: BaseException | None) -> bool:
+    """Return True for recoverable Telegram/httpx transport glitches."""
+    if exc is None:
+        return False
+    if isinstance(exc, _TRANSIENT_TG_ERRORS):
+        return True
+    # Some PTB paths wrap the real cause; walk a short chain.
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, _TRANSIENT_TG_ERRORS):
+        return True
+    return False
+
+
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Global error handler: always log; best-effort, debounced admin alert."""
+    """Global error handler: always log; admin-alert only for non-transient bugs."""
     exc = context.error
+
+    # Network blips during getUpdates (httpx.ReadError / Bad Gateway / timeouts)
+    # are expected on long-poll; PTB retries. Log at WARNING, never spam admins.
+    if _is_transient_telegram_error(exc):
+        log.warning(
+            "Transient Telegram network error (will retry; not alerting): %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        return
+
     if exc is not None:
         log.error("Unhandled exception in update handler (update=%r)", update, exc_info=exc)
     else:
@@ -126,6 +159,42 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception:
         # Never let the error handler itself crash the dispatcher.
         log.debug("error_handler: admin-alert dispatch failed", exc_info=True)
+
+
+def _application_builder_for_config(token: str, api_base_url: str):
+    """Build Application.builder wired to config telegram.api_base_url.
+
+    monitor.py already pushes media via the local Bot API Server
+    (http://127.0.0.1:8081). The admin bot must poll the same endpoint;
+    otherwise getUpdates hits api.telegram.org directly and surfaces
+    httpx.ReadError / Bad Gateway as noisy admin alerts.
+    """
+    base = (api_base_url or "https://api.telegram.org").rstrip("/")
+    builder = (
+        Application.builder()
+        .token(token)
+        # Generous timeouts: long-poll + local Bot API can be slow under load.
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(30.0)
+        .get_updates_connect_timeout(30.0)
+        .get_updates_read_timeout(50.0)
+        .get_updates_pool_timeout(30.0)
+        .get_updates_write_timeout(30.0)
+    )
+    # Official default is https://api.telegram.org/bot — only override when
+    # config points elsewhere (local Bot API Server).
+    if base and base != "https://api.telegram.org":
+        builder = (
+            builder
+            .base_url(f"{base}/bot")
+            .base_file_url(f"{base}/file/bot")
+        )
+        # --local mode returns absolute filesystem paths for downloaded files.
+        if base.startswith("http://127.0.0.1") or base.startswith("http://localhost"):
+            builder = builder.local_mode(True)
+    return builder
 
 # ---------------------------------------------------------------------------
 # Rate limiting
@@ -1656,9 +1725,10 @@ def main() -> None:
     global _ADMIN_CHAT_IDS
     _ADMIN_CHAT_IDS = sorted(AUTHORIZED_USER_IDS)
 
+    api_base = cfg.telegram.api_base_url or "https://api.telegram.org"
+    log.info("Telegram API base: %s", api_base.rstrip("/"))
     app = (
-        Application.builder()
-        .token(token)
+        _application_builder_for_config(token, api_base)
         .post_init(post_init)
         .post_shutdown(_shutdown_background_tasks)
         .build()

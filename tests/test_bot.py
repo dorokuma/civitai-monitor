@@ -534,3 +534,89 @@ class TestRunBackfillRegression:
         assert result is None  # timeout sentinel
         assert civitai_bot._load_active_backfills() == {}
         assert len(released_paths) == 1  # lock file released
+
+
+# ---------------------------------------------------------------------------
+# Transient Telegram error classification + API base wiring
+# ---------------------------------------------------------------------------
+
+class TestTransientTelegramErrors:
+    def test_network_error_is_transient(self):
+        from telegram.error import NetworkError
+        assert civitai_bot._is_transient_telegram_error(NetworkError("httpx.ReadError: "))
+
+    def test_timed_out_is_transient(self):
+        from telegram.error import TimedOut
+        assert civitai_bot._is_transient_telegram_error(TimedOut("Timed out"))
+
+    def test_retry_after_is_transient(self):
+        from telegram.error import RetryAfter
+        assert civitai_bot._is_transient_telegram_error(RetryAfter(5))
+
+    def test_value_error_is_not_transient(self):
+        assert not civitai_bot._is_transient_telegram_error(ValueError("boom"))
+
+    def test_none_is_not_transient(self):
+        assert not civitai_bot._is_transient_telegram_error(None)
+
+    def test_cause_chain_counts(self):
+        from telegram.error import NetworkError
+        outer = RuntimeError("wrap")
+        outer.__cause__ = NetworkError("httpx.ReadError: ")
+        assert civitai_bot._is_transient_telegram_error(outer)
+
+
+class TestApplicationBuilderForConfig:
+    def test_official_api_keeps_default_base(self):
+        builder = civitai_bot._application_builder_for_config("TOKEN", "https://api.telegram.org")
+        # builder is Application.Builder; inspect the private attrs set by setters
+        # (stable enough for a regression guard on the official default path).
+        assert builder._base_url is None or "api.telegram.org" in str(builder._base_url or "https://api.telegram.org/bot")
+
+    def test_local_api_sets_base_and_local_mode(self):
+        builder = civitai_bot._application_builder_for_config("TOKEN", "http://127.0.0.1:8081")
+        # After .base_url(...), PTB stores it on the builder.
+        assert builder._base_url == "http://127.0.0.1:8081/bot"
+        assert builder._base_file_url == "http://127.0.0.1:8081/file/bot"
+        assert builder._local_mode is True
+
+
+@pytest.mark.asyncio
+async def test_error_handler_skips_admin_alert_for_network_error(monkeypatch):
+    """Regression: httpx.ReadError must not spam admins as ⚠️ Bot 未处理异常."""
+    from telegram.error import NetworkError
+
+    sent = []
+
+    class _Bot:
+        async def send_message(self, chat_id, text):
+            sent.append((chat_id, text))
+
+    class _Ctx:
+        error = NetworkError("httpx.ReadError: ")
+        bot = _Bot()
+
+    monkeypatch.setattr(civitai_bot, "_ADMIN_CHAT_IDS", [12345])
+    monkeypatch.setattr(civitai_bot, "_last_error_alert", {})
+    await civitai_bot._error_handler(None, _Ctx())
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_error_handler_alerts_for_real_bugs(monkeypatch):
+    sent = []
+
+    class _Bot:
+        async def send_message(self, chat_id, text):
+            sent.append((chat_id, text))
+
+    class _Ctx:
+        error = RuntimeError("unexpected bug")
+        bot = _Bot()
+
+    monkeypatch.setattr(civitai_bot, "_ADMIN_CHAT_IDS", [12345])
+    monkeypatch.setattr(civitai_bot, "_last_error_alert", {})
+    await civitai_bot._error_handler(None, _Ctx())
+    assert len(sent) == 1
+    assert "RuntimeError" in sent[0][1]
+    assert "unexpected bug" in sent[0][1]
