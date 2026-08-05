@@ -165,7 +165,11 @@ MIN_API_PAGE_LIMIT = 1
 # Telegram send limits
 TELEGRAM_PHOTO_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 TELEGRAM_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024  # 50 MB; larger is rejected
-TELEGRAM_VIDEO_MAX_MB = 2048  # Telegram sendDocument limit; sendVideo only for small previews
+# 本地 telegram-bot-api 服务器（127.0.0.1:8081）的文件上限是 2GB（2000MB），
+# sendVideo 在本地服务器下同样放宽到 2GB，所以这里的 2048MB 阈值是匹配的，不是 bug。
+# 不要把它改成 50——那是官方云 API api.telegram.org 的 sendVideo 上限。
+# 本项目永远使用自建本地服务器（不会切回官方 API），此值保持 2048。
+TELEGRAM_VIDEO_MAX_MB = 2048
 
 # Per-item timeouts (seconds) for downloads
 IMAGE_DOWNLOAD_TIMEOUT = 120
@@ -842,9 +846,15 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
                 if resp.status_code == 200:
                     # Check size — skip only when a positive cap is configured
                     cl = resp.headers.get("content-length")
-                    if max_size_mb > 0 and cl and int(cl) > max_size_mb * 1024 * 1024:
+                    cl_int = 0
+                    if cl:
+                        try:
+                            cl_int = int(cl)
+                        except ValueError:
+                            log.warning("Video Content-Length %r unparseable, treating as unknown size", cl)
+                    if max_size_mb > 0 and cl_int > max_size_mb * 1024 * 1024:
                         log.warning("Video too large (%.1f MB > %d MB), skipping",
-                                    int(cl) / 1024 / 1024, max_size_mb)
+                                    cl_int / 1024 / 1024, max_size_mb)
                         return False
                     if not cl and max_size_mb > 0:
                         log.info("Video size unknown (no Content-Length), downloading anyway up to %d MB cap", max_size_mb)

@@ -2,6 +2,16 @@
 
 This file follows the [Keep a Changelog](https://keepachangelog.com/) format, and version numbers follow [SemVer](https://semver.org/).
 
+## [1.1.2] - 2026-08-05
+
+### Fixed
+- monitor.py: 视频下载时 Content-Length 头无法解析为数字不再导致崩溃，按未知大小处理并继续下载。
+- civitai-bot.py: `/status` 命令扫描文件元数据时捕获 JSONDecodeError（ValueError 子类），损坏的 JSON 缓存不再导致命令崩溃。
+- backfill-memory-wrapper.py: 启用 backfill 进程的虚拟内存限制（RLIMIT_AS，软 1400MB / 硬 1500MB），并同步修正主服务内存注释（MemoryMax=4G）。
+
+### Notes
+- monitor.py: 补充注释说明 2048MB 的 sendVideo 阈值与本地 telegram-bot-api 服务器（127.0.0.1:8081，上限 2GB）匹配，此值应保持 2048 而非改为官方云 API 的 50MB。
+
 ## [1.1.1] - 2026-07-29
 
 ### Fixed

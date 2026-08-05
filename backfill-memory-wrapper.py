@@ -2,7 +2,7 @@
 """
 backfill-memory-wrapper.py
 Sets a stricter memory limit (1400 MB) for the backfill process, then execs into monitor.py.
-主服务 MemoryMax=1800MB，Backfill 更严格 = 1400MB.
+主服务 MemoryMax=4G，Backfill 更严格 = 1400MB.
 """
 import resource
 import sys
@@ -18,7 +18,7 @@ HARD_LIMIT_BYTES = 1500 * 1024 * 1024   # 1500 MB - hard limit (SIGKILL if excee
 def set_memory_limit():
     try:
         # Set virtual memory (address space) limit
-        # resource.setrlimit(resource.RLIMIT_AS, (SOFT_LIMIT_BYTES, HARD_LIMIT_BYTES))
+        resource.setrlimit(resource.RLIMIT_AS, (SOFT_LIMIT_BYTES, HARD_LIMIT_BYTES))
         print(f"[backfill-wrapper] Set RLIMIT_AS: soft={SOFT_LIMIT_BYTES // (1024*1024)} MB, hard={HARD_LIMIT_BYTES // (1024*1024)} MB", file=sys.stderr)
     except (ValueError, OSError) as e:
         print(f"[backfill-wrapper] Warning: could not set RLIMIT_AS: {e}", file=sys.stderr)

@@ -805,7 +805,7 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     seen_count += len(data) if isinstance(data, list) else 0
                     if f.stat().st_mtime > latest_mtime:
                         latest_mtime = f.stat().st_mtime
-                except OSError as e:
+                except (OSError, ValueError) as e:
                     log.warning("Error checking file mtime: %s", e)
         if latest_mtime:
             from zoneinfo import ZoneInfo
