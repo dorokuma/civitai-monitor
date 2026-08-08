@@ -37,13 +37,13 @@ from collections import defaultdict
 from functools import wraps
 
 import requests
-import yaml
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
-# Import unified config from monitor
-from monitor import MonitorConfig, load_config
+# Import unified config from monitor / config_io (re-exported by monitor)
+from monitor import MonitorConfig, cleanup_old_caches, load_config, write_config
+from bot_ui import paginated_user_keyboard
 
 # Transient Telegram transport failures during long-polling / send. PTB already
 # retries these in its network loop; they must not page admins as "unhandled".
@@ -401,10 +401,7 @@ def read_config() -> MonitorConfig:
     return cfg
 
 
-def write_config(cfg: MonitorConfig) -> None:
-    data = cfg.model_dump(exclude_none=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True, indent=2)
+# write_config is imported from monitor/config_io (redacts bot_token, atomic write)
 
 
 def get_users(cfg: MonitorConfig, telegram_user_id: int) -> list[str]:
@@ -643,7 +640,7 @@ async def cmd_add(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # 添加用户
     users.append(username)
     cfg = set_users(cfg, uid, users)
-    write_config(cfg)
+    write_config(cfg, CONFIG_PATH)
     await update.message.reply_text(
         f"✅ 已添加 @{username} 到监控列表\n"
         f"下次定时任务（每10分钟）将自动开始抓取",
@@ -665,30 +662,16 @@ async def _show_remove_list(message, telegram_user_id: int, page: int = 0) -> No
         await message.reply_text("📭 监控列表是空的，先 `/add` 加几个吧", parse_mode="Markdown")
         return
 
-    per_page = 8
-    total_pages = (len(users) + per_page - 1) // per_page
-    page = max(0, min(page, total_pages - 1))
-    start = page * per_page
-    end = start + per_page
-    page_users = users[start:end]
-
-    keyboard = []
-    for u in page_users:
-        keyboard.append([InlineKeyboardButton(f"❌ @{u}", callback_data=f"rem:{u}")])
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("◀ 上一页", callback_data=f"rem_pg:{page - 1}"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("下一页 ▶", callback_data=f"rem_pg:{page + 1}"))
-    if nav:
-        keyboard.append(nav)
-    keyboard.append([InlineKeyboardButton("🔒 关闭", callback_data="rem_cl")])
-
-    total_text = f"👥 共 {len(users)} 个监控对象" if total_pages <= 1 else f"👥 共 {len(users)} 个（第 {page + 1}/{total_pages} 页）"
+    markup, total_text, _page = paginated_user_keyboard(
+        users, page,
+        item_prefix="rem",
+        item_label_fmt="❌ @{u}",
+        page_prefix="rem_pg",
+        close_data="rem_cl",
+    )
     await message.reply_text(
         f"{total_text}\n点击按钮取消关注：",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=markup,
     )
 
 
@@ -726,7 +709,7 @@ async def cmd_remove_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -
                 return
             users.remove(username)
             cfg = set_users(cfg, uid, users)
-            write_config(cfg)
+            write_config(cfg, CONFIG_PATH)
 
             if users:
                 await query.edit_message_text(f"✅ 已取消关注 @{username}", reply_markup=None)
@@ -743,30 +726,16 @@ async def cmd_remove_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -
 
 async def _render_remove_page(query, users: list[str], page: int) -> None:
     """Update the message with a fresh page of remove buttons."""
-    per_page = 8
-    total_pages = (len(users) + per_page - 1) // per_page
-    page = max(0, min(page, total_pages - 1))
-    start = page * per_page
-    end = start + per_page
-    page_users = users[start:end]
-
-    keyboard = []
-    for u in page_users:
-        keyboard.append([InlineKeyboardButton(f"❌ @{u}", callback_data=f"rem:{u}")])
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("◀ 上一页", callback_data=f"rem_pg:{page - 1}"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("下一页 ▶", callback_data=f"rem_pg:{page + 1}"))
-    if nav:
-        keyboard.append(nav)
-    keyboard.append([InlineKeyboardButton("🔒 关闭", callback_data="rem_cl")])
-
-    total_text = f"👥 共 {len(users)} 个监控对象" if total_pages <= 1 else f"👥 共 {len(users)} 个（第 {page + 1}/{total_pages} 页）"
+    markup, total_text, _page = paginated_user_keyboard(
+        users, page,
+        item_prefix="rem",
+        item_label_fmt="❌ @{u}",
+        page_prefix="rem_pg",
+        close_data="rem_cl",
+    )
     await query.edit_message_text(
         f"{total_text}\n点击按钮取消关注：",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=markup,
     )
 
 
@@ -835,7 +804,9 @@ async def cmd_mode(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args = update.message.text.strip().split(maxsplit=1)
     if len(args) < 2:
         await update.message.reply_text(
-            "Usage: `/mode <incremental|full>`", parse_mode="Markdown"
+            "Usage: `/mode <incremental|full>`\n"
+            "⚠️ *全局设置*：会影响**全部订阅者**的扫描模式。",
+            parse_mode="Markdown",
         )
         return
     mode = args[1].strip().lower()
@@ -844,8 +815,12 @@ async def cmd_mode(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     cfg = read_config()
     cfg.mode = mode
-    write_config(cfg)
-    await update.message.reply_text(f"✅ Mode set to `{mode}`.", parse_mode="Markdown")
+    write_config(cfg, CONFIG_PATH)
+    await update.message.reply_text(
+        f"✅ Mode set to `{mode}`.\n"
+        f"⚠️ *全局设置*：此变更影响**全部订阅者**（不是仅你自己）。",
+        parse_mode="Markdown",
+    )
 
 
 async def cmd_nsfw(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -854,7 +829,9 @@ async def cmd_nsfw(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args = update.message.text.strip().split(maxsplit=1)
     if len(args) < 2:
         await update.message.reply_text(
-            "Usage: `/nsfw <sfw_only|nsfw_only|both>`", parse_mode="Markdown"
+            "Usage: `/nsfw <sfw_only|nsfw_only|both>`\n"
+            "⚠️ *全局设置*：会影响**全部订阅者**的 NSFW 过滤。",
+            parse_mode="Markdown",
         )
         return
     val = args[1].strip().lower()
@@ -863,8 +840,12 @@ async def cmd_nsfw(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     cfg = read_config()
     cfg.nsfw = val
-    write_config(cfg)
-    await update.message.reply_text(f"✅ NSFW filter set to `{val}`.", parse_mode="Markdown")
+    write_config(cfg, CONFIG_PATH)
+    await update.message.reply_text(
+        f"✅ NSFW filter set to `{val}`.\n"
+        f"⚠️ *全局设置*：此变更影响**全部订阅者**（不是仅你自己）。",
+        parse_mode="Markdown",
+    )
 
 
 async def cmd_cleanup(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -883,31 +864,39 @@ async def cmd_cleanup(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("📂 Download directory does not exist — nothing to clean.")
         return
 
-    cutoff = time.time() - days * 86400
-    removed = 0
-    size_freed = 0
-    for f in DOWNLOAD_DIR.iterdir():
-        if f.is_file() and f.stat().st_mtime < cutoff:
-            size_freed += f.stat().st_size
-            f.unlink()
-            removed += 1
+    # Reuse monitor.cleanup_old_caches (days + max_total_gb) so bot and scanner share semantics.
+    cfg = read_config()
+    max_total_gb = getattr(cfg.download, "max_total_gb", 0) or 0
+    before_files = []
+    for root, _dirs, files in os.walk(DOWNLOAD_DIR):
+        for fname in files:
+            fpath = Path(root) / fname
+            try:
+                before_files.append((fpath, fpath.stat().st_size))
+            except OSError:
+                pass
+    before_size = sum(s for _, s in before_files)
 
-    # Also clean videos subdirectory
-    video_dir = DOWNLOAD_DIR / "videos"
-    if video_dir.exists():
-        for f in video_dir.iterdir():
-            if f.is_file() and f.stat().st_mtime < cutoff:
-                size_freed += f.stat().st_size
-                f.unlink()
-                removed += 1
+    removed = cleanup_old_caches(DOWNLOAD_DIR, days, max_total_gb)
+
+    after_size = 0
+    if DOWNLOAD_DIR.exists():
+        for root, _dirs, files in os.walk(DOWNLOAD_DIR):
+            for fname in files:
+                try:
+                    after_size += (Path(root) / fname).stat().st_size
+                except OSError:
+                    pass
+    size_freed = max(0, before_size - after_size)
 
     if removed:
+        extra = f"，并按 max_total_gb={max_total_gb} 限额裁剪" if max_total_gb > 0 else ""
         await update.message.reply_text(
-            f"🧹 Cleaned {removed} cached images older than {days} days "
+            f"🧹 Cleaned {removed} cached file(s) older than {days} days{extra} "
             f"(freed {_human_size(size_freed)})."
         )
     else:
-        await update.message.reply_text(f"📂 No cached images older than {days} days.")
+        await update.message.reply_text(f"📂 No cached files older than {days} days.")
 
 
 async def communicate_with_idle_timeout(proc: asyncio.subprocess.Process, timeout: float = 1800.0) -> tuple[bytes, bytes]:
@@ -1098,30 +1087,16 @@ async def _show_backfill_list(message, telegram_user_id: int, page: int = 0) -> 
         await message.reply_text("📭 监控列表是空的，先 `/add` 加几个吧", parse_mode="Markdown")
         return
 
-    per_page = 8
-    total_pages = (len(users) + per_page - 1) // per_page
-    page = max(0, min(page, total_pages - 1))
-    start = page * per_page
-    end = start + per_page
-    page_users = users[start:end]
-
-    keyboard = []
-    for u in page_users:
-        keyboard.append([InlineKeyboardButton(f"⏳ @{u}", callback_data=f"bf:{u}")])
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("◀ 上一页", callback_data=f"bf_pg:{page - 1}"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("下一页 ▶", callback_data=f"bf_pg:{page + 1}"))
-    if nav:
-        keyboard.append(nav)
-    keyboard.append([InlineKeyboardButton("🔒 关闭", callback_data="bf_cl")])
-
-    total_text = f"👥 共 {len(users)} 个监控对象" if total_pages <= 1 else f"👥 共 {len(users)} 个（第 {page + 1}/{total_pages} 页）"
+    markup, total_text, _page = paginated_user_keyboard(
+        users, page,
+        item_prefix="bf",
+        item_label_fmt="⏳ @{u}",
+        page_prefix="bf_pg",
+        close_data="bf_cl",
+    )
     await message.reply_text(
         f"{total_text}\n点击用户开始全量回填：",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=markup,
     )
 
 
@@ -1158,8 +1133,10 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
                 result = await _run_backfill(username, uid)
 
                 if result is None:
-                    # Timeout
-                    await query.message.reply_text("⏱ 回填超时（2小时）")
+                    # Idle timeout: no stdout/stderr for 1800s (30 min). Not a hard 2h wall clock.
+                    await query.message.reply_text(
+                        "⏱ 回填超时：连续 30 分钟无输出（idle 1800s），已终止子进程"
+                    )
                     return
                 if result == "busy":
                     # Extremely unlikely: scan still running after kill+retry
@@ -1369,30 +1346,16 @@ async def _resume_backfill_task(application: Application, tg_id: str, username: 
 
 async def _render_backfill_page(query, users: list[str], page: int) -> None:
     """Update the message with a fresh page of backfill buttons."""
-    per_page = 8
-    total_pages = (len(users) + per_page - 1) // per_page
-    page = max(0, min(page, total_pages - 1))
-    start = page * per_page
-    end = start + per_page
-    page_users = users[start:end]
-
-    keyboard = []
-    for u in page_users:
-        keyboard.append([InlineKeyboardButton(f"⏳ @{u}", callback_data=f"bf:{u}")])
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("◀ 上一页", callback_data=f"bf_pg:{page - 1}"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("下一页 ▶", callback_data=f"bf_pg:{page + 1}"))
-    if nav:
-        keyboard.append(nav)
-    keyboard.append([InlineKeyboardButton("🔒 关闭", callback_data="bf_cl")])
-
-    total_text = f"👥 共 {len(users)} 个监控对象" if total_pages <= 1 else f"👥 共 {len(users)} 个（第 {page + 1}/{total_pages} 页）"
+    markup, total_text, _page = paginated_user_keyboard(
+        users, page,
+        item_prefix="bf",
+        item_label_fmt="⏳ @{u}",
+        page_prefix="bf_pg",
+        close_data="bf_cl",
+    )
     await query.edit_message_text(
         f"{total_text}\n点击用户开始全量回填：",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=markup,
     )
 
 

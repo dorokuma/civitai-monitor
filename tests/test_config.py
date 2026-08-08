@@ -94,3 +94,20 @@ def test_monitor_config_mode_nsfw_valid():
     )
     assert cfg.mode == "incremental"
     assert cfg.nsfw == "sfw_only"
+
+
+def test_write_config_never_persists_token(tmp_path, monkeypatch):
+    """write_config strips bot_token even if present in memory model."""
+    from monitor import write_config
+    import yaml
+
+    path = tmp_path / "out.yaml"
+    cfg = MonitorConfig(
+        telegram={"bot_token": "env-injected-secret", "chat_id": "c"},
+        subscriptions={},
+        authorized_users=[],
+    )
+    write_config(cfg, path)
+    raw = yaml.safe_load(path.read_text())
+    assert raw["telegram"]["bot_token"] == ""
+    assert "env-injected-secret" not in path.read_text()

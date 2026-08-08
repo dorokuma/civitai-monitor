@@ -12,12 +12,15 @@ import pytest
 import requests
 
 from monitor import (
+    FetchPageError,
     PENDING_CONFIRM_SECONDS,
     PENDING_MAX_RETRIES,
     _monitor_signal_handler,
     adopt_stale_inflight,
     cleanup_old_caches,
     clear_pending,
+    download_video,
+    escape_markdown,
     fetch_page,
     load_pending_map,
     load_push_timestamps,
@@ -33,7 +36,9 @@ from monitor import (
     seen_file_for_user,
     update_pending_map,
     update_push_timestamps,
+    write_config,
 )
+from monitor import MonitorConfig
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +188,7 @@ class TestFetchPageLimitClamp:
 
     def test_clamps_huge_limit_to_200(self):
         """If config writes images_per_page: 10000 we must not send it raw."""
-        with patch("monitor.safe_get") as mock_get:
+        with patch("civitai_client.safe_get") as mock_get:
             mock_get.return_value = self._mock_response()
             with patch.dict(os.environ, {}, clear=False):
                 fetch_page("alice", limit=10000)
@@ -191,25 +196,25 @@ class TestFetchPageLimitClamp:
         assert sent_params["limit"] == 200
 
     def test_clamps_zero_or_negative_to_one(self):
-        with patch("monitor.safe_get") as mock_get:
+        with patch("civitai_client.safe_get") as mock_get:
             mock_get.return_value = self._mock_response()
             fetch_page("alice", limit=0)
         assert mock_get.call_args.kwargs["params"]["limit"] == 1
         mock_get.reset_mock()
-        with patch("monitor.safe_get") as mock_get:
+        with patch("civitai_client.safe_get") as mock_get:
             mock_get.return_value = self._mock_response()
             fetch_page("alice", limit=-5)
         assert mock_get.call_args.kwargs["params"]["limit"] == 1
 
     def test_preserves_normal_limit(self):
-        with patch("monitor.safe_get") as mock_get:
+        with patch("civitai_client.safe_get") as mock_get:
             mock_get.return_value = self._mock_response()
             fetch_page("alice", limit=100)
         assert mock_get.call_args.kwargs["params"]["limit"] == 100
 
     def test_uses_civitai_red_when_nsfw_true(self):
         """NSFW track must hit civitai.red."""
-        with patch("monitor.safe_get") as mock_get:
+        with patch("civitai_client.safe_get") as mock_get:
             mock_get.return_value = self._mock_response()
             fetch_page("alice", nsfw=True, sort="Newest")
         called_url = mock_get.call_args.args[0]
@@ -222,7 +227,7 @@ class TestFetchPageLimitClamp:
         without sort when first call returns 0 items."""
         empty = self._mock_response(items=[])
         items = self._mock_response(items=[{"id": 1, "url": "x"}])
-        with patch("monitor.safe_get") as mock_get:
+        with patch("civitai_client.safe_get") as mock_get:
             mock_get.side_effect = [empty, items]
             fetched, cursor = fetch_page("alice", nsfw=False, sort="Newest")
         assert mock_get.call_count == 2
@@ -233,19 +238,18 @@ class TestFetchPageLimitClamp:
 
     def test_returns_empty_and_no_cursor_on_empty_response(self):
         """When both attempts return 0 items, return ([], '') so the loop terminates."""
-        with patch("monitor.safe_get") as mock_get:
+        with patch("civitai_client.safe_get") as mock_get:
             mock_get.return_value = self._mock_response(items=[])
             fetched, cursor = fetch_page("alice", nsfw=False, sort="Newest")
         assert fetched == []
         assert cursor == ""
 
-    def test_network_error_returns_empty(self):
-        """A 5xx must not crash the loop — return ([], '') and let the caller skip."""
+    def test_network_error_raises_fetch_page_error(self):
+        """Hard network/HTTP failures raise FetchPageError (no silent empty page)."""
         import requests as _req
-        with patch("monitor.safe_get", side_effect=_req.RequestException("boom")):
-            fetched, cursor = fetch_page("alice", nsfw=False, sort="Newest")
-        assert fetched == []
-        assert cursor == ""
+        with patch("civitai_client.safe_get", side_effect=_req.RequestException("boom")):
+            with pytest.raises(FetchPageError):
+                fetch_page("alice", nsfw=False, sort="Newest")
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +294,7 @@ class TestTelegramMediaAntiDuplicate:
     """Timeout after media upload must NOT fall back to a second text message."""
 
     def test_video_timeout_returns_uncertain_no_text(self, monkeypatch, tmp_path):
-        import monitor as m
+        import telegram_media as tm
 
         video = tmp_path / "1.mp4"
         video.write_bytes(b"fake-video")
@@ -299,17 +303,17 @@ class TestTelegramMediaAntiDuplicate:
             raise requests.Timeout("read timed out")
 
         text_calls: list = []
-        monkeypatch.setattr(m.requests, "post", boom)
+        monkeypatch.setattr(tm.requests, "post", boom)
         monkeypatch.setattr(
-            m, "_send_telegram_text",
+            tm, "_send_telegram_text",
             lambda *a, **k: text_calls.append(1) or True,
         )
-        ok = m._send_telegram_video("http://api/botT", "chat", "caption", video)
+        ok = tm._send_telegram_video("http://api/botT", "chat", "caption", video)
         assert ok is None  # uncertain, not false success
         assert text_calls == []
 
     def test_media_group_timeout_returns_uncertain_no_text(self, monkeypatch, tmp_path):
-        import monitor as m
+        import telegram_media as tm
 
         img = tmp_path / "1.jpeg"
         img.write_bytes(b"fake-img")
@@ -318,17 +322,17 @@ class TestTelegramMediaAntiDuplicate:
             raise requests.Timeout("read timed out")
 
         text_calls: list = []
-        monkeypatch.setattr(m.requests, "post", boom)
+        monkeypatch.setattr(tm.requests, "post", boom)
         monkeypatch.setattr(
-            m, "_send_telegram_text",
+            tm, "_send_telegram_text",
             lambda *a, **k: text_calls.append(1) or True,
         )
-        ok = m._send_telegram_media_group("http://api/botT", "chat", "caption", [img])
+        ok = tm._send_telegram_media_group("http://api/botT", "chat", "caption", [img])
         assert ok is None
         assert text_calls == []
 
     def test_video_http_error_still_falls_back_to_text(self, monkeypatch, tmp_path):
-        import monitor as m
+        import telegram_media as tm
 
         video = tmp_path / "1.mp4"
         video.write_bytes(b"fake-video")
@@ -336,16 +340,44 @@ class TestTelegramMediaAntiDuplicate:
         class FakeResp:
             ok = False
             text = "bad request"
+            status_code = 400
+            headers = {}
 
-        monkeypatch.setattr(m.requests, "post", lambda *a, **k: FakeResp())
+        monkeypatch.setattr(tm.requests, "post", lambda *a, **k: FakeResp())
         text_calls: list = []
         monkeypatch.setattr(
-            m, "_send_telegram_text",
+            tm, "_send_telegram_text",
             lambda *a, **k: text_calls.append(1) or True,
         )
-        ok = m._send_telegram_video("http://api/botT", "chat", "caption", video)
+        ok = tm._send_telegram_video("http://api/botT", "chat", "caption", video)
         assert ok is True
         assert text_calls == [1]
+
+    def test_telegram_429_retries_then_succeeds(self, monkeypatch):
+        import telegram_media as tm
+
+        calls = {"n": 0}
+
+        class FakeResp:
+            def __init__(self, status, ok=False):
+                self.status_code = status
+                self.ok = ok
+                self.text = "x"
+                self.headers = {"Retry-After": "0"} if status == 429 else {}
+
+        def fake_post(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] < 2:
+                return FakeResp(429)
+            return FakeResp(200, ok=True)
+
+        sleeps: list[float] = []
+        monkeypatch.setattr(tm.requests, "post", fake_post)
+        monkeypatch.setattr(tm.time, "sleep", lambda s: sleeps.append(s))
+        resp = tm._telegram_post("http://api/botT/sendMessage", timeout=5, json={})
+        assert resp.ok is True
+        assert calls["n"] == 2
+        assert sleeps  # waited on 429
 
 
 class TestPushLifecycleState:
@@ -542,4 +574,158 @@ class TestIncrementalHoles:
         # 4. 断言：应该成功获取 Page 2 并发现且推送 98
         assert 98 in pushed_targets, "Bug: 提前退出导致未推送空洞图片 98！"
 
+
+# ---------------------------------------------------------------------------
+# write_config — redact token + atomic write
+# ---------------------------------------------------------------------------
+
+
+class TestWriteConfig:
+    def test_write_config_redacts_bot_token(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        cfg = MonitorConfig(
+            telegram={"bot_token": "SECRET_TOKEN_DO_NOT_PERSIST", "chat_id": "-1001"},
+            subscriptions={"1": [{"name": "alice"}]},
+            authorized_users=[1],
+        )
+        write_config(cfg, path)
+        text = path.read_text()
+        assert "SECRET_TOKEN_DO_NOT_PERSIST" not in text
+        import yaml
+        raw = yaml.safe_load(text)
+        assert raw["telegram"]["bot_token"] == ""
+        assert raw["telegram"]["chat_id"] == "-1001"
+        # no leftover tmp
+        leftovers = list(tmp_path.glob("config.yaml*.tmp"))
+        assert leftovers == []
+
+    def test_write_config_atomic_no_tmp_leftover(self, tmp_path):
+        path = tmp_path / "cfg.yaml"
+        cfg = MonitorConfig(telegram={"bot_token": "t", "chat_id": "c"})
+        write_config(cfg, path)
+        assert path.exists()
+        assert not path.with_suffix(".tmp").exists()
+
+
+# ---------------------------------------------------------------------------
+# load_seen_ids / load_pushed_ids — corrupt files
+# ---------------------------------------------------------------------------
+
+
+class TestCorruptIdFiles:
+    def test_load_seen_ids_corrupt_returns_empty(self, tmp_path, caplog):
+        path = seen_file_for_user(tmp_path, "tg1", "alice")
+        path.write_text("{not-json")
+        import logging
+        with caplog.at_level(logging.WARNING):
+            ids = load_seen_ids(tmp_path, "tg1", "alice")
+        assert ids == set()
+        assert any("Corrupt seen" in r.message for r in caplog.records)
+
+    def test_load_pushed_ids_corrupt_returns_empty(self, tmp_path, caplog):
+        path = pushed_file_for_user(tmp_path, "tg1", "alice")
+        path.write_text("[]broken")
+        import logging
+        with caplog.at_level(logging.WARNING):
+            ids = load_pushed_ids(tmp_path, "tg1", "alice")
+        assert ids == set()
+        assert any("Corrupt pushed" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# download_video — stream cap without Content-Length
+# ---------------------------------------------------------------------------
+
+
+class TestDownloadVideoStreamCap:
+    def test_no_content_length_over_cap_deletes_tmp(self, tmp_path, monkeypatch):
+        """When CL is missing, count bytes while streaming; exceed cap → False + no file."""
+        import monitor as m
+
+        save = tmp_path / "videos" / "2.mp4"
+        big = [b"a" * (512 * 1024)] * 3  # 1.5 MB total, no Content-Length
+
+        class BodyResp:
+            status_code = 200
+            headers = {}  # no content-length
+            url = "https://cdn.example/video"
+
+            def raise_for_status(self):
+                return None
+
+            def iter_content(self, chunk_size=8192):
+                yield from big
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class ProbeResp:
+            status_code = 200
+            headers = {}
+            url = "https://other.cdn/path/not-b2"
+
+            def raise_for_status(self):
+                return None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        calls = {"n": 0}
+
+        def fake_safe_get(url, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return ProbeResp()
+            return BodyResp()
+
+        monkeypatch.setattr(m, "safe_get", fake_safe_get)
+        ok = download_video("https://image.civitai.com/y", save, max_size_mb=1)
+        assert ok is False
+        assert not save.exists()
+        assert not save.with_suffix(save.suffix + ".tmp").exists()
+
+
+# ---------------------------------------------------------------------------
+# Markdown escape
+# ---------------------------------------------------------------------------
+
+
+class TestEscapeMarkdown:
+    def test_escapes_underscore_in_username(self):
+        assert escape_markdown("user_name") == r"user\_name"
+
+    def test_escapes_multiple(self):
+        assert "*" not in escape_markdown("a*b_c") or r"\*" in escape_markdown("a*b_c")
+        assert escape_markdown("a*b") == r"a\*b"
+
+
+class TestClearStatusInterrupted:
+    def test_interrupted_keeps_snapshot(self, tmp_path, monkeypatch):
+        import datetime as _dt
+        import monitor as m
+
+        status = tmp_path / "monitor_status.json"
+        monkeypatch.setattr(m, "STATUS_PATH", status)
+        status.write_text('{"status":"running"}')
+        start = _dt.datetime.now()
+        m._clear_status(True, start)
+        assert status.exists()
+        data = __import__("json").loads(status.read_text())
+        assert data["status"] == "interrupted"
+
+    def test_normal_clears_status(self, tmp_path, monkeypatch):
+        import datetime as _dt
+        import monitor as m
+
+        status = tmp_path / "monitor_status.json"
+        monkeypatch.setattr(m, "STATUS_PATH", status)
+        status.write_text('{"status":"running"}')
+        m._clear_status(False, _dt.datetime.now())
+        assert not status.exists()
 

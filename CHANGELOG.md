@@ -2,6 +2,28 @@
 
 This file follows the [Keep a Changelog](https://keepachangelog.com/) format, and version numbers follow [SemVer](https://semver.org/).
 
+## [1.1.3] - 2026-08-08
+
+### Added
+- Module split (compat re-exports from `monitor.py` / bot imports):
+  `config_io.py`, `civitai_client.py`, `state_store.py`, `telegram_media.py`, `bot_ui.py`.
+- `FetchPageError`: network/HTTP hard failures from `fetch_page` raise instead of returning empty; `main()` exits 2.
+- Telegram send path: limited 429 `Retry-After` retries + Markdown escape for dynamic usernames.
+- Shared `paginated_user_keyboard` for remove/backfill UI.
+
+### Fixed
+- `write_config`: redacts `telegram.bot_token` (env-injected tokens never written back) + atomic `tmp`/`os.replace`.
+- `load_seen_ids` / `load_pushed_ids`: corrupt JSON → empty set + warning.
+- `download_video`: without Content-Length, stream-count bytes and abort past cap (default 1024 MB).
+- `_clear_status(interrupted=True)` keeps the interrupted snapshot (no immediate unlink).
+- Backfill timeout user text matches idle 1800s (30 min no output), not “2 hours”.
+- `/mode` and `/nsfw` replies warn that settings are **global** (all subscribers).
+- `/cleanup` reuses `monitor.cleanup_old_caches` (incl. `max_total_gb`).
+
+### Changed
+- Removed unused `pydantic-settings` from requirements.
+- Docs: multi-user subscribe vs single channel push; seen vs pushed; env token dual-track.
+
 ## [1.1.2] - 2026-08-05
 
 ### Fixed

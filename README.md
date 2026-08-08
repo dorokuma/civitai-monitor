@@ -67,6 +67,13 @@ subscriptions:                      seen_ids/
   ANOTHER_USER_ID: [Username2]      └ seen_ids_ANOTHER_ID_Username2.json
 ```
 
+**Important operational notes (v1.1.3+):**
+
+- **Multi-user subscribe vs single push target**: each authorized Telegram user can maintain their own *subscription list*, but media is pushed to the **single** `telegram.chat_id` channel/chat configured in yaml — not one private chat per subscriber.
+- **Global `/mode` and `/nsfw`**: these settings apply to the whole scanner (all subscribers), not only the admin who ran the command.
+- **`seen_ids` vs `pushed_ids`**: dedupe for “already delivered” is based on **`pushed_ids`**. `seen_ids` tracks scan progress / page cursor safety and may diverge after a failed send.
+- **Token dual-track**: prefer env `CIVITAI_BOT_TOKEN` (via `load_env.py` and/or systemd `EnvironmentFile`). Do not store a real token in yaml — `write_config` strips `bot_token` on save.
+
 ---
 
 ## Quick Start

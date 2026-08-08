@@ -64,6 +64,13 @@ subscriptions:                      seen_ids/
   ANOTHER_USER_ID: [Username2]      └ seen_ids_ANOTHER_ID_Username2.json
 ```
 
+**运维要点（v1.1.3+）：**
+
+- **多用户订阅 vs 单一推送频道**：每个授权 Telegram 用户可维护各自的*订阅列表*，但媒体推送到配置里**唯一的** `telegram.chat_id`（不是按订阅者每人一个私聊）。
+- **全局 `/mode` 与 `/nsfw`**：影响整个扫描器（全部订阅者），不是仅限下命令的管理员。
+- **`seen_ids` vs `pushed_ids`**：是否“已送达”以 **`pushed_ids` 去重为准**；`seen_ids` 主要记录扫描进度/缓存，发送失败时两者可能不一致。
+- **Token 双轨**：优先环境变量 `CIVITAI_BOT_TOKEN`（`load_env.py` 和/或 systemd `EnvironmentFile`）。勿把真 token 写进 yaml —— `write_config` 落盘时会 strip `bot_token`。
+
 ---
 
 ## 快速开始
