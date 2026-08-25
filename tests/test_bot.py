@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib.util
+import inspect
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +25,56 @@ from civitai_bot_module import (
     scheduled_scan_cron,
     set_users,
 )
+
+# ---------------------------------------------------------------------------
+# Background-task shutdown
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_shutdown_callback_accepts_application_and_cancels_tasks(monkeypatch):
+    """PTB passes Application to post_shutdown; tracked tasks are awaited."""
+    assert list(inspect.signature(civitai_bot._shutdown_background_tasks).parameters) == [
+        "application"
+    ]
+
+    monkeypatch.setattr(civitai_bot, "_background_tasks", set())
+    finished = asyncio.Event()
+
+    async def background_task():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            finished.set()
+            raise
+
+    task = asyncio.create_task(background_task())
+    civitai_bot._background_tasks.add(task)
+    await asyncio.sleep(0)
+    await civitai_bot._shutdown_background_tasks(MagicMock())
+
+    assert task.cancelled()
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_callback_does_not_propagate_task_cleanup_errors(monkeypatch):
+    """A task cleanup failure is collected without blocking application shutdown."""
+    monkeypatch.setattr(civitai_bot, "_background_tasks", set())
+
+    async def broken_task():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise RuntimeError("cleanup failed")
+
+    task = asyncio.create_task(broken_task())
+    civitai_bot._background_tasks.add(task)
+    await asyncio.sleep(0)
+    await civitai_bot._shutdown_background_tasks(MagicMock())
+
+    assert task.done()
+    assert isinstance(task.exception(), RuntimeError)
+
 
 # ---------------------------------------------------------------------------
 # _CIVITAI_URL_PREFIXES

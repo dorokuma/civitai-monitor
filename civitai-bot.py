@@ -83,7 +83,7 @@ def _track_task(task: asyncio.Task) -> asyncio.Task:
     return task
 
 
-async def _shutdown_background_tasks() -> None:
+async def _shutdown_background_tasks(application: Application) -> None:
     """Cancel every tracked background task and wait for them to finish."""
     pending = [t for t in _background_tasks if not t.done()]
     if not pending:
