@@ -19,8 +19,6 @@ Usage:
 
 from __future__ import annotations
 
-import load_env  # noqa: F401  # 自动加载同目录下的 civitai-bot.env（token 等敏感信息）
-
 import argparse
 import atexit
 import datetime as _dt
@@ -32,10 +30,13 @@ import random
 import signal
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, NamedTuple
+from typing import Any, NamedTuple
 
 import requests
+
+import load_env  # noqa: F401  # 自动加载同目录下的 civitai-bot.env（token 等敏感信息）
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -53,38 +54,38 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # Re-exports (keep `from monitor import X` stable for bot + tests)
 # ---------------------------------------------------------------------------
 
-from config_io import (  # noqa: E402
-    ApiConfig,  # noqa: F401
-    BackfillConfig,  # noqa: F401
-    DATA_DIR_NAME,
-    DEFAULT_CONFIG_PATHS,  # noqa: F401
-    DataConfig,  # noqa: F401
-    DownloadConfig,  # noqa: F401
-    HttpConfig,  # noqa: F401
-    IncrementalConfig,  # noqa: F401
-    LOCK_FILE_NAME,
-    MonitorConfig,  # noqa: F401
-    SCRIPT_DIR,
-    STATUS_FILE_NAME,
-    TelegramConfig,  # noqa: F401
-    VALID_MODES,  # noqa: F401
-    VALID_NSFW,  # noqa: F401
-    load_config,
-    redact_config_for_disk,  # noqa: F401
-    write_config,  # noqa: F401
-)
-from civitai_client import (  # noqa: E402
-    FetchPageError,
+from civitai_client import (
     HTTP_REQUEST_TIMEOUT,  # noqa: F401
     MAX_API_PAGE_LIMIT,  # noqa: F401
     MIN_API_PAGE_LIMIT,  # noqa: F401
+    FetchPageError,
     RateLimitError,  # noqa: F401
     fetch_page,
     init_session,  # noqa: F401
     safe_get,
     session,  # noqa: F401
 )
-from state_store import (  # noqa: E402
+from config_io import (
+    DATA_DIR_NAME,
+    DEFAULT_CONFIG_PATHS,  # noqa: F401
+    LOCK_FILE_NAME,
+    SCRIPT_DIR,
+    STATUS_FILE_NAME,
+    VALID_MODES,  # noqa: F401
+    VALID_NSFW,  # noqa: F401
+    ApiConfig,  # noqa: F401
+    BackfillConfig,  # noqa: F401
+    DataConfig,  # noqa: F401
+    DownloadConfig,  # noqa: F401
+    HttpConfig,  # noqa: F401
+    IncrementalConfig,  # noqa: F401
+    MonitorConfig,  # noqa: F401
+    TelegramConfig,  # noqa: F401
+    load_config,
+    redact_config_for_disk,  # noqa: F401
+    write_config,  # noqa: F401
+)
+from state_store import (
     PENDING_CONFIRM_SECONDS,
     PENDING_MAX_RETRIES,
     PendingMap,  # noqa: F401
@@ -105,7 +106,7 @@ from state_store import (  # noqa: E402
     update_pending_map,  # noqa: F401
     update_push_timestamps,  # noqa: F401
 )
-from telegram_media import (  # noqa: E402
+from telegram_media import (
     TELEGRAM_DOCUMENT_MAX_BYTES,  # noqa: F401
     TELEGRAM_PHOTO_MAX_BYTES,  # noqa: F401
     TELEGRAM_VIDEO_MAX_MB,  # noqa: F401
@@ -156,11 +157,9 @@ def _is_permanent_request_error(exc: requests.RequestException) -> bool:
     keep the item un-pushed so the next scan can retry.
     """
     resp = getattr(exc, "response", None)
-    if resp is not None and resp.status_code in _PERMANENT_HTTP_STATUSES:
-        return True
     # An HTTPError raised manually (e.g. download_video's "last status")
     # without a .response is treated as transient by default.
-    return False
+    return resp is not None and resp.status_code in _PERMANENT_HTTP_STATUSES
 
 LOCK_PATH = SCRIPT_DIR / LOCK_FILE_NAME
 STATUS_PATH = SCRIPT_DIR / STATUS_FILE_NAME
@@ -960,7 +959,7 @@ def _acquire_process_lock() -> int | None:
 
 def _write_status(
     *,
-    start_time: "_dt.datetime",
+    start_time: _dt.datetime,
     mode: str,
     current_creator: str,
     creators_done: int,
@@ -976,18 +975,18 @@ def _write_status(
         "creators_done": creators_done,
         "creators_total": creators_total,
         "pushed_count": pushed_count,
-        "elapsed_seconds": int((_dt.datetime.now() - start_time).total_seconds()),
+        "elapsed_seconds": int((_dt.datetime.now(_dt.timezone.utc) - start_time).total_seconds()),
     }
     STATUS_PATH.write_text(json.dumps(payload))
 
 
-def _clear_status(interrupted: bool, start_time: "_dt.datetime") -> None:
+def _clear_status(interrupted: bool, start_time: _dt.datetime) -> None:
     """Clear running status. On interrupt, leave an interrupted snapshot on disk."""
     try:
         if interrupted:
             STATUS_PATH.write_text(json.dumps({
                 "status": "interrupted",
-                "elapsed_seconds": int((_dt.datetime.now() - start_time).total_seconds()),
+                "elapsed_seconds": int((_dt.datetime.now(_dt.timezone.utc) - start_time).total_seconds()),
             }))
             return  # keep interrupted snapshot for operators
         if STATUS_PATH.exists():
@@ -1091,7 +1090,7 @@ def main() -> None:
     parser.add_argument("--user", type=str, help="Process only this Civitai username")
     args = parser.parse_args()
 
-    global cfg  # noqa: PLW0602
+    global cfg
     cfg = load_config(Path(args.config) if args.config else None)
     if cfg is None:
         sys.exit(1)
@@ -1117,7 +1116,7 @@ def main() -> None:
         sys.exit(1)
 
     # Step 4: write initial status, then walk every (TG user, creator) pair.
-    start_time = _dt.datetime.now()
+    start_time = _dt.datetime.now(_dt.timezone.utc)
     total_creators = sum(len(v) for v in subs.values())
     _write_status(
         start_time=start_time, mode=cfg.mode, current_creator="",

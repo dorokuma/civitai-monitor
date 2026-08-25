@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+
 def load_dotenv(env_path: str | Path | None = None) -> bool:
     if env_path is None:
         # Try ~/.civitai-monitor/.env first, then legacy project-root path
@@ -25,8 +26,7 @@ def load_dotenv(env_path: str | Path | None = None) -> bool:
             line = raw_line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
-            if line.startswith("export "):
-                line = line[7:]
+            line = line.removeprefix("export ")
             key, value = line.split("=", 1)
             key = key.strip()
             value = value.strip()

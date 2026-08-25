@@ -12,9 +12,10 @@ import pytest
 import requests
 
 from monitor import (
-    FetchPageError,
     PENDING_CONFIRM_SECONDS,
     PENDING_MAX_RETRIES,
+    FetchPageError,
+    MonitorConfig,
     _monitor_signal_handler,
     adopt_stale_inflight,
     cleanup_old_caches,
@@ -29,8 +30,8 @@ from monitor import (
     load_seen_ids,
     mark_inflight,
     mark_pending,
-    nsfw_tracks,
     normalize_to_original,
+    nsfw_tracks,
     pushed_file_for_user,
     save_pushed_ids,
     save_seen_ids,
@@ -38,8 +39,6 @@ from monitor import (
     update_pending_map,
     write_config,
 )
-from monitor import MonitorConfig
-
 
 # ---------------------------------------------------------------------------
 # nsfw_tracks
@@ -229,7 +228,7 @@ class TestFetchPageLimitClamp:
         items = self._mock_response(items=[{"id": 1, "url": "x"}])
         with patch("civitai_client.safe_get") as mock_get:
             mock_get.side_effect = [empty, items]
-            fetched, cursor = fetch_page("alice", nsfw=False, sort="Newest")
+            fetched, _cursor = fetch_page("alice", nsfw=False, sort="Newest")
         assert mock_get.call_count == 2
         # Second call must not have `sort` parameter
         second_params = mock_get.call_args_list[1].kwargs["params"]
@@ -247,9 +246,8 @@ class TestFetchPageLimitClamp:
     def test_network_error_raises_fetch_page_error(self):
         """Hard network/HTTP failures raise FetchPageError (no silent empty page)."""
         import requests as _req
-        with patch("civitai_client.safe_get", side_effect=_req.RequestException("boom")):
-            with pytest.raises(FetchPageError):
-                fetch_page("alice", nsfw=False, sort="Newest")
+        with patch("civitai_client.safe_get", side_effect=_req.RequestException("boom")), pytest.raises(FetchPageError):
+            fetch_page("alice", nsfw=False, sort="Newest")
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +339,7 @@ class TestTelegramMediaAntiDuplicate:
             ok = False
             text = "bad request"
             status_code = 400
-            headers = {}
+            headers = {}  # noqa: RUF012
 
         monkeypatch.setattr(tm.requests, "post", lambda *a, **k: FakeResp())
         text_calls: list = []
@@ -504,8 +502,9 @@ class TestStateWriteFailure:
 
     def test_save_pushed_ids_raises_state_write_error(self, tmp_path):
         """save_pushed_ids must raise StateWriteError when the lock times out."""
-        from state_store import StateWriteError
         from filelock import Timeout
+
+        from state_store import StateWriteError
 
         with patch("state_store.FileLock") as mock_lock:
             mock_lock.side_effect = Timeout(str(tmp_path / ".pushed.lock"))
@@ -995,7 +994,7 @@ class TestDownloadVideoStreamCap:
 
         class BodyResp:
             status_code = 200
-            headers = {}  # no content-length
+            headers = {}  # no content-length  # noqa: RUF012
             url = "https://cdn.example/video"
 
             def raise_for_status(self):
@@ -1012,7 +1011,7 @@ class TestDownloadVideoStreamCap:
 
         class ProbeResp:
             status_code = 200
-            headers = {}
+            headers = {}  # noqa: RUF012
             url = "https://other.cdn/path/not-b2"
 
             def raise_for_status(self):
@@ -1057,12 +1056,13 @@ class TestEscapeMarkdown:
 class TestClearStatusInterrupted:
     def test_interrupted_keeps_snapshot(self, tmp_path, monkeypatch):
         import datetime as _dt
+
         import monitor as m
 
         status = tmp_path / "monitor_status.json"
         monkeypatch.setattr(m, "STATUS_PATH", status)
         status.write_text('{"status":"running"}')
-        start = _dt.datetime.now()
+        start = _dt.datetime.now(_dt.timezone.utc)
         m._clear_status(True, start)
         assert status.exists()
         data = __import__("json").loads(status.read_text())
@@ -1070,11 +1070,12 @@ class TestClearStatusInterrupted:
 
     def test_normal_clears_status(self, tmp_path, monkeypatch):
         import datetime as _dt
+
         import monitor as m
 
         status = tmp_path / "monitor_status.json"
         monkeypatch.setattr(m, "STATUS_PATH", status)
         status.write_text('{"status":"running"}')
-        m._clear_status(False, _dt.datetime.now())
+        m._clear_status(False, _dt.datetime.now(_dt.timezone.utc))
         assert not status.exists()
 

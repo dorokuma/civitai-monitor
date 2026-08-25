@@ -4,9 +4,9 @@ backfill-memory-wrapper.py
 Sets a stricter memory limit (1400 MB) for the backfill process, then execs into monitor.py.
 主服务 MemoryMax=4G，Backfill 更严格 = 1400MB.
 """
+import os
 import resource
 import sys
-import os
 
 if len(sys.argv) < 3:
     print("Usage: backfill-memory-wrapper.py <python_bin> <monitor_script> <args...>", file=sys.stderr)

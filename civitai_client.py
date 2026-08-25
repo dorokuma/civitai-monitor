@@ -95,12 +95,8 @@ def _should_retry_api(exc: BaseException) -> bool:
         return True
     if isinstance(exc, requests.exceptions.HTTPError):
         resp = getattr(exc, "response", None)
-        if resp is not None and 500 <= resp.status_code < 600:
-            return True
-        return False  # 4xx → client error, do not retry
-    if isinstance(exc, requests.RequestException):
-        return True
-    return False
+        return resp is not None and 500 <= resp.status_code < 600  # 4xx → client error, do not retry
+    return isinstance(exc, requests.RequestException)
 
 
 @retry(

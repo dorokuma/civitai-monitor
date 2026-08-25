@@ -1,8 +1,10 @@
 """Tests for monitor.py — MonitorConfig and load_config."""
 
-import yaml
 import tempfile
 from pathlib import Path
+
+import yaml
+
 from monitor import MonitorConfig, load_config
 
 
@@ -69,7 +71,6 @@ def test_monitor_config_defaults():
 def test_load_config_missing_file():
     """load_config() exits with error when config is missing (tested by checking it doesn't crash)."""
     # load_config calls sys.exit(1) on missing file — tested manually
-    pass
 
 
 def test_monitor_config_nested_subscriptions():
@@ -98,8 +99,9 @@ def test_monitor_config_mode_nsfw_valid():
 
 def test_write_config_never_persists_token(tmp_path, monkeypatch):
     """write_config strips bot_token even if present in memory model."""
-    from monitor import write_config
     import yaml
+
+    from monitor import write_config
 
     path = tmp_path / "out.yaml"
     cfg = MonitorConfig(

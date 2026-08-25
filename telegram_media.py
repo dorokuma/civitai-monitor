@@ -55,7 +55,7 @@ def escape_markdown(text: str) -> str:
 def _telegram_post(
     url: str,
     *,
-    timeout: float | int,
+    timeout: float,
     max_retries: int = _TG_MAX_RETRIES,
     **kwargs,
 ) -> requests.Response:
@@ -201,7 +201,7 @@ def _send_telegram_media_group(api_base: str, chat_id: str, text: str, file_path
                     "caption": text if i == 0 else "",
                     "parse_mode": "Markdown",
                 })
-                fh = open(fp, "rb")
+                fh = open(fp, "rb")  # noqa: SIM115
                 open_handles.append(fh)
                 files[f"img{i}"] = (fp.name, fh, "image/jpeg")
 

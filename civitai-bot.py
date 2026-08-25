@@ -31,19 +31,20 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
-from pathlib import Path
 from collections import defaultdict
+from datetime import datetime, timezone
 from functools import wraps
+from pathlib import Path
 
 import requests
 from telegram import BotCommand, Update
 from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
+from bot_ui import paginated_user_keyboard
+
 # Import unified config from monitor / config_io (re-exported by monitor)
 from monitor import MonitorConfig, cleanup_old_caches, load_config, write_config
-from bot_ui import paginated_user_keyboard
 
 # Transient Telegram transport failures during long-polling / send. PTB already
 # retries these in its network loop; they must not page admins as "unhandled".
@@ -113,9 +114,7 @@ def _is_transient_telegram_error(exc: BaseException | None) -> bool:
         return True
     # Some PTB paths wrap the real cause; walk a short chain.
     cause = getattr(exc, "__cause__", None)
-    if isinstance(cause, _TRANSIENT_TG_ERRORS):
-        return True
-    return False
+    return isinstance(cause, _TRANSIENT_TG_ERRORS)
 
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -192,7 +191,7 @@ def _application_builder_for_config(token: str, api_base_url: str):
             .base_file_url(f"{base}/file/bot")
         )
         # --local mode returns absolute filesystem paths for downloaded files.
-        if base.startswith("http://127.0.0.1") or base.startswith("http://localhost"):
+        if base.startswith(("http://127.0.0.1", "http://localhost")):
             builder = builder.local_mode(True)
     return builder
 
@@ -258,7 +257,7 @@ def _load_active_backfills() -> dict[str, dict[str, str]]:
 
 def _save_active_backfills(data: dict[str, dict[str, str]]) -> None:
     """Atomically write active backfills state via rename."""
-    tmp = tempfile.NamedTemporaryFile(
+    tmp = tempfile.NamedTemporaryFile(  # noqa: SIM115
         mode="w", suffix=".tmp", dir=SCRIPT_DIR, delete=False, encoding="utf-8"
     )
     try:
@@ -293,7 +292,7 @@ def _acquire_backfill_lock(tg_id: str, username: str) -> tuple[int, Path] | None
         fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return fd, lock_path
-    except (OSError, IOError):
+    except OSError:
         if fd is not None:
             try:
                 os.close(fd)
@@ -501,7 +500,7 @@ def validate_username_exists(username: str, cookies_path: str | Path | None = No
             cj = http.cookiejar.MozillaCookieJar(str(cookies_path))
             cj.load(ignore_expires=True, ignore_discard=True)
             s.cookies.update(cj)
-        except (OSError, http.cookiejar.LoadError, Exception) as e:
+        except (OSError, http.cookiejar.LoadError, Exception) as e:  # noqa: BLE001
             log.warning("Failed to load cookies from %s: %s", cookies_path, e)
 
     has_sfw = False
@@ -724,11 +723,11 @@ async def cmd_remove_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -
             else:
                 await query.edit_message_text(f"✅ 已取消关注 @{username}\n📭 监控列表已清空", reply_markup=None)
     except Exception as e:
-        log.exception("Remove callback error: %s", e)
+        log.exception("Remove callback error: %s", e)  # noqa: TRY401
         try:
             await query.edit_message_text("❌ 操作失败，请重试 /remove", reply_markup=None)
         except Exception as e:
-            log.exception("Nested error in remove callback: %s", e)
+            log.exception("Nested error in remove callback: %s", e)  # noqa: TRY401
 
 
 async def _render_remove_page(query, users: list[str], page: int) -> None:
@@ -779,8 +778,7 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 try:
                     data = json.loads(f.read_text())
                     seen_count += len(data) if isinstance(data, list) else 0
-                    if f.stat().st_mtime > latest_mtime:
-                        latest_mtime = f.stat().st_mtime
+                    latest_mtime = max(latest_mtime, f.stat().st_mtime)
                 except (OSError, ValueError) as e:
                     log.warning("Error checking file mtime: %s", e)
         if latest_mtime:
@@ -924,7 +922,7 @@ async def communicate_with_idle_timeout(proc: asyncio.subprocess.Process, timeou
                 if not data:
                     break
                 await queue.put((stream_type, data))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             await queue.put(("error", e))
         finally:
             await queue.put((stream_type, None))
@@ -986,7 +984,7 @@ async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             cwd=str(SCRIPT_DIR),
         )
         try:
-            out, err = await communicate_with_idle_timeout(proc, timeout=1800)
+            _out, err = await communicate_with_idle_timeout(proc, timeout=1800)
         except asyncio.TimeoutError:
             try:
                 proc.terminate()
@@ -1016,7 +1014,7 @@ async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="Markdown",
         )
     except Exception as e:
-        log.exception("Scan command error: %s", e)
+        log.exception("Scan command error: %s", e)  # noqa: TRY401
         await update.message.reply_text(f"❌ Error: {e}")
 
 
@@ -1075,7 +1073,7 @@ async def cmd_stop(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     except ProcessLookupError:
         await update.message.reply_text("扫描进程已不在了，锁应该已释放。")
     except Exception as e:
-        log.exception("Backfill cancel error: %s", e)
+        log.exception("Backfill cancel error: %s", e)  # noqa: TRY401
         await update.message.reply_text(f"❌ 终止失败: {e}")
 
 
@@ -1162,10 +1160,10 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
                     parse_mode="Markdown",
                 )
             except Exception as e:
-                log.exception("Backfill error: %s", e)
+                log.exception("Backfill error: %s", e)  # noqa: TRY401
                 await query.message.reply_text(f"❌ 回填出错: {e}")
     except Exception as e:
-        log.exception("Backfill callback outer error: %s", e)
+        log.exception("Backfill callback outer error: %s", e)  # noqa: TRY401
 
 
 async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProcess | None | str:
@@ -1213,7 +1211,7 @@ async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProce
             try:
                 _register_backfill(tg_id_str, username)
             except Exception as e:
-                log.exception("Backfill heartbeat for @%s failed: %s", username, e)
+                log.exception("Backfill heartbeat for @%s failed: %s", username, e)  # noqa: TRY401
             heartbeat_handle = loop.call_later(10.0, _heartbeat_tick)
 
         heartbeat_handle = loop.call_later(10.0, _heartbeat_tick)
@@ -1319,7 +1317,7 @@ def _resume_stale_backfills(application: Application) -> None:
             try:
                 _track_task(loop.create_task(_do_resume(tg_id, username, last_active_str)))
             except Exception as e:
-                log.exception("Error resuming backfill @%s: %s", username, e)
+                log.exception("Error resuming backfill @%s: %s", username, e)  # noqa: TRY401
 
 
 async def _resume_backfill_task(application: Application, tg_id: str, username: str) -> None:
@@ -1346,9 +1344,9 @@ async def _resume_backfill_task(application: Application, tg_id: str, username: 
                 parse_mode="Markdown",
             )
         except Exception as e:
-            log.exception("Could not notify user %s: %s", tg_id, e)
+            log.exception("Could not notify user %s: %s", tg_id, e)  # noqa: TRY401
     except Exception as e:
-        log.exception("Resumed backfill @%s error: %s", username, e)
+        log.exception("Resumed backfill @%s error: %s", username, e)  # noqa: TRY401
 
 
 async def _render_backfill_page(query, users: list[str], page: int) -> None:
@@ -1541,7 +1539,7 @@ async def scheduled_scan_cron() -> None:
                 else:
                     log.warning("Scheduled scan failed (exit %d)", returncode)
             except Exception as e:
-                log.exception("Scheduled scan error: %s", e)
+                log.exception("Scheduled scan error: %s", e)  # noqa: TRY401
             if _shutdown_requested:
                 break
             await asyncio.sleep(current_interval)
@@ -1614,7 +1612,7 @@ def _sweep_stale_backfills(max_age_minutes: int) -> int:
                     _unregister_backfill(tg_id, username)
                     removed += 1
             except Exception as e:
-                log.exception("Could not parse last_active %r for @%s: %s", last_active_str, username, e)
+                log.exception("Could not parse last_active %r for @%s: %s", last_active_str, username, e)  # noqa: TRY401
     return removed
 
 

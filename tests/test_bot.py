@@ -3,11 +3,10 @@
 import asyncio
 import importlib.util
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-from pathlib import Path
 
 # Load civitai-bot.py as a module (hyphenated name needs importlib)
 _spec = importlib.util.spec_from_file_location(
@@ -17,15 +16,14 @@ civitai_bot = importlib.util.module_from_spec(_spec)
 sys.modules["civitai_bot_module"] = civitai_bot
 _spec.loader.exec_module(civitai_bot)
 
-from civitai_bot_module import (  # noqa: E402
-    MonitorConfig,
+from civitai_bot_module import (
     _CIVITAI_URL_PREFIXES,
+    MonitorConfig,
     get_users,
     parse_username_input,
     scheduled_scan_cron,
     set_users,
 )
-
 
 # ---------------------------------------------------------------------------
 # _CIVITAI_URL_PREFIXES
@@ -181,7 +179,7 @@ class TestScheduledScanCron:
         # Use a timestamp within the stale-watchdog window (default 120 min)
         # so the entry is treated as a real, ongoing backfill — not a zombie
         # that the watchdog should sweep away.
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
         fresh = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
         self._patch_active_backfills(monkeypatch, {"111": {"alice": fresh}})
         create_subproc = AsyncMock()
@@ -211,7 +209,7 @@ class TestScheduledScanCron:
         mid-backfill would leave active_backfills.json populated forever,
         permanently blocking the scan cron.
         """
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
         ancient = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         self._patch_active_backfills(monkeypatch, {"111": {"alice": ancient}})
         proc = self._make_fake_proc(returncode=0)
@@ -262,15 +260,14 @@ class TestScheduledScanCron:
 
         sleep_mock = AsyncMock(side_effect=_maybe_shutdown)
 
-        with caplog.at_level(logging.INFO, logger="civitai-bot"):
-            with patch.object(
-                civitai_bot.asyncio, "create_subprocess_exec", create_subproc
-            ), patch.object(civitai_bot.asyncio, "sleep", sleep_mock):
+        with caplog.at_level(logging.INFO, logger="civitai-bot"), patch.object(
+            civitai_bot.asyncio, "create_subprocess_exec", create_subproc
+        ), patch.object(civitai_bot.asyncio, "sleep", sleep_mock):
+            civitai_bot._shutdown_requested = False
+            try:
+                await scheduled_scan_cron()
+            finally:
                 civitai_bot._shutdown_requested = False
-                try:
-                    await scheduled_scan_cron()
-                finally:
-                    civitai_bot._shutdown_requested = False
 
         # The subproc was spawned (backfills were empty)
         create_subproc.assert_called_once()
@@ -293,7 +290,6 @@ class TestScheduledScanCron:
         async def _fake_wait():
             # Simulate a long-running scan: set shutdown from "outside"
             civitai_bot._shutdown_requested = True
-            return None
 
         proc.wait = AsyncMock(side_effect=_fake_wait)
         sleep_mock = AsyncMock()
@@ -322,7 +318,6 @@ class TestScheduledScanCron:
 
         async def _fake_wait():
             civitai_bot._shutdown_requested = True
-            return None
         proc.wait = AsyncMock(side_effect=_fake_wait)
         sleep_mock = AsyncMock()
 
@@ -359,7 +354,6 @@ class TestScheduledScanCron:
         async def _fake_wait():
             # Simulate the scan noticing shutdown was requested
             civitai_bot._shutdown_requested = True
-            return None
         proc.wait = AsyncMock(side_effect=_fake_wait)
         sleep_mock = AsyncMock()
 
@@ -369,17 +363,16 @@ class TestScheduledScanCron:
         async def _wait_for_raises_no_loop(*_a, **_k):
             raise RuntimeError("no running event loop")
 
-        with caplog.at_level(logging.INFO, logger="civitai-bot"):
-            with patch.object(
-                civitai_bot.asyncio, "create_subprocess_exec", create_subproc
-            ), patch.object(
-                civitai_bot.asyncio, "wait_for", _wait_for_raises_no_loop
-            ), patch.object(civitai_bot.asyncio, "sleep", sleep_mock):
+        with caplog.at_level(logging.INFO, logger="civitai-bot"), patch.object(
+            civitai_bot.asyncio, "create_subprocess_exec", create_subproc
+        ), patch.object(
+            civitai_bot.asyncio, "wait_for", _wait_for_raises_no_loop
+        ), patch.object(civitai_bot.asyncio, "sleep", sleep_mock):
+            civitai_bot._shutdown_requested = False
+            try:
+                await scheduled_scan_cron()  # MUST NOT RAISE
+            finally:
                 civitai_bot._shutdown_requested = False
-                try:
-                    await scheduled_scan_cron()  # MUST NOT RAISE
-                finally:
-                    civitai_bot._shutdown_requested = False
 
         # terminate() was called (SIGTERM sent to subprocess)
         proc.terminate.assert_called_once()
