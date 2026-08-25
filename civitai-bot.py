@@ -356,7 +356,14 @@ def _load_interval() -> int:
 
 
 def _save_interval(seconds: int) -> None:
-    INTERVAL_CONFIG.write_text(json.dumps({"seconds": seconds}))
+    """Persist scan interval atomically (tmp + rename) to match other state files."""
+    tmp = INTERVAL_CONFIG.with_suffix(INTERVAL_CONFIG.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        f.write(json.dumps({"seconds": seconds}))
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(INTERVAL_CONFIG)
+    INTERVAL_CONFIG.chmod(0o600)
 
 
 _scan_interval: int = 600

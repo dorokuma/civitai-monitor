@@ -33,7 +33,7 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import requests
 
@@ -88,6 +88,7 @@ from state_store import (  # noqa: E402
     PENDING_CONFIRM_SECONDS,
     PENDING_MAX_RETRIES,
     PendingMap,
+    StateWriteError,
     adopt_stale_inflight,
     clear_inflight,
     clear_pending,
@@ -123,6 +124,43 @@ from telegram_media import (  # noqa: E402
 # Per-item timeouts (seconds) for downloads
 IMAGE_DOWNLOAD_TIMEOUT = 120
 VIDEO_DOWNLOAD_TIMEOUT = 120
+
+
+# ---------------------------------------------------------------------------
+# Download result classification
+# ---------------------------------------------------------------------------
+
+# HTTP status codes that indicate the resource is gone for good — retrying
+# won't help, so the item is flagged as pushed to avoid an infinite loop.
+_PERMANENT_HTTP_STATUSES = frozenset({401, 403, 404, 410, 451})
+
+
+class DownloadResult(NamedTuple):
+    """Result of a download attempt.
+
+    ``success`` — file was downloaded and renamed to its final path.
+    ``permanent`` — on failure, True means the error won't succeed on retry
+    (404/410/403/401/451). Transient failures (timeout, 5xx, connection
+    error) set ``permanent=False`` so the caller can keep the item un-pushed
+    for the next scan.
+    """
+
+    success: bool
+    permanent: bool = False
+
+
+def _is_permanent_request_error(exc: requests.RequestException) -> bool:
+    """Return True for HTTP errors that won't succeed on retry (4xx gone).
+
+    Timeout, ConnectionError, 5xx and 429 are transient — the caller should
+    keep the item un-pushed so the next scan can retry.
+    """
+    resp = getattr(exc, "response", None)
+    if resp is not None and resp.status_code in _PERMANENT_HTTP_STATUSES:
+        return True
+    # An HTTPError raised manually (e.g. download_video's "last status")
+    # without a .response is treated as transient by default.
+    return False
 
 LOCK_PATH = SCRIPT_DIR / LOCK_FILE_NAME
 STATUS_PATH = SCRIPT_DIR / STATUS_FILE_NAME
@@ -166,25 +204,26 @@ def normalize_to_original(
 # ---------------------------------------------------------------------------
 
 
-def download_image(url: str, save_path: Path, timeout: int = 120) -> bool:
+def download_image(url: str, save_path: Path, timeout: int = 120) -> DownloadResult:
     if save_path.exists():
         log.info("Already exists: %s, skipped", save_path.name)
-        return True
+        return DownloadResult(True)
+    tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
     try:
         with safe_get(url, stream=True, timeout=timeout) as resp:
             resp.raise_for_status()
             save_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
             with open(tmp_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=65536):
                     if chunk:
                         f.write(chunk)
             tmp_path.rename(save_path)
             log.info("Downloaded: %s (%d bytes)", save_path.name, save_path.stat().st_size)
-            return True
+            return DownloadResult(True)
     except requests.RequestException as e:
+        tmp_path.unlink(missing_ok=True)
         log.warning("Image download failed for %s: %s", url, e)
-        return False
+        return DownloadResult(False, _is_permanent_request_error(e))
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +231,7 @@ def download_image(url: str, save_path: Path, timeout: int = 120) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
+def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> DownloadResult:
     """Download a full-quality video from Civitai CDN.
 
     Strategy:
@@ -207,7 +246,8 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
     """
     if save_path.exists():
         log.info("Already exists: %s, skipped", save_path.name)
-        return True
+        return DownloadResult(True)
+    tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
     try:
         with safe_get(url, stream=True) as resp:
             resp.raise_for_status()
@@ -241,14 +281,13 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
                             "Video too large (%.1f MB > %d MB), skipping",
                             cl_int / 1024 / 1024, max_size_mb,
                         )
-                        return False
+                        return DownloadResult(False, True)
                     if not cl and max_bytes:
                         log.info(
                             "Video size unknown (no Content-Length), streaming with %d MB cap",
                             max_size_mb,
                         )
                     save_path.parent.mkdir(parents=True, exist_ok=True)
-                    tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
                     downloaded = 0
                     try:
                         with open(tmp_path, "wb") as f:
@@ -271,17 +310,17 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
                             save_path.name,
                             save_path.stat().st_size / 1024 / 1024,
                         )
-                        return True
+                        return DownloadResult(True)
                     except _VideoSizeCapExceeded:
                         try:
                             tmp_path.unlink(missing_ok=True)
                         except OSError:
                             pass
-                        return False
+                        return DownloadResult(False, True)
                 last_status = resp.status_code
                 if resp.status_code == 404:
                     log.warning("B2 /original 404 — video file not available on CDN")
-                    return False
+                    return DownloadResult(False, True)
                 if attempt < 2:
                     log.info(
                         "B2 /original returned %d, retrying (%d/3)...",
@@ -290,8 +329,9 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> bool:
                     time.sleep(2 ** attempt)
         raise requests.HTTPError(f"Video fetch failed (last status {last_status})")
     except requests.RequestException as e:
+        tmp_path.unlink(missing_ok=True)
         log.warning("Video download failed for %s: %s", url, e)
-        return False
+        return DownloadResult(False, _is_permanent_request_error(e))
 
 
 class _VideoSizeCapExceeded(Exception):
@@ -311,11 +351,24 @@ def _record_push_success(
     pushed_dir: Path | None,
     tg_id: str | None,
 ) -> None:
-    """Mark ``item_id`` as pushed and flush to disk immediately."""
+    """Mark ``item_id`` as pushed and flush to disk immediately.
+
+    Raises ``StateWriteError`` if the disk write fails — the caller must NOT
+    treat the item as pushed in that case (inflight/pending recovery handles
+    it on the next scan). On failure ``pushed_ids`` is rolled back so the
+    in-memory set stays consistent with the missing on-disk entry.
+    """
     if pushed_ids is None or pushed_dir is None or tg_id is None:
         return
     pushed_ids.add(item_id)
-    save_pushed_ids(pushed_dir, tg_id, username, pushed_ids)
+    try:
+        save_pushed_ids(pushed_dir, tg_id, username, pushed_ids)
+    except StateWriteError:
+        # Rollback: the id was not persisted. Remove from the in-memory set
+        # so it is NOT treated as pushed. inflight stays set so the next
+        # scan's adopt_stale_inflight will convert it to pending.
+        pushed_ids.discard(item_id)
+        raise
     clear_pending(pushed_dir, tg_id, username, item_id)
     clear_inflight(pushed_dir, tg_id, username, item_id)
 
@@ -330,8 +383,6 @@ def _finalize_send_outcome(
     tg_id: str | None,
 ) -> bool:
     """Apply lifecycle bookkeeping for a send outcome. Returns confirmed-success bool."""
-    if pushed_dir is not None and tg_id is not None:
-        clear_inflight(pushed_dir, tg_id, username, item_id)
     if outcome is True:
         _record_push_success(
             item_id, username,
@@ -339,17 +390,28 @@ def _finalize_send_outcome(
         )
         return True
     if outcome is None:
+        # Uncertain delivery (e.g. Telegram timeout). Park as pending so the
+        # next scan can retry — but ONLY after the pending state is persisted.
+        # Order: mark_pending (write state) → on success → clear_inflight.
+        # This is isomorphic to the outcome=True path (save_pushed_ids → clear).
+        # If mark_pending raises StateWriteError, inflight stays set so the
+        # next scan's adopt_stale_inflight handles it. Without clearing
+        # inflight here, adopt_stale_inflight would re-adopt the id with
+        # retries=0 on every scan, bypassing PENDING_MAX_RETRIES.
         if pushed_dir is not None and tg_id is not None:
             existing = load_pending_map(pushed_dir, tg_id, username)
             prev_retries = existing[item_id][1] if item_id in existing else 0
             retries = max(prev_retries, 0)
             mark_pending(pushed_dir, tg_id, username, item_id, retries=retries)
+            clear_inflight(pushed_dir, tg_id, username, item_id)
             log.info(
                 "Parked id=%d for @%s as pending (uncertain delivery, retries=%d)",
                 item_id, username, retries,
             )
         return False
+    # outcome is False: send definitively failed.
     if pushed_dir is not None and tg_id is not None:
+        clear_inflight(pushed_dir, tg_id, username, item_id)
         clear_pending(pushed_dir, tg_id, username, item_id)
     return False
 
@@ -384,12 +446,63 @@ def process_and_push(
 
     def _send(text: str, files: list[Path] | None) -> bool:
         if pushed_dir is not None and tg_id is not None:
-            mark_inflight(pushed_dir, tg_id, username, item_id)
+            try:
+                mark_inflight(pushed_dir, tg_id, username, item_id)
+            except StateWriteError:
+                log.error(
+                    "Failed to mark inflight for id=%d @%s, proceeding without "
+                    "crash-recovery guard",
+                    item_id, username,
+                )
         outcome = send_to_telegram(bot_token, chat_id, text, files)
-        return _finalize_send_outcome(
-            outcome, item_id, username,
-            pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
-        )
+        try:
+            return _finalize_send_outcome(
+                outcome, item_id, username,
+                pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
+            )
+        except StateWriteError:
+            # save_pushed_ids (outcome=True) or mark_pending (outcome=None)
+            # failed: the item state was NOT persisted. inflight stays set
+            # (not cleared) so adopt_stale_inflight will convert it to pending
+            # on the next scan. Skip this item and continue processing the rest.
+            log.error(
+                "State write failed for id=%d @%s; inflight left for next scan recovery",
+                item_id, username,
+            )
+            return False
+
+    def _send_transient_download_failure(text: str) -> bool:
+        """Send a text-only notice for a transient download failure.
+
+        The item is parked as pending (reusing the existing retries counter)
+        so the next scan can retry the full download+push. It is NOT marked
+        as pushed — the user should get another chance to receive the media.
+        The retry count is capped by PENDING_MAX_RETRIES via the existing
+        pending mechanism in _fetch_and_process_page.
+        """
+        if pushed_dir is not None and tg_id is not None:
+            try:
+                mark_inflight(pushed_dir, tg_id, username, item_id)
+            except StateWriteError:
+                log.error(
+                    "Failed to mark inflight for id=%d @%s, proceeding without "
+                    "crash-recovery guard",
+                    item_id, username,
+                )
+        send_to_telegram(bot_token, chat_id, text, None)
+        if pushed_dir is not None and tg_id is not None:
+            existing = load_pending_map(pushed_dir, tg_id, username)
+            prev_retries = existing[item_id][1] if item_id in existing else 0
+            try:
+                mark_pending(pushed_dir, tg_id, username, item_id, retries=prev_retries)
+                clear_inflight(pushed_dir, tg_id, username, item_id)
+            except StateWriteError:
+                log.error(
+                    "State write failed for id=%d @%s; pending/inflight "
+                    "may be inconsistent",
+                    item_id, username,
+                )
+        return False
 
     if is_video:
         video_url = item.get("url") or item.get("meta", {}).get("videoUrl", "")
@@ -398,38 +511,68 @@ def process_and_push(
             return False
 
         filepath = output_dir / "videos" / f"{item_id}.mp4"
-        success = download_video(video_url, filepath, max_video_size_mb)
+        dl = download_video(video_url, filepath, max_video_size_mb)
 
-        status = " ✅" if success else " ⚠️（视频下载失败，请在 Civitai 页面查看）"
-        text = (
-            f"🎥 *New video by @{safe_user}*{status}\n"
-            f"🔗 [View on Civitai]({civitai_url})\n"
-            f"🕐 {created_at}"
-        )
-        pushed = _send(text, [filepath] if success else None)
+        if dl.success:
+            text = (
+                f"🎥 *New video by @{safe_user}* ✅\n"
+                f"🔗 [View on Civitai]({civitai_url})\n"
+                f"🕐 {created_at}"
+            )
+            pushed = _send(text, [filepath])
+        elif dl.permanent:
+            text = (
+                f"🎥 *New video by @{safe_user}* ⚠️（视频下载失败，请在 Civitai 页面查看）\n"
+                f"🔗 [View on Civitai]({civitai_url})\n"
+                f"🕐 {created_at}"
+            )
+            pushed = _send(text, None)
+        else:
+            # Transient failure: notify but do NOT mark pushed — retry next scan.
+            text = (
+                f"🎥 *New video by @{safe_user}* ⚠️（视频暂不可用，将在下次扫描重试）\n"
+                f"🔗 [View on Civitai]({civitai_url})\n"
+                f"🕐 {created_at}"
+            )
+            pushed = _send_transient_download_failure(text)
         log.info(
-            "Pushed %s %s to @%s | id=%d file=%s success=%s push=%s",
-            "video", "✅" if pushed else "❌", username, item_id,
-            filepath.name if success else "none", success, pushed,
+            "Pushed video %s to @%s | id=%d file=%s success=%s push=%s",
+            "✅" if pushed else "❌", username, item_id,
+            filepath.name if dl.success else "none", dl.success, pushed,
         )
         return pushed
 
     orig_url = normalize_to_original(item.get("url", ""), size_suffixes)
     ext = os.path.splitext(orig_url.split("/")[-1])[1] or ".jpeg"
     filepath = output_dir / f"{item_id}{ext}"
-    success = download_image(orig_url, filepath)
+    dl = download_image(orig_url, filepath)
 
-    status = " ✅" if success else " ⚠️（图片下载失败，请在 Civitai 页面查看）"
-    text = (
-        f"🖼 *New artwork by @{safe_user}*{status}\n"
-        f"🔗 [View on Civitai]({civitai_url})\n"
-        f"🕐 {created_at}"
-    )
-    pushed = _send(text, [filepath] if success else None)
+    if dl.success:
+        text = (
+            f"🖼 *New artwork by @{safe_user}* ✅\n"
+            f"🔗 [View on Civitai]({civitai_url})\n"
+            f"🕐 {created_at}"
+        )
+        pushed = _send(text, [filepath])
+    elif dl.permanent:
+        text = (
+            f"🖼 *New artwork by @{safe_user}* ⚠️（图片下载失败，请在 Civitai 页面查看）\n"
+            f"🔗 [View on Civitai]({civitai_url})\n"
+            f"🕐 {created_at}"
+        )
+        pushed = _send(text, None)
+    else:
+        # Transient failure: notify but do NOT mark pushed — retry next scan.
+        text = (
+            f"🖼 *New artwork by @{safe_user}* ⚠️（图片暂不可用，将在下次扫描重试）\n"
+            f"🔗 [View on Civitai]({civitai_url})\n"
+            f"🕐 {created_at}"
+        )
+        pushed = _send_transient_download_failure(text)
     log.info(
-        "Pushed %s %s to @%s | id=%d file=%s success=%s push=%s",
-        "image", "✅" if pushed else "❌", username, item_id,
-        filepath.name if success else "none", success, pushed,
+        "Pushed image %s to @%s | id=%d file=%s success=%s push=%s",
+        "✅" if pushed else "❌", username, item_id,
+        filepath.name if dl.success else "none", dl.success, pushed,
     )
     return pushed
 
@@ -815,19 +958,6 @@ def _acquire_process_lock() -> int | None:
     return lock_fd
 
 
-def _is_scan_running() -> bool:
-    lock_file = SCRIPT_DIR / LOCK_FILE_NAME
-    try:
-        pid_str = lock_file.read_text().strip()
-        if pid_str:
-            pid = int(pid_str)
-            os.kill(pid, 0)
-            return True
-    except (ValueError, ProcessLookupError, OSError, FileNotFoundError):
-        pass
-    return False
-
-
 def _write_status(
     *,
     start_time: "_dt.datetime",
@@ -893,7 +1023,15 @@ def _process_single_creator(
     max_video_size_mb: int,
     incremental_max_pages: int,
 ) -> tuple[set[int], int]:
-    """Run a single creator through incremental or full mode."""
+    """Run a single creator through incremental or full mode.
+
+    Catches ``StateWriteError`` from any state-persistence call inside
+    run_full / run_incremental so that a lock timeout for one creator
+    does not crash the entire scan process (which would be worse than
+    the old silent-failure behavior under systemd Restart=always). The
+    creator is skipped with an error log; its in-flight items remain
+    for the next scan's adopt_stale_inflight recovery.
+    """
     seen_ids = load_seen_ids(seen_dir, tg_id_str, username)
     common: dict[str, Any] = {
         "username": username,
@@ -910,20 +1048,28 @@ def _process_single_creator(
         "video_enabled": video_enabled,
         "max_video_size_mb": max_video_size_mb,
     }
-    if mode == "full":
-        user_seen = run_full(
-            **common,
-            shutdown_flag=lambda: _monitor_shutdown_requested,
-        )
-    else:
-        user_seen = run_incremental(**common, max_pages=incremental_max_pages)
+    try:
+        if mode == "full":
+            user_seen = run_full(
+                **common,
+                shutdown_flag=lambda: _monitor_shutdown_requested,
+            )
+        else:
+            user_seen = run_incremental(**common, max_pages=incremental_max_pages)
 
-    if not user_seen:
+        if not user_seen:
+            return seen_ids, 0
+        union = seen_ids | user_seen
+        if len(union) <= len(seen_ids):
+            return seen_ids, 0
+        save_seen_ids(seen_dir, tg_id_str, username, union)
+    except StateWriteError:
+        log.error(
+            "State persistence failed for @%s (TG:%s); skipping this creator. "
+            "In-flight items will be recovered on the next scan.",
+            username, tg_id_str,
+        )
         return seen_ids, 0
-    union = seen_ids | user_seen
-    if len(union) <= len(seen_ids):
-        return seen_ids, 0
-    save_seen_ids(seen_dir, tg_id_str, username, union)
     new_count = len(union) - len(seen_ids)
     log.info(
         "Merged %d new IDs for @%s (TG:%s) (total: %d)",

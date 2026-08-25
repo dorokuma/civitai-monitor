@@ -174,6 +174,12 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now civitai-bot
 ```
 
+> **Single-instance constraint**: this service relies on local `fcntl` file
+> locks (`.monitor.lock`) for mutual exclusion. It **must run on a single
+> host as a single instance only**. Multi-host or multi-instance deployment
+> invalidates these locks and will cause **duplicate downloads and duplicate
+> pushes** to your Telegram channel.
+
 ---
 
 ## Video Download: Cookies Guide

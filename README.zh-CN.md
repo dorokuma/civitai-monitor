@@ -170,6 +170,10 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now civitai-bot
 ```
 
+> **单实例约束**：本服务依赖本地 `fcntl` 文件锁（`.monitor.lock`）实现互斥，
+> **只能单主机单实例运行**。多主机或多实例部署会导致锁失效，引发
+> **重复下载与重复推送**。
+
 ---
 
 ## 视频下载：Cookies 获取教程

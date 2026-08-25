@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -20,6 +21,33 @@ PENDING_MAX_RETRIES = 1
 
 # Pending records: id → (ts, retries). Legacy on-disk value may be a bare float.
 PendingMap = dict[int, tuple[float, int]]
+
+
+class StateWriteError(Exception):
+    """Raised when a state file cannot be persisted to disk.
+
+    FileLock timeout after 3 attempts means the caller MUST NOT treat the
+    item as saved — otherwise the in-memory state diverges from disk and a
+    crash causes a duplicate push. Callers should catch this, skip the
+    current item, and let inflight/pending recovery handle it on the next
+    scan.
+    """
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically: tmp → flush+fsync → rename.
+
+    The fsync before rename lowers the window where a system-level crash
+    loses the last write (rename is atomic on the same filesystem, but
+    the tmp file's data may still be in the page cache).
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)
+    path.chmod(0o600)
 
 
 def _safe_user_token(username: str) -> str:
@@ -62,26 +90,28 @@ def _save_lock_path(seen_dir: Path, name: str = "save") -> Path:
 
 
 def save_seen_ids(seen_dir: Path, tg_id: str, username: str, ids: set[int]) -> None:
-    """Save seen IDs for a specific (Telegram user, Civitai user) pair."""
+    """Save seen IDs for a specific (Telegram user, Civitai user) pair.
+
+    Raises ``StateWriteError`` if the file lock cannot be acquired after 3
+    attempts — callers must treat the save as failed (the in-memory set
+    was not persisted).
+    """
     path = seen_file_for_user(seen_dir, tg_id, username)
     lock_path = _save_lock_path(seen_dir, name="seen")
     for attempt in range(3):
         try:
             with FileLock(str(lock_path), timeout=10):
-                # Atomic write: temp file + rename to prevent corruption on crash
-                tmp = path.with_suffix(".tmp")
-                tmp.write_text(json.dumps(sorted(ids), indent=2))
-                tmp.rename(path)
-                path.chmod(0o600)
+                # Atomic write: temp file + fsync + rename to prevent corruption on crash
+                _atomic_write(path, json.dumps(sorted(ids), indent=2))
             log.info("Saved %d seen IDs for @%s", len(ids), username)
-            break
+            return
         except Timeout:
             if attempt < 2:
                 time.sleep(2)
             else:
-                log.warning(
-                    "Timeout saving %d seen IDs for @%s, skipped after 3 attempts",
-                    len(ids), username,
+                raise StateWriteError(
+                    f"Timeout saving {len(ids)} seen IDs for @{username} "
+                    f"after 3 attempts (lock: {lock_path})"
                 )
 
 
@@ -109,6 +139,9 @@ def save_pushed_ids(pushed_dir: Path, tg_id: str, username: str, ids: set[int]) 
     Merge-on-write avoids clobbering IDs saved by an earlier crash-recovery
     path or a concurrent writer. The caller's ``ids`` set is updated in place
     to the merged result so in-memory state stays consistent with disk.
+
+    Raises ``StateWriteError`` if the file lock cannot be acquired after 3
+    attempts — callers must NOT treat the item as pushed in that case.
     """
     path = pushed_file_for_user(pushed_dir, tg_id, username)
     lock_path = _save_lock_path(pushed_dir, name="pushed")
@@ -125,22 +158,19 @@ def save_pushed_ids(pushed_dir: Path, tg_id: str, username: str, ids: set[int]) 
                             username,
                         )
                 merged = on_disk | set(ids)
-                tmp = path.with_suffix(".tmp")
-                tmp.write_text(json.dumps(sorted(merged), indent=2))
-                tmp.rename(path)
-                path.chmod(0o600)
+                _atomic_write(path, json.dumps(sorted(merged), indent=2))
                 # Keep caller set in sync with the merged disk view.
                 ids.clear()
                 ids.update(merged)
             log.info("Saved %d pushed IDs for @%s", len(merged), username)
-            break
+            return
         except Timeout:
             if attempt < 2:
                 time.sleep(2)
             else:
-                log.warning(
-                    "Timeout saving %d pushed IDs for @%s, skipped after 3 attempts",
-                    len(ids), username,
+                raise StateWriteError(
+                    f"Timeout saving {len(ids)} pushed IDs for @{username} "
+                    f"after 3 attempts (lock: {lock_path})"
                 )
 
 
@@ -183,10 +213,7 @@ def load_push_timestamps(state_dir: Path, kind: str, tg_id: str, username: str) 
 def _write_push_timestamps(path: Path, data: dict[int, float]) -> None:
     """Atomic rewrite of an id→ts map (caller must hold the lock)."""
     serializable = {str(k): v for k, v in sorted(data.items())}
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(serializable, indent=2))
-    tmp.rename(path)
-    path.chmod(0o600)
+    _atomic_write(path, json.dumps(serializable, indent=2))
 
 
 def update_push_timestamps(
@@ -198,7 +225,10 @@ def update_push_timestamps(
     add: dict[int, float] | None = None,
     remove: set[int] | None = None,
 ) -> dict[int, float]:
-    """Merge add / remove into an inflight-style float map under a file lock."""
+    """Merge add / remove into an inflight-style float map under a file lock.
+
+    Raises ``StateWriteError`` if the lock cannot be acquired after 3 attempts.
+    """
     path = _push_state_file(state_dir, kind, tg_id, username)
     lock_path = _save_lock_path(state_dir, name=f"{kind}_push")
     for attempt in range(3):
@@ -222,9 +252,9 @@ def update_push_timestamps(
             if attempt < 2:
                 time.sleep(2)
             else:
-                log.warning(
-                    "Timeout updating %s push state for @%s after 3 attempts",
-                    kind, username,
+                raise StateWriteError(
+                    f"Timeout updating {kind} push state for @{username} "
+                    f"after 3 attempts (lock: {lock_path})"
                 )
     return load_push_timestamps(state_dir, kind, tg_id, username)
 
@@ -282,10 +312,7 @@ def _write_pending_map(path: Path, data: PendingMap) -> None:
         str(k): {"ts": ts, "retries": retries}
         for k, (ts, retries) in sorted(data.items())
     }
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(serializable, indent=2))
-    tmp.rename(path)
-    path.chmod(0o600)
+    _atomic_write(path, json.dumps(serializable, indent=2))
 
 
 def update_pending_map(
@@ -296,7 +323,10 @@ def update_pending_map(
     add: PendingMap | None = None,
     remove: set[int] | None = None,
 ) -> PendingMap:
-    """Merge add/remove into the pending map under lock; atomic rewrite."""
+    """Merge add/remove into the pending map under lock; atomic rewrite.
+
+    Raises ``StateWriteError`` if the lock cannot be acquired after 3 attempts.
+    """
     path = _push_state_file(state_dir, "pending", tg_id, username)
     lock_path = _save_lock_path(state_dir, name="pending_push")
     for attempt in range(3):
@@ -320,9 +350,9 @@ def update_pending_map(
             if attempt < 2:
                 time.sleep(2)
             else:
-                log.warning(
-                    "Timeout updating pending push state for @%s after 3 attempts",
-                    username,
+                raise StateWriteError(
+                    f"Timeout updating pending push state for @{username} "
+                    f"after 3 attempts (lock: {lock_path})"
                 )
     return load_pending_map(state_dir, tg_id, username)
 
@@ -350,6 +380,12 @@ def clear_pending(state_dir: Path, tg_id: str, username: str, item_id: int) -> N
 def adopt_stale_inflight(state_dir: Path, tg_id: str, username: str) -> PendingMap:
     """Move any leftover inflight IDs into pending (crash mid-send recovery).
 
+    If a leftover inflight ID already has a pending entry (e.g. the process
+    crashed after mark_pending but before clear_inflight in the outcome=None
+    path), the existing retries count is preserved so the PENDING_MAX_RETRIES
+    cap is not bypassed. New inflight IDs (genuine crash mid-send, no prior
+    pending) are adopted with retries=0 as before.
+
     Returns the pending map after adoption.
     """
     inflight = load_push_timestamps(state_dir, "inflight", tg_id, username)
@@ -359,9 +395,19 @@ def adopt_stale_inflight(state_dir: Path, tg_id: str, username: str) -> PendingM
         "Adopting %d leftover inflight ID(s) as pending for @%s (crash recovery)",
         len(inflight), username,
     )
+    existing = load_pending_map(state_dir, tg_id, username)
+    # Preserve retries for IDs that already have a pending entry; adopt new
+    # inflight-only IDs with retries=0 (genuine crash mid-send).
+    add: PendingMap = {}
+    for iid, ts in inflight.items():
+        if iid in existing:
+            _ts, retries = existing[iid]
+            add[iid] = (ts, retries)
+        else:
+            add[iid] = (ts, 0)
     update_pending_map(
         state_dir, tg_id, username,
-        add={iid: (ts, 0) for iid, ts in inflight.items()},
+        add=add,
     )
     update_push_timestamps(state_dir, "inflight", tg_id, username, remove=set(inflight.keys()))
     return load_pending_map(state_dir, tg_id, username)
