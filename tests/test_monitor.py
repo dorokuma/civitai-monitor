@@ -36,7 +36,6 @@ from monitor import (
     save_seen_ids,
     seen_file_for_user,
     update_pending_map,
-    update_push_timestamps,
     write_config,
 )
 from monitor import MonitorConfig

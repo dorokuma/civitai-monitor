@@ -37,7 +37,7 @@ from collections import defaultdict
 from functools import wraps
 
 import requests
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, Update
 from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
@@ -1467,7 +1467,7 @@ def _summarise_log(stderr: str) -> str:
             seen.add(line)
             unique.append(line)
 
-    safe_lines = [l.replace(chr(96), chr(92)+chr(96)) for l in unique[-15:]]
+    safe_lines = [line.replace(chr(96), chr(92)+chr(96)) for line in unique[-15:]]
     return chr(96)*3 + chr(10) + chr(10).join(safe_lines) + chr(10) + chr(96)*3
 
 

@@ -19,5 +19,4 @@ jobs:
         run: pip install ruff
 
       - name: Run ruff
-        working-directory: /root/civitai-monitor
         run: ruff check .

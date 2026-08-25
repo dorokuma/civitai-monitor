@@ -22,5 +22,4 @@ jobs:
           pip install pytest pytest-asyncio
 
       - name: Run tests
-        working-directory: /root/civitai-monitor
         run: python -m pytest tests/ -v
