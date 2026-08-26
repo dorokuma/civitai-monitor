@@ -2,6 +2,11 @@
 
 This file follows the [Keep a Changelog](https://keepachangelog.com/) format, and version numbers follow [SemVer](https://semver.org/).
 
+## [1.1.4] - 2026-08-26
+
+### Fixed
+- Incremental scan requests `sort=Newest` from Civitai so newly published works are found on the first page instead of being missed by the default ordering.
+
 ## [1.1.3] - 2026-08-08
 
 ### Added

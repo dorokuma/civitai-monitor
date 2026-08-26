@@ -730,7 +730,7 @@ def run_incremental(
             pushed_ids = load_pushed_ids(seen_dir, tg_id, username)
             new_on_page, page_ids, next_cursor = _fetch_and_process_page(
                 username, nsfw_flag, cursor, all_seen, pushed_ids,
-                base_url=base_url, limit=limit, sort=None,
+                base_url=base_url, limit=limit, sort="Newest",
                 size_suffixes=size_suffixes, output_dir=output_dir,
                 bot_token=bot_token, chat_id=chat_id,
                 video_enabled=video_enabled, max_video_size_mb=max_video_size_mb,
