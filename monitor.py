@@ -782,6 +782,12 @@ def run_incremental(
 # Full mode (backfill)
 # ---------------------------------------------------------------------------
 
+# Hard safety caps for the per-track backfill walk. A content-bearing cursor
+# loop or a pathological API can otherwise make run_full never terminate,
+# holding the process lock and stalling scheduled scans.
+MAX_FULL_PAGES_PER_TRACK = 500  # hard cap: phinjo runs ~130 pages @ 100/page
+MAX_CONSECUTIVE_EMPTY_PAGES = 3  # stop after this many consecutive empty pages
+
 
 def run_full(
     username: str,
@@ -809,12 +815,20 @@ def run_full(
         log.info("── %s track for @%s ──", label, username)
         cursor = ""
         page = 0
+        consecutive_empty_pages = 0
+        visited_cursors: set[str] = set()
 
         while True:
             if shutdown_flag():
                 log.info("%s: shutdown requested, stopping at page %d", label, page)
                 break
             page += 1
+            if page > MAX_FULL_PAGES_PER_TRACK:
+                log.warning(
+                    "%s: reached hard page cap of %d pages, stopping backfill "
+                    "(possible unguarded loop)", label, MAX_FULL_PAGES_PER_TRACK,
+                )
+                break
             pushed_ids = load_pushed_ids(seen_dir, tg_id, username)
             new_on_page, page_ids, next_cursor = _fetch_and_process_page(
                 username, nsfw_flag, cursor, all_seen, pushed_ids,
@@ -825,10 +839,39 @@ def run_full(
                 pushed_dir=seen_dir, tg_id=tg_id,
             )
 
+            # Cursor-loop guard: remember every cursor we walked; if the API
+            # hands back an already-visited cursor the pagination is looping
+            # (content pages can still cycle), so stop instead of spinning.
+            visited_cursors.add(cursor)
+            if next_cursor and next_cursor in visited_cursors:
+                log.warning(
+                    "%s: cursor %r already visited at page %d, stopping backfill "
+                    "(API cursor loop)", label, next_cursor, page,
+                )
+                break
+
             if not page_ids:
+                if next_cursor:
+                    # Empty page but API still has a next cursor: keep walking.
+                    # Guard against infinite loops on pathological empty runs.
+                    consecutive_empty_pages += 1
+                    log.info(
+                        "%s: page %d empty but nextCursor present, continuing "
+                        "(consecutive empty: %d)", label, page, consecutive_empty_pages,
+                    )
+                    if consecutive_empty_pages >= MAX_CONSECUTIVE_EMPTY_PAGES:
+                        log.warning(
+                            "%s: %d consecutive empty pages, stopping backfill",
+                            label, consecutive_empty_pages,
+                        )
+                        break
+                    cursor = next_cursor
+                    time.sleep(2.0 + random.random() * 1.0)
+                    continue
                 log.info("%s: exhausted after %d pages", label, page - 1)
                 break
 
+            consecutive_empty_pages = 0
             all_seen.update(page_ids)
 
             if new_on_page:

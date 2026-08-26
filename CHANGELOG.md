@@ -2,6 +2,17 @@
 
 This file follows the [Keep a Changelog](https://keepachangelog.com/) format, and version numbers follow [SemVer](https://semver.org/).
 
+## [1.1.5] - 2026-08-26
+
+### Fixed
+- `fetch_page` keeps the API `nextCursor` even on empty pages, and `run_full` continues walking on `([], next_cursor)` instead of dropping the cursor and missing later works.
+- `run_full` stops after 3 consecutive empty pages, so pathological empty runs cannot loop forever.
+
+### Added
+- `run_full` detects API cursor loops via a `visited_cursors` set and breaks out of content-bearing pagination cycles.
+- `run_full` hard per-track page cap (`MAX_FULL_PAGES_PER_TRACK = 500`) so an endless track cannot hold the process lock.
+- Regression tests covering empty-page cursor preservation, consecutive-empty guard, cursor-loop detection, and the page cap.
+
 ## [1.1.4] - 2026-08-26
 
 ### Fixed

@@ -135,11 +135,13 @@ def fetch_page(
     """Fetch one page of images for a user.
 
     Uses cursor-based pagination (Civitai API page parameter is broken).
-    Returns (items, next_cursor) where next_cursor is empty when there are no more pages.
+    Returns (items, next_cursor); next_cursor is empty when there are no more
+    pages. An empty page may still return a non-empty next_cursor from the API
+    metadata, so callers must keep walking on ``([], next_cursor)`` rather than
+    treating an empty page as the end of the gallery.
 
     Raises:
         FetchPageError: on network / HTTP hard failures after retries.
-        True empty pages still return ``([], "")``.
     """
     # Clamp `limit` to the Civitai-allowed range.
     limit = max(MIN_API_PAGE_LIMIT, min(int(limit), MAX_API_PAGE_LIMIT))
@@ -180,7 +182,7 @@ def fetch_page(
             items = fallback_resp.json().get("items", [])
             resp = fallback_resp
 
-        next_cursor = resp.json().get("metadata", {}).get("nextCursor", "") if items else ""
+        next_cursor = resp.json().get("metadata", {}).get("nextCursor", "")
         return items, next_cursor
     except requests.RequestException as e:
         log.warning("Page query failed (nsfw=%s): %s", nsfw, e)

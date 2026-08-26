@@ -1079,3 +1079,164 @@ class TestClearStatusInterrupted:
         m._clear_status(False, _dt.datetime.now(_dt.timezone.utc))
         assert not status.exists()
 
+
+# ---------------------------------------------------------------------------
+# Empty-page cursor regression (run_full backfill structural page skip)
+# ---------------------------------------------------------------------------
+
+
+class TestFetchPageCursorOnEmptyItems:
+    """fetch_page must return the metadata nextCursor even when items is
+    empty, so run_full can keep walking instead of losing the cursor."""
+
+    def _mock_response(self, items=None, next_cursor=""):
+        resp = MagicMock()
+        resp.json.return_value = {
+            "items": items or [],
+            "metadata": {"nextCursor": next_cursor},
+        }
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    def test_returns_metadata_cursor_when_items_empty(self):
+        with patch("civitai_client.safe_get") as mock_get:
+            mock_get.return_value = self._mock_response(items=[], next_cursor="cur123")
+            fetched, cursor = fetch_page("alice", nsfw=False, sort="Newest")
+        assert fetched == []
+        assert cursor == "cur123"
+
+    def test_fallback_response_also_returns_metadata_cursor(self):
+        """The Newest-fallback retry path must also preserve a cursor."""
+        first = self._mock_response(items=[], next_cursor="")
+        second = self._mock_response(items=[], next_cursor="cur456")
+        with patch("civitai_client.safe_get") as mock_get:
+            mock_get.side_effect = [first, second]
+            fetched, cursor = fetch_page("alice", nsfw=False, sort="Newest")
+        assert fetched == []
+        assert cursor == "cur456"
+
+
+class TestRunFullEmptyPageCursor:
+    """run_full must not break on an empty page that still has a nextCursor,
+    and must stop after N consecutive empty pages (dead-loop guard)."""
+
+    @staticmethod
+    def _mock_process_page(results, calls):
+        def fake(username, nsfw_flag, cursor, seen_ids, pushed_ids, **kwargs):
+            calls.append(cursor)
+            return results.pop(0)
+        return fake
+
+    @staticmethod
+    def _run(m, tmp_path, results, calls):
+        return m.run_full(
+            "alice",
+            seen_ids=set(),
+            tg_id="tg1",
+            nsfw_setting="sfw_only",
+            output_dir=tmp_path,
+            size_suffixes=[],
+            bot_token="token",
+            chat_id="chat",
+            base_url="https://civitai.com",
+            limit=5,
+            video_enabled=False,
+            max_video_size_mb=10,
+            seen_dir=tmp_path,
+        )
+
+    def test_continues_past_empty_page_with_cursor(self, tmp_path, monkeypatch):
+        import monitor as m
+
+        results = [
+            ([{"id": 1}], {1}, "c1"),   # page 1: content
+            ([], set(), "c2"),          # page 2: empty but cursor present
+            ([{"id": 2}], {2}, ""),     # page 3: content, end
+        ]
+        calls = []
+        monkeypatch.setattr(m, "_fetch_and_process_page", self._mock_process_page(results, calls))
+        monkeypatch.setattr(m.time, "sleep", lambda *a, **k: None)
+
+        seen = self._run(m, tmp_path, results, calls)
+        # Walked page1 -> empty page2 (cursor preserved) -> page3, no break at page2
+        assert calls == ["", "c1", "c2"]
+        assert seen == {1, 2}
+
+    def test_stops_after_consecutive_empty_pages(self, tmp_path, monkeypatch):
+        import monitor as m
+
+        results = [
+            ([], set(), "c1"),
+            ([], set(), "c2"),
+            ([], set(), "c3"),
+            ([{"id": 9}], {9}, ""),   # must never be reached
+        ]
+        calls = []
+        monkeypatch.setattr(m, "_fetch_and_process_page", self._mock_process_page(results, calls))
+        monkeypatch.setattr(m.time, "sleep", lambda *a, **k: None)
+
+        seen = self._run(m, tmp_path, results, calls)
+        # 3 consecutive empty pages -> break before the 4th page
+        assert calls == ["", "c1", "c2"]
+        assert seen == set()
+
+    def test_recovers_after_empty_empty_content(self, tmp_path, monkeypatch):
+        """Empty-empty-content must reset consecutive_empty_pages to 0 and keep
+        walking: the 3-empty cap only counts *consecutive* empty pages."""
+        import monitor as m
+
+        results = [
+            ([], set(), "c1"),            # page 1: empty (cursor -> c1)
+            ([], set(), "c2"),            # page 2: empty (cursor -> c2)
+            ([{"id": 3}], {3}, "c3"),     # page 3: content (cursor -> c3)
+            ([], set(), "c4"),            # page 4: empty again (walked with c3)
+            ([], set(), "c5"),            # page 5: empty again
+            ([], set(), "c6"),            # page 6: empty again -> cap fires post-reset
+        ]
+        calls = []
+        monkeypatch.setattr(m, "_fetch_and_process_page", self._mock_process_page(results, calls))
+        monkeypatch.setattr(m.time, "sleep", lambda *a, **k: None)
+
+        seen = self._run(m, tmp_path, results, calls)
+        # Reset at page 3 means the cap fires at page 6 (3 empties after
+        # content), not at page 5; page 4 was walked with cursor c3, no break.
+        assert calls == ["", "c1", "c2", "c3", "c4", "c5"]
+        assert seen == {3}
+
+    def test_breaks_on_revisited_cursor(self, tmp_path, monkeypatch):
+        """A content-bearing cursor loop (nextCursor repeats a visited value)
+        must break instead of spinning forever."""
+        import monitor as m
+
+        results = [
+            ([{"id": 1}], {1}, "c1"),
+            ([{"id": 2}], {2}, "c1"),   # nextCursor repeats -> loop
+            ([{"id": 3}], {3}, "c3"),   # must never be reached
+        ]
+        calls = []
+        monkeypatch.setattr(m, "_fetch_and_process_page", self._mock_process_page(results, calls))
+        monkeypatch.setattr(m.time, "sleep", lambda *a, **k: None)
+
+        seen = self._run(m, tmp_path, results, calls)
+        # Loop detected after page 2, before a 3rd fetch
+        assert calls == ["", "c1"]
+        assert seen == {1}
+
+    def test_breaks_on_page_cap(self, tmp_path, monkeypatch):
+        """A track that never runs out of fresh cursors must stop at the hard
+        per-track page cap instead of walking forever."""
+        import monitor as m
+
+        monkeypatch.setattr(m, "MAX_FULL_PAGES_PER_TRACK", 5)
+        results = [
+            ([{"id": i}], {i}, f"c{i}") for i in range(1, 12)
+        ]
+        calls = []
+        monkeypatch.setattr(m, "_fetch_and_process_page", self._mock_process_page(results, calls))
+        monkeypatch.setattr(m.time, "sleep", lambda *a, **k: None)
+
+        seen = self._run(m, tmp_path, results, calls)
+        assert calls == ["", "c1", "c2", "c3", "c4"]
+        assert len(calls) == 5
+        assert seen == {1, 2, 3, 4, 5}
+
