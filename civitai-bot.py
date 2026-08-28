@@ -1001,10 +1001,8 @@ async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(msg, parse_mode="Markdown")
             return
         if proc.returncode != 0:
-            await update.message.reply_text(
-                f"❌ Scan failed (exit {proc.returncode}):\n`{stderr[-500:]}`",
-                parse_mode="Markdown",
-            )
+            reason = _classify_failure(proc.returncode, stderr)
+            await update.message.reply_text(f"❌ Scan failed: {reason}")
             return
         # Log output is on stderr; stdout is empty in incremental mode (no JSON output)
         # Try to extract meaningful info from stderr
@@ -1151,7 +1149,10 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
                     )
                     return
                 if result.returncode != 0:
-                    await query.message.reply_text(f"❌ 回填 @{username} 失败（exit {result.returncode}）\n{result.stderr[:500]}")
+                    stderr = result.stderr or ""
+                    reason = _classify_failure(result.returncode, stderr)
+                    log.warning("Backfill failed for username=%s returncode=%s stderr=%r", username, result.returncode, stderr[-4000:])
+                    await query.message.reply_text(f"❌ 回填 @{username} 失败：{reason}")
                     return
 
                 summary = _summarise_log(result.stderr)
@@ -1331,7 +1332,17 @@ async def _resume_backfill_task(application: Application, tg_id: str, username: 
             log.warning("Resumed backfill @%s — monitor busy, will retry next bot start", username)
             return
         if result.returncode != 0:
+            reason = _classify_failure(result.returncode, result.stderr or "")
             log.warning("Resumed backfill @%s failed (exit %d)", username, result.returncode)
+            # Notify user if chat_id is known
+            try:
+                chat_id = int(tg_id)
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ 重启后自动续接的回填 @{username} 失败：{reason}",
+                )
+            except Exception as e:
+                log.exception("Could not notify user %s: %s", tg_id, e)  # noqa: TRY401
             return
 
         log.info("Resumed backfill @%s completed successfully", username)
@@ -1439,6 +1450,26 @@ def _read_scan_status() -> str:
     except Exception:
         log.exception("Error generating status message (non-critical)")
         return ""
+
+
+def _classify_failure(returncode: int, stderr: str) -> str:
+    """Classify a monitor.py failure into a user-facing reason string.
+
+    Only the tail of stderr ([-2000:]) is inspected: fatal error lines are
+    always printed last, while non-fatal download warnings in the middle of
+    the log can contain timeout/503-like substrings and must not pollute the
+    classification. Returncode 75 (scan lock held) wins over any text.
+    """
+    tail = (stderr or "")[-2000:]
+    if returncode == 75:
+        return "另一个扫描进程正在运行，请稍后再试"
+    if "Service Unavailable" in tail or "503 Server Error" in tail:
+        return "Civitai API 暂时不可用（503），稍后可重试"
+    if "Rate Limited" in tail:
+        return "触发 Civitai 限流，请稍后再试"
+    if "Timeout" in tail or "timeout" in tail or "timed out" in tail:
+        return "网络请求超时，稍后可重试"
+    return "未知错误，详见服务日志"
 
 
 def _summarise_log(stderr: str) -> str:

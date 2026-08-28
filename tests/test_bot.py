@@ -664,3 +664,72 @@ async def test_error_handler_alerts_for_real_bugs(monkeypatch):
     assert len(sent) == 1
     assert "RuntimeError" in sent[0][1]
     assert "unexpected bug" in sent[0][1]
+
+
+# ---------------------------------------------------------------------------
+# Failure reason classification (_classify_failure)
+# ---------------------------------------------------------------------------
+
+class TestClassifyFailure:
+    """_classify_failure maps monitor.py failures to user-facing reasons.
+
+    Ordering matters: 75 (by returncode) > 503 > 429 > timeout > unknown.
+    Matching is restricted to the tail of stderr ([-2000:]) so non-fatal
+    download warnings in the middle of the log cannot pollute the class.
+    """
+
+    def test_exit_75_means_scan_running(self):
+        assert civitai_bot._classify_failure(75, "") == "另一个扫描进程正在运行，请稍后再试"
+
+    def test_exit_75_wins_over_stderr_text(self):
+        # returncode 75 is checked before any stderr content
+        stderr = "ERROR: 503 Server Error for url: https://civitai.com/api/v1/images"
+        assert civitai_bot._classify_failure(75, stderr) == "另一个扫描进程正在运行，请稍后再试"
+
+    def test_503_server_error_text(self):
+        stderr = (
+            "2025-01-01 12:00:00 ERROR FetchPageError: 503 Server Error "
+            "for url: https://civitai.com/api/v1/images"
+        )
+        assert civitai_bot._classify_failure(1, stderr) == "Civitai API 暂时不可用（503），稍后可重试"
+
+    def test_service_unavailable_text(self):
+        stderr = "ERROR: HTTP 503 Service Unavailable from the gateway"
+        assert civitai_bot._classify_failure(1, stderr) == "Civitai API 暂时不可用（503），稍后可重试"
+
+    def test_rate_limited_text(self):
+        stderr = "ERROR RateLimitError: 429 Rate Limited, retry after 30s"
+        assert civitai_bot._classify_failure(1, stderr) == "触发 Civitai 限流，请稍后再试"
+
+    def test_rate_limited_wins_over_timeout_text(self):
+        # 429 branch is checked before the timeout branch
+        stderr = "429 Rate Limited, retry after 120s -- read timed out meanwhile"
+        assert civitai_bot._classify_failure(1, stderr) == "触发 Civitai 限流，请稍后再试"
+
+    def test_read_timed_out_text(self):
+        stderr = "requests.exceptions.ReadTimeout: HTTPSConnectionPool ... Read timed out."
+        assert civitai_bot._classify_failure(1, stderr) == "网络请求超时，稍后可重试"
+
+    def test_unknown_text(self):
+        stderr = "ERROR: unexpected crash in some module"
+        assert civitai_bot._classify_failure(1, stderr) == "未知错误，详见服务日志"
+
+    def test_page_progress_count_with_plus_503_is_not_503(self):
+        # "+503 new" is a progress counter, not a 503 error
+        stderr = "page 3: +503 new"
+        assert civitai_bot._classify_failure(1, stderr) == "未知错误，详见服务日志"
+
+    def test_tail_only_matching_ignores_mid_log_download_warnings(self):
+        # Non-fatal download warning in the middle of the log contains
+        # "Read timed out", but the fatal line at the tail is a 503:
+        # tail matching must classify as 503, not timeout.
+        stderr = (
+            "12:00:00 WARN Image download failed for 12345: "
+            "Read timed out, retrying\n"
+            "12:00:01 WARN Image download failed for 67890: "
+            "Read timed out, retrying\n"
+            "12:00:02 ERROR: 503 Server Error for url: "
+            "https://civitai.com/api/v1/images"
+        )
+        assert civitai_bot._classify_failure(1, stderr) == "Civitai API 暂时不可用（503），稍后可重试"
+
