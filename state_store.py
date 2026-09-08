@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -411,3 +412,118 @@ def adopt_stale_inflight(state_dir: Path, tg_id: str, username: str) -> PendingM
     )
     update_push_timestamps(state_dir, "inflight", tg_id, username, remove=set(inflight.keys()))
     return load_pending_map(state_dir, tg_id, username)
+
+
+def backlog_alert_file(seen_dir: Path) -> Path:
+    """JSON file recording last backlog-truncation Telegram alert per (user, track)."""
+    seen_dir.mkdir(parents=True, exist_ok=True)
+    return seen_dir / "backlog_truncation_alerts.json"
+
+
+def claim_backlog_truncation_alert(
+    seen_dir: Path,
+    username: str,
+    track: str,
+    today: str | None = None,
+) -> bool:
+    """Atomically claim today's Telegram slot for ``(username, track)``.
+
+    Returns True if this caller should send the alert (and records *today*
+    on disk). Returns False if that pair was already alerted on *today*.
+    ``today`` is an ISO date (YYYY-MM-DD); defaults to the local date.
+
+    Cross-process safe via FileLock + ``_atomic_write``. On-disk shape::
+
+        {username: {track: "YYYY-MM-DD"}}
+    """
+    if not today:
+        today = date.today().isoformat()
+    path = backlog_alert_file(seen_dir)
+    lock_path = _save_lock_path(seen_dir, name="backlog_alert")
+    for attempt in range(3):
+        try:
+            with FileLock(str(lock_path), timeout=10):
+                state: dict[str, Any] = {}
+                if path.exists():
+                    try:
+                        raw = json.loads(path.read_text())
+                        if isinstance(raw, dict):
+                            state = raw
+                    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+                        log.warning(
+                            "Corrupt backlog truncation alert file, starting empty"
+                        )
+                        state = {}
+                user_state = state.get(username)
+                if not isinstance(user_state, dict):
+                    user_state = {}
+                if user_state.get(track) == today:
+                    return False
+                user_state[track] = today
+                state[username] = user_state
+                _atomic_write(path, json.dumps(state, indent=2))
+                return True
+        except Timeout:
+            if attempt < 2:
+                time.sleep(2)
+            else:
+                raise StateWriteError(
+                    f"Timeout claiming backlog truncation alert for @{username} "
+                    f"track {track} after 3 attempts (lock: {lock_path})"
+                )
+
+
+def rollback_backlog_truncation_alert(
+    seen_dir: Path,
+    username: str,
+    track: str,
+    today: str | None = None,
+) -> bool:
+    """Undo today's claim for ``(username, track)`` so a later scan can retry.
+
+    Returns True if the on-disk slot was cleared. Returns False if there
+    was nothing to undo (missing file, missing key, or stored date is not
+    *today* — never clobber a different day's record). ``today`` is an ISO
+    date (YYYY-MM-DD); defaults to the local date.
+
+    Cross-process safe via FileLock + ``_atomic_write``.
+    """
+    if not today:
+        today = date.today().isoformat()
+    path = backlog_alert_file(seen_dir)
+    lock_path = _save_lock_path(seen_dir, name="backlog_alert")
+    for attempt in range(3):
+        try:
+            with FileLock(str(lock_path), timeout=10):
+                if not path.exists():
+                    return False
+                try:
+                    raw = json.loads(path.read_text())
+                    if not isinstance(raw, dict):
+                        return False
+                    state = raw
+                except (json.JSONDecodeError, OSError, TypeError, ValueError):
+                    log.warning(
+                        "Corrupt backlog truncation alert file, skip rollback"
+                    )
+                    return False
+                user_state = state.get(username)
+                if not isinstance(user_state, dict):
+                    return False
+                if user_state.get(track) != today:
+                    return False
+                del user_state[track]
+                if user_state:
+                    state[username] = user_state
+                else:
+                    state.pop(username, None)
+                _atomic_write(path, json.dumps(state, indent=2))
+                return True
+        except Timeout:
+            if attempt < 2:
+                time.sleep(2)
+            else:
+                raise StateWriteError(
+                    f"Timeout rolling back backlog truncation alert for @{username} "
+                    f"track {track} after 3 attempts (lock: {lock_path})"
+                )

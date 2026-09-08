@@ -58,11 +58,12 @@ class IncrementalConfig(BaseModel):
 
     Incremental is designed to surface *new* content, not to walk an entire
     creator's history. ``max_pages`` caps how many pages we fetch per track
-    (SFW/NSFW) on any given scan, so a creator with 1k+ items does not push
+    (SFW/NSFW/ALL) on any given scan, so a creator with 1k+ items does not push
     the whole history on the very first run. To backfill the full history,
     use the ``/backfill <user>`` command (which runs ``--mode full``).
     """
-    max_pages: int = 5
+    max_pages: int = 50
+    hole_window_items: int = 500
 
 
 class BackfillConfig(BaseModel):
@@ -73,11 +74,28 @@ class BackfillConfig(BaseModel):
     )
 
 
+class ReconciliationConfig(BaseModel):
+    """Configuration for daily deep reconciliation mode."""
+    enabled: bool = True
+    time: str = Field(
+        default="03:30",
+        description="Daily execution time (HH:MM) in server local time"
+    )
+    max_pages_per_track: int = Field(
+        default=200,
+        description="Max pages to walk per track (SFW/NSFW/ALL) during reconciliation"
+    )
+    max_consecutive_no_new_pages: int = Field(
+        default=3,
+        description="Stop track walk after N consecutive pages with 0 new items"
+    )
+
+
 class MonitorConfig(BaseModel):
     users: list = Field(default_factory=list)
     subscriptions: dict[str, list] = Field(default_factory=dict)
     authorized_users: list[int] = Field(default_factory=list)
-    mode: Literal["incremental", "full"] = "incremental"
+    mode: Literal["incremental", "full", "reconcile"] = "incremental"
     nsfw: Literal["sfw_only", "nsfw_only", "both"] = "both"
     api: ApiConfig = Field(default_factory=ApiConfig)
     download: DownloadConfig = Field(default_factory=DownloadConfig)
@@ -86,6 +104,7 @@ class MonitorConfig(BaseModel):
     incremental: IncrementalConfig = Field(default_factory=IncrementalConfig)
     http: HttpConfig = Field(default_factory=HttpConfig)
     backfill: BackfillConfig = Field(default_factory=BackfillConfig)
+    reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
     video_enabled: bool = True
     max_video_size_mb: int = 1024
 
@@ -103,7 +122,7 @@ DEFAULT_CONFIG_PATHS = [
 ]
 
 VALID_NSFW = {"sfw_only", "nsfw_only", "both"}
-VALID_MODES = {"incremental", "full"}
+VALID_MODES = {"incremental", "full", "reconcile"}
 
 DATA_DIR_NAME = "seen_ids"
 STATUS_FILE_NAME = "monitor_status.json"

@@ -52,11 +52,11 @@ class TestNsfwTracks:
         assert nsfw_tracks("nsfw_only") == [True]
 
     def test_both(self):
-        assert nsfw_tracks("both") == [False, True]
+        assert nsfw_tracks("both") == [False, True, None]
 
     def test_unknown_defaults_to_both(self):
         result = nsfw_tracks("garbage")
-        assert result == [False, True]
+        assert result == [False, True, None]
 
 
 # ---------------------------------------------------------------------------
@@ -221,19 +221,27 @@ class TestFetchPageLimitClamp:
         sent = mock_get.call_args.kwargs["params"]
         assert sent["nsfw"] == "true"
 
-    def test_falls_back_to_unsorted_when_newest_returns_empty(self):
-        """Some users (e.g. PotatoMan760) have the Newest-sort bug — retry
-        without sort when first call returns 0 items."""
-        empty = self._mock_response(items=[])
-        items = self._mock_response(items=[{"id": 1, "url": "x"}])
+    def test_no_fallback_when_newest_returns_empty(self):
+        """Empty items on sort=Newest must not fall back or change sort;
+        returns ([], nextCursor) directly to allow pagination penetration."""
+        empty = self._mock_response(items=[], next_cursor="c123")
         with patch("civitai_client.safe_get") as mock_get:
-            mock_get.side_effect = [empty, items]
-            fetched, _cursor = fetch_page("alice", nsfw=False, sort="Newest")
-        assert mock_get.call_count == 2
-        # Second call must not have `sort` parameter
-        second_params = mock_get.call_args_list[1].kwargs["params"]
-        assert "sort" not in second_params
-        assert len(fetched) == 1
+            mock_get.return_value = empty
+            fetched, cursor = fetch_page("alice", nsfw=False, sort="Newest")
+        assert mock_get.call_count == 1
+        assert fetched == []
+        assert cursor == "c123"
+
+    def test_all_track_uses_browsing_level_31(self):
+        """ALL track (nsfw=None) must hit civitai.red with browsingLevel=31."""
+        with patch("civitai_client.safe_get") as mock_get:
+            mock_get.return_value = self._mock_response()
+            fetch_page("alice", nsfw=None, sort="Newest")
+        called_url = mock_get.call_args.args[0]
+        assert called_url.startswith("https://civitai.red/api/v1/images")
+        sent = mock_get.call_args.kwargs["params"]
+        assert "nsfw" not in sent
+        assert sent["browsingLevel"] == 31
 
     def test_returns_empty_and_no_cursor_on_empty_response(self):
         """When both attempts return 0 items, return ([], '') so the loop terminates."""
@@ -833,10 +841,10 @@ class TestIncrementalMaxPages:
     """Regression: a 1k+ item creator used to push their entire history
     on the very first scan. ``max_pages`` caps this per track."""
 
-    def test_default_is_five(self):
+    def test_default_is_fifty(self):
         from monitor import IncrementalConfig
         cfg = IncrementalConfig()
-        assert cfg.max_pages == 5
+        assert cfg.max_pages == 50
 
     def test_zero_means_no_extra_cap_relies_on_caught_up(self):
         """max_pages=0 makes the inner while loop run 0 times — no pages fetched.
@@ -850,7 +858,7 @@ class TestIncrementalMaxPages:
     def test_monitor_config_includes_incremental_section(self):
         from monitor import MonitorConfig
         cfg = MonitorConfig(telegram={"bot_token": "t", "chat_id": "c"})
-        assert cfg.incremental.max_pages == 5
+        assert cfg.incremental.max_pages == 50
 
 
 class TestIncrementalHoles:
@@ -1105,13 +1113,13 @@ class TestFetchPageCursorOnEmptyItems:
         assert fetched == []
         assert cursor == "cur123"
 
-    def test_fallback_response_also_returns_metadata_cursor(self):
-        """The Newest-fallback retry path must also preserve a cursor."""
-        first = self._mock_response(items=[], next_cursor="")
-        second = self._mock_response(items=[], next_cursor="cur456")
+    def test_empty_page_with_metadata_cursor_returns_cursor(self):
+        """Empty page with non-empty metadata cursor returns ([], cursor) without retry."""
+        resp = self._mock_response(items=[], next_cursor="cur456")
         with patch("civitai_client.safe_get") as mock_get:
-            mock_get.side_effect = [first, second]
+            mock_get.return_value = resp
             fetched, cursor = fetch_page("alice", nsfw=False, sort="Newest")
+        assert mock_get.call_count == 1
         assert fetched == []
         assert cursor == "cur456"
 
@@ -1240,3 +1248,382 @@ class TestRunFullEmptyPageCursor:
         assert len(calls) == 5
         assert seen == {1, 2, 3, 4, 5}
 
+
+
+# ---------------------------------------------------------------------------
+# Incremental empty page penetration & Reconciliation tests
+# ---------------------------------------------------------------------------
+
+class TestIncrementalEmptyPagePenetration:
+    def test_penetrates_empty_first_page_when_next_cursor_present(self, tmp_path):
+        import monitor as m
+        page1 = ([], set(), "cursor_pg2")
+        page2 = ([{"id": 999, "url": "http://x/1.jpg"}], {999}, "")
+        calls = []
+
+        def fake_fetch_and_process(username, nsfw_flag, cursor, *args, **kwargs):
+            calls.append((nsfw_flag, cursor))
+            if cursor == "":
+                return page1
+            elif cursor == "cursor_pg2":
+                return page2
+            return ([], set(), "")
+
+        with patch("monitor._fetch_and_process_page", side_effect=fake_fetch_and_process), \
+             patch("monitor.save_seen_ids"):
+            seen = m.run_incremental(
+                "alice",
+                seen_ids=set(),
+                tg_id="123",
+                seen_dir=tmp_path,
+                nsfw_setting="sfw_only",
+                output_dir=tmp_path,
+                size_suffixes=[],
+                bot_token="tok",
+                chat_id="cid",
+                base_url="http://base",
+                limit=100,
+                video_enabled=False,
+                max_video_size_mb=10,
+                max_pages=5,
+            )
+        assert 999 in seen
+        assert calls == [(False, ""), (False, "cursor_pg2")]
+
+
+class TestReconciliation:
+    def test_reconciliation_stops_after_consecutive_no_new_pages(self, tmp_path):
+        import monitor as m
+        # Page 1: 1 new item
+        # Page 2: 0 new items
+        # Page 3: 0 new items
+        # Page 4: 0 new items -> triggers stop (3 consecutive no-new)
+        p1 = ([{"id": 101}], {101}, "c2")
+        p2 = ([], {100}, "c3")
+        p3 = ([], {99}, "c4")
+        p4 = ([], {98}, "c5")
+        pages = [p1, p2, p3, p4]
+
+        def fake_fetch_and_process(username, nsfw_flag, cursor, *args, **kwargs):
+            return pages.pop(0)
+
+        with patch("monitor._fetch_and_process_page", side_effect=fake_fetch_and_process), \
+             patch("monitor.save_seen_ids"):
+            seen, total_new, total_pages = m.run_reconciliation(
+                "alice",
+                seen_ids=set(),
+                tg_id="123",
+                seen_dir=tmp_path,
+                nsfw_setting="sfw_only",
+                output_dir=tmp_path,
+                size_suffixes=[],
+                bot_token="tok",
+                chat_id="cid",
+                base_url="http://base",
+                limit=100,
+                video_enabled=False,
+                max_video_size_mb=10,
+                max_pages_per_track=200,
+                max_consecutive_no_new_pages=3,
+            )
+        assert 101 in seen
+        assert total_new == 1
+        assert total_pages == 4
+
+
+# ---------------------------------------------------------------------------
+# Incremental window decoupling & Backlog truncation alert tests
+# ---------------------------------------------------------------------------
+
+
+class TestIncrementalWindowDecouplingAndBacklogAlert:
+    def test_window_decoupling_stops_at_hole_window_boundary(self, tmp_path):
+        """When max_pages=50, limit=100, hole_window_items=500, and pushed has 2000 items,
+        steady state with no new items must caught_up after 5 pages (500 items), not 50 pages."""
+        import monitor as m
+        # 2000 pushed IDs: 2000 down to 1
+        pushed = set(range(1, 2001))
+        m.save_pushed_ids(tmp_path, "123", "alice", pushed)
+
+        # 50 mock pages of 100 items each, no new items
+        pages = []
+        for p in range(50):
+            start = 2000 - p * 100
+            page_ids = set(range(start - 99, start + 1))
+            pages.append(([], page_ids, f"cursor_{p+1}"))
+
+        fetched_pages = []
+
+        def fake_fetch(username, nsfw_flag, cursor, *args, **kwargs):
+            p = len(fetched_pages)
+            fetched_pages.append(p)
+            return pages[p]
+
+        with patch("monitor._fetch_and_process_page", side_effect=fake_fetch),              patch("monitor.time.sleep"),              patch("monitor.save_seen_ids"):
+            seen = m.run_incremental(
+                "alice",
+                seen_ids=pushed,
+                tg_id="123",
+                seen_dir=tmp_path,
+                nsfw_setting="sfw_only",
+                output_dir=tmp_path,
+                size_suffixes=[],
+                bot_token="tok",
+                chat_id="cid",
+                base_url="http://base",
+                limit=100,
+                video_enabled=False,
+                max_video_size_mb=10,
+                max_pages=50,
+                hole_window_items=500,
+            )
+
+        # Should have stopped after 5 pages (500 items), not 50 pages
+        assert len(fetched_pages) == 5
+
+    def test_backlog_truncation_alert_fires_when_max_pages_reached_with_new_items(self, tmp_path, caplog):
+        """When incremental hits max_pages and last page had new items, send TG alert and log warning."""
+        import logging
+        import monitor as m
+
+        # 5 pages, all with new items
+        pages = [
+            ([{"id": i}], {i}, f"cursor_{i}") for i in range(1, 6)
+        ]
+
+        def fake_fetch(*args, **kwargs):
+            return pages.pop(0)
+
+        with patch("monitor._fetch_and_process_page", side_effect=fake_fetch),              patch("monitor.time.sleep"),              patch("monitor.send_to_telegram") as mock_tg,              patch("monitor.save_seen_ids"),              caplog.at_level(logging.WARNING, logger="civitai-monitor"):
+            m.run_incremental(
+                "alice",
+                seen_ids=set(),
+                tg_id="123",
+                seen_dir=tmp_path,
+                nsfw_setting="sfw_only",
+                output_dir=tmp_path,
+                size_suffixes=[],
+                bot_token="tok",
+                chat_id="cid",
+                base_url="http://base",
+                limit=100,
+                video_enabled=False,
+                max_video_size_mb=10,
+                max_pages=5,
+                hole_window_items=500,
+            )
+
+        # Telegram alert sent
+        mock_tg.assert_called_once()
+        msg = mock_tg.call_args.args[2]
+        assert msg == "@alice 积压超过单次扫描容量 (track: SFW)，请 /backfill"
+        # Warning logged
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("积压超过单次扫描容量 (track: SFW)，请 /backfill" in w for w in warnings)
+
+    def test_backlog_truncation_alert_not_fired_when_last_page_had_no_new_items(self, tmp_path):
+        """When max_pages is reached but last page had NO new items, no alert sent."""
+        import monitor as m
+
+        pushed = set(range(1, 1000))
+        m.save_pushed_ids(tmp_path, "123", "alice", pushed)
+
+        # 3 pages, all without new items (e.g. searching holes)
+        pages = [
+            ([], {900, 899}, "c1"),
+            ([], {898, 897}, "c2"),
+            ([], {896, 895}, "c3"),
+        ]
+
+        def fake_fetch(*args, **kwargs):
+            return pages.pop(0)
+
+        with patch("monitor._fetch_and_process_page", side_effect=fake_fetch),              patch("monitor.time.sleep"),              patch("monitor.send_to_telegram") as mock_tg,              patch("monitor.save_seen_ids"):
+            m.run_incremental(
+                "alice",
+                seen_ids=pushed,
+                tg_id="123",
+                seen_dir=tmp_path,
+                nsfw_setting="sfw_only",
+                output_dir=tmp_path,
+                size_suffixes=[],
+                bot_token="tok",
+                chat_id="cid",
+                base_url="http://base",
+                limit=100,
+                video_enabled=False,
+                max_video_size_mb=10,
+                max_pages=3,
+                hole_window_items=5000,  # wide window so safe_lower_bound doesn't break early
+            )
+
+        mock_tg.assert_not_called()
+
+    def _run_incremental_truncated(self, tmp_path, username="alice", nsfw_setting="sfw_only", max_pages=2):
+        import itertools
+
+        counter = itertools.count(1)
+
+        def fake_fetch(*args, **kwargs):
+            i = next(counter)
+            return ([{"id": i}], {i}, f"cursor_{i}")
+
+        return fake_fetch, dict(
+            username=username,
+            seen_ids=set(),
+            tg_id="123",
+            seen_dir=tmp_path,
+            nsfw_setting=nsfw_setting,
+            output_dir=tmp_path,
+            size_suffixes=[],
+            bot_token="tok",
+            chat_id="cid",
+            base_url="http://base",
+            limit=100,
+            video_enabled=False,
+            max_video_size_mb=10,
+            max_pages=max_pages,
+            hole_window_items=500,
+        )
+
+    def test_backlog_truncation_alert_throttled_same_track_same_day(self, tmp_path, caplog):
+        """Same (username, track) sends TG once per day; second trigger logs WARNING only."""
+        import logging
+        import monitor as m
+
+        fake_fetch, kwargs = self._run_incremental_truncated(tmp_path, max_pages=2)
+        username = kwargs.pop("username")
+
+        with patch("monitor._fetch_and_process_page", side_effect=fake_fetch), \
+             patch("monitor.time.sleep"), \
+             patch("monitor.send_to_telegram") as mock_tg, \
+             patch("monitor.save_seen_ids"), \
+             caplog.at_level(logging.WARNING, logger="civitai-monitor"):
+            m.run_incremental(username, **kwargs)
+            m.run_incremental(username, **kwargs)
+
+        assert mock_tg.call_count == 1
+        msg = mock_tg.call_args.args[2]
+        assert msg == "@alice 积压超过单次扫描容量 (track: SFW)，请 /backfill"
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        trunc_warnings = [w for w in warnings if "积压超过单次扫描容量" in w]
+        assert len(trunc_warnings) == 2
+
+    def test_backlog_truncation_alert_different_tracks_each_send_once(self, tmp_path):
+        """Different tracks for the same user each get one Telegram alert the same day."""
+        import json
+        from datetime import date
+
+        import monitor as m
+
+        fake_fetch, kwargs = self._run_incremental_truncated(
+            tmp_path, nsfw_setting="both", max_pages=1,
+        )
+        username = kwargs.pop("username")
+
+        with patch("monitor._fetch_and_process_page", side_effect=fake_fetch), \
+             patch("monitor.time.sleep"), \
+             patch("monitor.send_to_telegram") as mock_tg, \
+             patch("monitor.save_seen_ids"):
+            m.run_incremental(username, **kwargs)
+
+        assert mock_tg.call_count == 3
+        msgs = [c.args[2] for c in mock_tg.call_args_list]
+        assert "@alice 积压超过单次扫描容量 (track: SFW)，请 /backfill" in msgs
+        assert "@alice 积压超过单次扫描容量 (track: NSFW)，请 /backfill" in msgs
+        assert "@alice 积压超过单次扫描容量 (track: ALL)，请 /backfill" in msgs
+        state = json.loads((tmp_path / "backlog_truncation_alerts.json").read_text())
+        today = date.today().isoformat()
+        assert state["alice"] == {"SFW": today, "NSFW": today, "ALL": today}
+
+    def test_backlog_truncation_alert_resets_next_day(self, tmp_path):
+        """After the stored date is no longer today, the same (username, track) alerts again."""
+        import json
+        from datetime import date
+
+        import monitor as m
+
+        fake_fetch, kwargs = self._run_incremental_truncated(tmp_path, max_pages=1)
+        username = kwargs.pop("username")
+
+        with patch("monitor._fetch_and_process_page", side_effect=fake_fetch), \
+             patch("monitor.time.sleep"), \
+             patch("monitor.send_to_telegram") as mock_tg, \
+             patch("monitor.save_seen_ids"):
+            m.run_incremental(username, **kwargs)
+            assert mock_tg.call_count == 1
+
+            path = tmp_path / "backlog_truncation_alerts.json"
+            state = json.loads(path.read_text())
+            assert "alice" in state and "SFW" in state["alice"]
+            state["alice"]["SFW"] = "2000-01-01"
+            path.write_text(json.dumps(state))
+
+            m.run_incremental(username, **kwargs)
+            assert mock_tg.call_count == 2
+            msgs = [c.args[2] for c in mock_tg.call_args_list]
+            assert msgs[0] == msgs[1] == "@alice 积压超过单次扫描容量 (track: SFW)，请 /backfill"
+            state = json.loads(path.read_text())
+            assert state["alice"]["SFW"] == date.today().isoformat()
+
+    def test_backlog_truncation_alert_send_exception_does_not_burn_slot(self, tmp_path):
+        """If Telegram send raises, today's slot is not consumed; next trigger retries."""
+        import json
+        from datetime import date
+
+        import monitor as m
+
+        fake_fetch, kwargs = self._run_incremental_truncated(tmp_path, max_pages=1)
+        username = kwargs.pop("username")
+        calls = {"n": 0}
+
+        def boom(*a, **k):
+            calls["n"] += 1
+            raise RuntimeError("tg down")
+
+        with patch("monitor._fetch_and_process_page", side_effect=fake_fetch), \
+             patch("monitor.time.sleep"), \
+             patch("monitor.send_to_telegram", side_effect=boom), \
+             patch("monitor.save_seen_ids"):
+            m.run_incremental(username, **kwargs)
+            assert calls["n"] == 1
+            path = tmp_path / "backlog_truncation_alerts.json"
+            if path.exists():
+                state = json.loads(path.read_text())
+                assert state.get("alice", {}).get("SFW") != date.today().isoformat()
+
+            m.run_incremental(username, **kwargs)
+            assert calls["n"] == 2
+            if path.exists():
+                state = json.loads(path.read_text())
+                assert state.get("alice", {}).get("SFW") != date.today().isoformat()
+
+    def test_backlog_truncation_alert_send_false_does_not_burn_slot(self, tmp_path):
+        """False from send_to_telegram also leaves the slot free; success then throttles."""
+        import json
+        from datetime import date
+
+        import monitor as m
+
+        fake_fetch, kwargs = self._run_incremental_truncated(tmp_path, max_pages=1)
+        username = kwargs.pop("username")
+
+        with patch("monitor._fetch_and_process_page", side_effect=fake_fetch), \
+             patch("monitor.time.sleep"), \
+             patch("monitor.send_to_telegram") as mock_tg, \
+             patch("monitor.save_seen_ids"):
+            mock_tg.side_effect = [False, True]
+            m.run_incremental(username, **kwargs)
+            assert mock_tg.call_count == 1
+            path = tmp_path / "backlog_truncation_alerts.json"
+            if path.exists():
+                state = json.loads(path.read_text())
+                assert state.get("alice", {}).get("SFW") != date.today().isoformat()
+
+            m.run_incremental(username, **kwargs)
+            assert mock_tg.call_count == 2
+            state = json.loads(path.read_text())
+            assert state["alice"]["SFW"] == date.today().isoformat()
+
+            m.run_incremental(username, **kwargs)
+            assert mock_tg.call_count == 2

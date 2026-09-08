@@ -42,6 +42,7 @@ from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from bot_ui import paginated_user_keyboard
+from state_store import _atomic_write
 
 # Import unified config from monitor / config_io (re-exported by monitor)
 from monitor import MonitorConfig, cleanup_old_caches, load_config, write_config
@@ -365,12 +366,38 @@ def _save_interval(seconds: int) -> None:
     INTERVAL_CONFIG.chmod(0o600)
 
 
+def _reconciliation_status_file(cfg: MonitorConfig | None = None) -> Path:
+    if cfg is None:
+        cfg = read_config()
+    data_dir = Path(cfg.data.data_dir) if cfg.data.data_dir else SCRIPT_DIR
+    return data_dir / "reconciliation_status.json"
+
+
+def _load_reconciliation_last_success(cfg: MonitorConfig | None = None) -> str | None:
+    """Load last successful reconciliation date (YYYY-MM-DD)."""
+    path = _reconciliation_status_file(cfg)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        return data.get("last_success_date")
+    except Exception:
+        return None
+
+
+def _save_reconciliation_last_success(date_str: str, cfg: MonitorConfig | None = None) -> None:
+    """Atomically persist last successful reconciliation date."""
+    path = _reconciliation_status_file(cfg)
+    _atomic_write(path, json.dumps({"last_success_date": date_str}, indent=2))
+
+
 _scan_interval: int = 600
 
-# Track the current scheduled-scan subprocess so cmd_stop can terminate it
-# without using pgrep — pgrep "python3.*monitor.py" would also match a
+# Track current scheduled-scan / reconciliation subprocesses so cmd_stop can terminate
+# them without using pgrep — pgrep "python3.*monitor.py" would also match a
 # running backfill subprocess and kill the wrong thing.
 _current_scan_proc: asyncio.subprocess.Process | None = None
+_current_recon_proc: asyncio.subprocess.Process | None = None
 
 # Loop-exit flag for scheduled_scan_cron. In production this is never
 # set — the scan task is torn down by PTB's Application.stop(), and the
@@ -1041,38 +1068,46 @@ async def cmd_interval(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_stop(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Stop the current scheduled scan so you can /backfill."""
+    """Stop current scheduled scan and/or reconciliation scan so you can /backfill."""
     if not await _check_auth(update):
         return
-    proc = _current_scan_proc
-    if proc is None or proc.returncode is not None:
+
+    procs_to_stop: list[tuple[asyncio.subprocess.Process, str]] = []
+    if _current_scan_proc is not None and _current_scan_proc.returncode is None:
+        procs_to_stop.append((_current_scan_proc, "定时增量扫描"))
+    if _current_recon_proc is not None and _current_recon_proc.returncode is None:
+        procs_to_stop.append((_current_recon_proc, "每日对账扫描"))
+
+    if not procs_to_stop:
         await update.message.reply_text("当前没有正在运行的定时扫描。")
         return
-    pid = proc.pid
-    try:
-        proc.terminate()  # SIGTERM — monitor.py will save state and exit cleanly
+
+    for proc, label in procs_to_stop:
+        pid = proc.pid
         try:
-            await asyncio.wait_for(proc.wait(), timeout=30)
-            await update.message.reply_text(
-                f"🛑 已终止定时扫描（PID: {pid}）。\n"
-                f"锁已释放，你现在可以用 `/backfill` 了。"
-            )
-        except asyncio.TimeoutError:
-            log.warning("Scan PID %s did not exit in 30s, sending SIGKILL", pid)
-            proc.kill()
+            proc.terminate()  # SIGTERM — monitor.py will save state and exit cleanly
             try:
-                await proc.wait()
-            except ProcessLookupError:
-                pass
-            await update.message.reply_text(
-                f"🛑 扫描 PID {pid} 不响应 SIGTERM，已 SIGKILL。\n"
-                f"你现在可以用 `/backfill` 了。"
-            )
-    except ProcessLookupError:
-        await update.message.reply_text("扫描进程已不在了，锁应该已释放。")
-    except Exception as e:
-        log.exception("Backfill cancel error: %s", e)  # noqa: TRY401
-        await update.message.reply_text(f"❌ 终止失败: {e}")
+                await asyncio.wait_for(proc.wait(), timeout=30)
+                await update.message.reply_text(
+                    f"🛑 已终止{label}（PID: {pid}）。\n"
+                    f"锁已释放，你现在可以用 `/backfill` 了。"
+                )
+            except asyncio.TimeoutError:
+                log.warning("%s PID %s did not exit in 30s, sending SIGKILL", label, pid)
+                proc.kill()
+                try:
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+                await update.message.reply_text(
+                    f"🛑 {label} PID {pid} 不响应 SIGTERM，已 SIGKILL。\n"
+                    f"你现在可以用 `/backfill` 了。"
+                )
+        except ProcessLookupError:
+            await update.message.reply_text(f"{label}进程已不在了，锁应该已释放。")
+        except Exception as e:
+            log.exception("Stop scan error: %s", e)  # noqa: TRY401
+            await update.message.reply_text(f"❌ 终止失败: {e}")
 
 
 @rate_limit(min_interval=10.0)
@@ -1407,25 +1442,26 @@ def _is_scan_running() -> bool:
 
 
 def _kill_running_scan() -> list[int]:
-    """Terminate the current scheduled scan subprocess. Returns list of killed PIDs.
+    """Terminate the current scheduled scan or reconciliation subprocess. Returns list of killed PIDs.
 
-    Uses the tracked ``_current_scan_proc`` instead of pgrep, because pgrep on
-    "python3.*monitor.py" would also match an in-flight backfill subprocess
+    Uses the tracked ``_current_scan_proc`` / ``_current_recon_proc`` instead of pgrep,
+    because pgrep on "python3.*monitor.py" would also match an in-flight backfill subprocess
     and kill the wrong thing. (Backfills start with ``start_new_session=True``,
     so pgrep can't distinguish them by session either.)
     """
-    proc = _current_scan_proc
-    if proc is None or proc.returncode is not None:
-        return []
-    pid = proc.pid
-    try:
-        proc.terminate()
-        return [pid]
-    except ProcessLookupError:
-        return []
-    except OSError as e:
-        log.warning("Failed to terminate scan PID %s: %s", pid, e)
-        return []
+    killed = []
+    for proc in (_current_scan_proc, _current_recon_proc):
+        if proc is None or proc.returncode is not None:
+            continue
+        pid = proc.pid
+        try:
+            proc.terminate()
+            killed.append(pid)
+        except ProcessLookupError:
+            pass
+        except OSError as e:
+            log.warning("Failed to terminate scan PID %s: %s", pid, e)
+    return killed
 
 
 def _read_scan_status() -> str:
@@ -1529,6 +1565,7 @@ async def scheduled_scan_cron() -> None:
         SIGKILL. We do NOT call ``os._exit`` — that would bypass PTB's own
         shutdown sequence and any in-flight backfill tasks.
     """
+    global _current_scan_proc
     cfg = read_config()
     STALE_BACKFILL_MINUTES = cfg.backfill.stale_backfill_minutes
     proc: asyncio.subprocess.Process | None = None
@@ -1554,9 +1591,9 @@ async def scheduled_scan_cron() -> None:
                 )
                 # Publish the proc so cmd_stop can terminate it precisely,
                 # without a pgrep that would also match a running backfill.
-                global _current_scan_proc
                 _current_scan_proc = proc
                 rc = await proc.wait() if proc is not None else None
+                _current_scan_proc = None
                 if _shutdown_requested:
                     break
                 returncode = int(rc) if rc is not None else -1
@@ -1647,6 +1684,111 @@ def _sweep_stale_backfills(max_age_minutes: int) -> int:
     return removed
 
 
+async def scheduled_reconciliation_cron() -> None:
+    """Run daily deep reconciliation as a background task.
+
+    Triggers once per day at or after configured time (default 03:30 local)
+    when today's run has not succeeded yet.
+    Runs monitor.py in --mode reconcile.
+    """
+    global _current_recon_proc
+    proc: asyncio.subprocess.Process | None = None
+    retry_date: str | None = None
+    daily_retry_count: int = 0
+    MAX_DAILY_RETRIES = 10
+
+    try:
+        while not _shutdown_requested:
+            cfg = read_config()
+            recon_cfg = getattr(cfg, "reconciliation", None)
+            if recon_cfg is None or not recon_cfg.enabled:
+                await asyncio.sleep(60)
+                continue
+
+            time_str = recon_cfg.time or "03:30"
+            try:
+                target_hour, target_minute = [int(x) for x in time_str.split(":", 1)]
+            except ValueError:
+                target_hour, target_minute = 3, 30
+
+            now = datetime.now()
+            today_str = now.strftime("%Y-%m-%d")
+            target_dt = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+            last_success = _load_reconciliation_last_success(cfg)
+
+            if now >= target_dt and last_success != today_str:
+                if retry_date != today_str:
+                    retry_date = today_str
+                    daily_retry_count = 0
+
+                if daily_retry_count >= MAX_DAILY_RETRIES:
+                    log.warning(
+                        "Daily reconciliation exceeded max retries (%d) today (%s), skipping until tomorrow",
+                        daily_retry_count, today_str,
+                    )
+                    await asyncio.sleep(60)
+                    continue
+
+                active_backfills = _load_active_backfills()
+                if active_backfills:
+                    log.info("Daily reconciliation skipped: active backfill(s) %s", list(active_backfills.keys()))
+                    await asyncio.sleep(60)
+                    continue
+
+                try:
+                    log.info("Daily deep reconciliation starting (%02d:%02d target)...", target_hour, target_minute)
+                    proc = await asyncio.create_subprocess_exec(
+                        sys.executable, str(MONITOR_SCRIPT),
+                        "--mode", "reconcile",
+                        cwd=str(SCRIPT_DIR),
+                    )
+                    _current_recon_proc = proc
+                    rc = await proc.wait() if proc is not None else None
+                    _current_recon_proc = None
+                    if _shutdown_requested:
+                        break
+                    returncode = int(rc) if rc is not None else -1
+                    if returncode == 0:
+                        log.info("Daily deep reconciliation completed successfully")
+                        _save_reconciliation_last_success(today_str, cfg)
+                        daily_retry_count = 0
+                    elif returncode == 75:
+                        log.info("Daily reconciliation skipped: monitor lock held (will retry in 60s)")
+                        await asyncio.sleep(60)
+                        continue
+                    else:
+                        log.warning("Daily reconciliation finished with code %d (will retry)", returncode)
+                        daily_retry_count += 1
+                        await asyncio.sleep(60)
+                        continue
+                except Exception as e:
+                    log.exception("Daily reconciliation error: %s", e)  # noqa: TRY401
+                    _current_recon_proc = None
+                    daily_retry_count += 1
+                    await asyncio.sleep(60)
+                    continue
+
+            if _shutdown_requested:
+                break
+            await asyncio.sleep(30)
+    finally:
+        if proc is not None and proc.returncode is None:
+            log.info("Shutdown: stopping current reconciliation scan...")
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=30)
+            except (RuntimeError, asyncio.TimeoutError):
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+        _current_recon_proc = None
+        log.info("Daily reconciliation cron stopped.")
+
+
 async def post_init(application: Application) -> None:
     commands = [
         BotCommand("add", "增加监控对象（支持用户名/链接/@）"),
@@ -1678,6 +1820,8 @@ async def post_init(application: Application) -> None:
 
     scan_task = _track_task(asyncio.create_task(scheduled_scan_cron()))
     scan_task.add_done_callback(_on_cron_done)
+    recon_task = _track_task(asyncio.create_task(scheduled_reconciliation_cron()))
+    recon_task.add_done_callback(_on_cron_done)
     log.info(f"Slash commands registered. Scheduled scan every {_scan_interval//60}min. Ready.")
 
 

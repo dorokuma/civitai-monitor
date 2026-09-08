@@ -80,6 +80,7 @@ from config_io import (
     HttpConfig,  # noqa: F401
     IncrementalConfig,  # noqa: F401
     MonitorConfig,  # noqa: F401
+    ReconciliationConfig,  # noqa: F401
     TelegramConfig,  # noqa: F401
     load_config,
     redact_config_for_disk,  # noqa: F401
@@ -91,6 +92,8 @@ from state_store import (
     PendingMap,  # noqa: F401
     StateWriteError,
     adopt_stale_inflight,
+    claim_backlog_truncation_alert,
+    rollback_backlog_truncation_alert,
     clear_inflight,
     clear_pending,
     load_pending_map,
@@ -174,11 +177,20 @@ def nsfw_tracks(nsfw_setting: str) -> list[bool | None]:
     mapping: dict[str, list[bool | None]] = {
         "sfw_only": [False],
         "nsfw_only": [True],
-        "both": [False, True],
+        "both": [False, True, None],
+        "all_only": [None],
     }
     if nsfw_setting not in mapping:
         log.warning("Unknown nsfw setting %r, defaulting to 'both'", nsfw_setting)
-    return mapping.get(nsfw_setting, [False, True])  # default both
+    return mapping.get(nsfw_setting, [False, True, None])  # default both
+
+
+def track_label(nsfw_flag: bool | None) -> str:
+    if nsfw_flag is True:
+        return "NSFW"
+    if nsfw_flag is False:
+        return "SFW"
+    return "ALL" 
 
 
 # ---------------------------------------------------------------------------
@@ -715,18 +727,22 @@ def run_incremental(
     limit: int,
     video_enabled: bool,
     max_video_size_mb: int,
-    max_pages: int = 5,
+    max_pages: int = 50,
+    hole_window_items: int = 500,
 ) -> set[int]:
     """Check latest content using cursor pagination. Propagates FetchPageError."""
     all_seen: set[int] = set(seen_ids)
     tracks = nsfw_tracks(nsfw_setting)
 
     for nsfw_flag in tracks:
-        label = "NSFW" if nsfw_flag else "SFW"
+        label = track_label(nsfw_flag)
         cursor = ""
         page = 0
+        visited_cursors: set[str] = set()
+        last_new_count = 0
         while page < max_pages:
             page += 1
+            visited_cursors.add(cursor)
             pushed_ids = load_pushed_ids(seen_dir, tg_id, username)
             new_on_page, page_ids, next_cursor = _fetch_and_process_page(
                 username, nsfw_flag, cursor, all_seen, pushed_ids,
@@ -736,8 +752,25 @@ def run_incremental(
                 video_enabled=video_enabled, max_video_size_mb=max_video_size_mb,
                 pushed_dir=seen_dir, tg_id=tg_id,
             )
+            last_new_count = len(new_on_page)
+
+            # Cursor loop guard
+            if next_cursor and next_cursor in visited_cursors:
+                log.warning(
+                    "%s: cursor %r already visited at page %d, stopping incremental (API cursor loop)",
+                    label, next_cursor, page,
+                )
+                break
 
             if not page_ids:
+                if next_cursor:
+                    log.info(
+                        "%s: page %d empty but nextCursor present, continuing (track: %s)",
+                        username, page, label,
+                    )
+                    cursor = next_cursor
+                    time.sleep(2.0 + random.random() * 1.0)
+                    continue
                 break
 
             all_seen.update(page_ids)
@@ -745,8 +778,8 @@ def run_incremental(
                 safe_lower_bound = 0
                 if pushed_ids:
                     sorted_pushed = sorted(pushed_ids, reverse=True)
-                    window_size = max_pages * limit
-                    safe_lower_bound = sorted_pushed[min(len(sorted_pushed) - 1, window_size - 1)]
+                    window_size = hole_window_items
+                    safe_lower_bound = sorted_pushed[min(len(sorted_pushed) - 1, max(0, window_size - 1))]
 
                 page_min_id = min(page_ids) if page_ids else 0
                 if page_min_id <= safe_lower_bound:
@@ -755,8 +788,8 @@ def run_incremental(
                 else:
                     log.info(
                         "%s: page %d has no new items, but min_id %d > safe_lower_bound %d. "
-                        "Continuing to search for potential holes.",
-                        username, page, page_min_id, safe_lower_bound,
+                        "Continuing to search for potential holes (track: %s).",
+                        username, page, page_min_id, safe_lower_bound, label,
                     )
 
             log.info("%s: +%d new (page %d, track: %s)", username, len(new_on_page), page, label)
@@ -769,6 +802,23 @@ def run_incremental(
             if not next_cursor:
                 break
             cursor = next_cursor
+            time.sleep(2.0 + random.random() * 1.0)
+        else:
+            if page >= max_pages and last_new_count > 0:
+                alert_msg = f"@{username} 积压超过单次扫描容量 (track: {label})，请 /backfill"
+                log.warning("%s (page=%d, max_pages=%d)", alert_msg, page, max_pages)
+                try:
+                    if bot_token and chat_id:
+                        if claim_backlog_truncation_alert(seen_dir, username, label):
+                            sent_ok = False
+                            try:
+                                sent_ok = send_to_telegram(bot_token, chat_id, alert_msg)
+                            except Exception as e:
+                                log.warning("Failed to send backlog truncation alert to Telegram: %s", e)
+                            if not sent_ok:
+                                rollback_backlog_truncation_alert(seen_dir, username, label)
+                except Exception as e:
+                    log.warning("Failed to send backlog truncation alert to Telegram: %s", e)
 
         if all_seen:
             union = seen_ids | all_seen
@@ -811,7 +861,7 @@ def run_full(
     tracks = nsfw_tracks(nsfw_setting)
 
     for nsfw_flag in tracks:
-        label = "NSFW" if nsfw_flag else "SFW"
+        label = track_label(nsfw_flag)
         log.info("── %s track for @%s ──", label, username)
         cursor = ""
         page = 0
@@ -888,6 +938,147 @@ def run_full(
             time.sleep(2.0 + random.random() * 1.0)
 
     return all_seen
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation mode (daily deep audit)
+# ---------------------------------------------------------------------------
+
+
+def run_reconciliation(
+    username: str,
+    *,
+    seen_ids: set[int],
+    tg_id: str,
+    seen_dir: Path,
+    nsfw_setting: str,
+    output_dir: Path,
+    size_suffixes: list[str],
+    bot_token: str,
+    chat_id: str,
+    base_url: str,
+    limit: int,
+    video_enabled: bool,
+    max_video_size_mb: int,
+    max_pages_per_track: int = 200,
+    max_consecutive_no_new_pages: int = 3,
+    shutdown_flag: Callable[[], bool] = lambda: False,
+) -> tuple[set[int], int, int]:
+    """Deep reconciliation scan for a creator across all configured tracks.
+
+    Paginates along sort=Newest until:
+      * N consecutive pages have 0 new items (default 3), OR
+      * Cursor is exhausted (end of gallery), OR
+      * Hard page cap is reached (default 200 pages), OR
+      * Shutdown is requested.
+
+    Returns:
+        (all_seen, total_new_pushed, total_pages_walked)
+    """
+    all_seen: set[int] = set(seen_ids)
+    tracks = nsfw_tracks(nsfw_setting)
+    total_new_pushed = 0
+    total_pages_walked = 0
+
+    for nsfw_flag in tracks:
+        label = track_label(nsfw_flag)
+        log.info("── [RECONCILE] %s track for @%s ──", label, username)
+        cursor = ""
+        page = 0
+        consecutive_no_new = 0
+        visited_cursors: set[str] = set()
+
+        while True:
+            if shutdown_flag():
+                log.info("[RECONCILE] %s: shutdown requested, stopping at page %d", label, page)
+                break
+            page += 1
+            total_pages_walked += 1
+            if page > max_pages_per_track:
+                log.warning(
+                    "[RECONCILE] %s: reached max pages cap (%d), stopping track",
+                    label, max_pages_per_track,
+                )
+                break
+
+            pushed_ids = load_pushed_ids(seen_dir, tg_id, username)
+            new_on_page, page_ids, next_cursor = _fetch_and_process_page(
+                username, nsfw_flag, cursor, all_seen, pushed_ids,
+                base_url=base_url, limit=limit, sort="Newest",
+                size_suffixes=size_suffixes, output_dir=output_dir,
+                bot_token=bot_token, chat_id=chat_id,
+                video_enabled=video_enabled, max_video_size_mb=max_video_size_mb,
+                pushed_dir=seen_dir, tg_id=tg_id,
+            )
+
+            # Cursor loop guard
+            visited_cursors.add(cursor)
+            if next_cursor and next_cursor in visited_cursors:
+                log.warning(
+                    "[RECONCILE] %s: cursor %r already visited at page %d, stopping track (API cursor loop)",
+                    label, next_cursor, page,
+                )
+                break
+
+            if not page_ids:
+                if next_cursor:
+                    consecutive_no_new += 1
+                    log.info(
+                        "[RECONCILE] %s: page %d empty but nextCursor present (consecutive no-new: %d)",
+                        label, page, consecutive_no_new,
+                    )
+                    if consecutive_no_new >= max_consecutive_no_new_pages:
+                        log.info(
+                            "[RECONCILE] %s: reached %d consecutive empty/no-new pages, stopping track",
+                            label, consecutive_no_new,
+                        )
+                        break
+                    cursor = next_cursor
+                    time.sleep(2.0 + random.random() * 1.0)
+                    continue
+                log.info("[RECONCILE] %s: exhausted after %d pages", label, page - 1)
+                break
+
+            all_seen.update(page_ids)
+
+            if new_on_page:
+                consecutive_no_new = 0
+                total_new_pushed += len(new_on_page)
+                log.info("[RECONCILE] %s page %d: +%d new items found and pushed", label, page, len(new_on_page))
+            else:
+                consecutive_no_new += 1
+                log.info(
+                    "[RECONCILE] %s page %d: 0 new items (consecutive no-new: %d/%d)",
+                    label, page, consecutive_no_new, max_consecutive_no_new_pages,
+                )
+                if consecutive_no_new >= max_consecutive_no_new_pages:
+                    log.info(
+                        "[RECONCILE] %s: reached %d consecutive pages with no new items, ending track at page %d",
+                        label, consecutive_no_new, page,
+                    )
+                    break
+
+            if all_seen:
+                union = seen_ids | all_seen
+                if len(union) > len(seen_ids):
+                    save_seen_ids(seen_dir, tg_id, username, union)
+
+            if not next_cursor:
+                log.info("[RECONCILE] %s: gallery completed after %d pages", label, page)
+                break
+            cursor = next_cursor
+            time.sleep(2.0 + random.random() * 1.0)
+
+        if all_seen:
+            union = seen_ids | all_seen
+            if len(union) > len(seen_ids):
+                save_seen_ids(seen_dir, tg_id, username, union)
+
+    log.info(
+        "[RECONCILE RESULT] @%s (TG:%s): walked %d pages total across tracks, discovered and pushed %d new items",
+        username, tg_id, total_pages_walked, total_new_pushed,
+    )
+    return all_seen, total_new_pushed, total_pages_walked
 
 
 # ---------------------------------------------------------------------------
@@ -1064,15 +1255,17 @@ def _process_single_creator(
     video_enabled: bool,
     max_video_size_mb: int,
     incremental_max_pages: int,
+    hole_window_items: int = 500,
+    reconcile_max_pages: int = 200,
+    reconcile_consecutive_no_new: int = 3,
 ) -> tuple[set[int], int]:
-    """Run a single creator through incremental or full mode.
+    """Run a single creator through incremental, full, or reconcile mode.
 
     Catches ``StateWriteError`` from any state-persistence call inside
-    run_full / run_incremental so that a lock timeout for one creator
-    does not crash the entire scan process (which would be worse than
-    the old silent-failure behavior under systemd Restart=always). The
-    creator is skipped with an error log; its in-flight items remain
-    for the next scan's adopt_stale_inflight recovery.
+    run_full / run_incremental / run_reconciliation so that a lock timeout
+    for one creator does not crash the entire scan process. The creator is
+    skipped with an error log; its in-flight items remain for the next scan's
+    adopt_stale_inflight recovery.
     """
     seen_ids = load_seen_ids(seen_dir, tg_id_str, username)
     common: dict[str, Any] = {
@@ -1096,8 +1289,19 @@ def _process_single_creator(
                 **common,
                 shutdown_flag=lambda: _monitor_shutdown_requested,
             )
+        elif mode == "reconcile":
+            user_seen, _new_pushed, _pages = run_reconciliation(
+                **common,
+                max_pages_per_track=reconcile_max_pages,
+                max_consecutive_no_new_pages=reconcile_consecutive_no_new,
+                shutdown_flag=lambda: _monitor_shutdown_requested,
+            )
         else:
-            user_seen = run_incremental(**common, max_pages=incremental_max_pages)
+            user_seen = run_incremental(
+                **common,
+                max_pages=incremental_max_pages,
+                hole_window_items=hole_window_items,
+            )
 
         if not user_seen:
             return seen_ids, 0
@@ -1129,7 +1333,7 @@ def main() -> None:
     # Step 2: parse CLI + load config
     parser = argparse.ArgumentParser(description="Civitai Monitor — civitai.com user gallery monitor")
     parser.add_argument("--config", type=str, help="Path to config.yaml (default: auto-search)")
-    parser.add_argument("--mode", type=str, choices=["incremental", "full"], help="Override scan mode")
+    parser.add_argument("--mode", type=str, choices=["incremental", "full", "reconcile"], help="Override scan mode")
     parser.add_argument("--user", type=str, help="Process only this Civitai username")
     args = parser.parse_args()
 
@@ -1202,6 +1406,9 @@ def main() -> None:
                     video_enabled=cfg.video_enabled,
                     max_video_size_mb=cfg.max_video_size_mb,
                     incremental_max_pages=cfg.incremental.max_pages,
+                    hole_window_items=getattr(cfg.incremental, "hole_window_items", 500),
+                    reconcile_max_pages=cfg.reconciliation.max_pages_per_track,
+                    reconcile_consecutive_no_new=cfg.reconciliation.max_consecutive_no_new_pages,
                 )
                 pushed_count += new_count
                 if cfg.mode == "full" and new_count > 0:

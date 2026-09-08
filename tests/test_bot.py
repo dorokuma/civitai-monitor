@@ -733,3 +733,173 @@ class TestClassifyFailure:
         )
         assert civitai_bot._classify_failure(1, stderr) == "Civitai API 暂时不可用（503），稍后可重试"
 
+
+
+# ---------------------------------------------------------------------------
+# scheduled_reconciliation_cron — window fix, lock retry, proc tracking
+# ---------------------------------------------------------------------------
+
+
+class TestScheduledReconciliationCron:
+    def _make_fake_proc(self, returncode: int | None):
+        from unittest.mock import AsyncMock, MagicMock
+        proc = MagicMock()
+        proc.pid = 12345
+        proc.returncode = returncode
+        if returncode is None:
+            proc.wait = AsyncMock(return_value=None)
+        else:
+            proc.wait = AsyncMock(return_value=returncode)
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        return proc
+
+    @pytest.mark.asyncio
+    async def test_triggers_cross_hour_past_target_time(self, monkeypatch):
+        """At 04:05 (past 03:30 target), triggers and runs if today not succeeded."""
+        from datetime import datetime
+        from unittest.mock import AsyncMock, patch
+
+        fake_dt = datetime(2026, 9, 8, 4, 5, 0)
+        monkeypatch.setattr(civitai_bot, "_load_active_backfills", lambda: {})
+        monkeypatch.setattr(civitai_bot, "_load_reconciliation_last_success", lambda *a: None)
+        saved_dates = []
+        monkeypatch.setattr(civitai_bot, "_save_reconciliation_last_success", lambda d, *a: saved_dates.append(d))
+
+        proc = self._make_fake_proc(returncode=0)
+        create_subproc = AsyncMock(return_value=proc)
+
+        iterations = [0]
+        async def _fake_sleep(*_a, **_k):
+            iterations[0] += 1
+            if iterations[0] >= 1:
+                civitai_bot._shutdown_requested = True
+
+        with patch("civitai_bot_module.datetime") as mock_dt, \
+             patch.object(civitai_bot.asyncio, "create_subprocess_exec", create_subproc), \
+             patch.object(civitai_bot.asyncio, "sleep", AsyncMock(side_effect=_fake_sleep)):
+            mock_dt.now.return_value = fake_dt
+            mock_dt.fromisoformat = datetime.fromisoformat
+            civitai_bot._shutdown_requested = False
+            try:
+                await civitai_bot.scheduled_reconciliation_cron()
+            finally:
+                civitai_bot._shutdown_requested = False
+
+        create_subproc.assert_called_once()
+        assert saved_dates == ["2026-09-08"]
+
+    @pytest.mark.asyncio
+    async def test_lock_conflict_0359_retries_and_succeeds_at_0401(self, monkeypatch):
+        """03:59 rc=75 lock conflict -> 04:01 past target hour still triggers and succeeds."""
+        from datetime import datetime
+        from unittest.mock import AsyncMock, patch
+
+        dt_0359 = datetime(2026, 9, 8, 3, 59, 0)
+        dt_0401 = datetime(2026, 9, 8, 4, 1, 0)
+        times = [dt_0359, dt_0401]
+
+        monkeypatch.setattr(civitai_bot, "_load_active_backfills", lambda: {})
+        last_success = [None]
+        monkeypatch.setattr(civitai_bot, "_load_reconciliation_last_success", lambda *a: last_success[0])
+        saved_dates = []
+        def _save(d, *a):
+            last_success[0] = d
+            saved_dates.append(d)
+        monkeypatch.setattr(civitai_bot, "_save_reconciliation_last_success", _save)
+
+        proc_75 = self._make_fake_proc(returncode=75)
+        proc_0 = self._make_fake_proc(returncode=0)
+        procs = [proc_75, proc_0]
+
+        async def _fake_create_subproc(*args, **kwargs):
+            return procs.pop(0)
+
+        iterations = [0]
+        async def _fake_sleep(*_a, **_k):
+            iterations[0] += 1
+            if iterations[0] >= 2:
+                civitai_bot._shutdown_requested = True
+
+        with patch("civitai_bot_module.datetime") as mock_dt, \
+             patch.object(civitai_bot.asyncio, "create_subprocess_exec", AsyncMock(side_effect=_fake_create_subproc)), \
+             patch.object(civitai_bot.asyncio, "sleep", AsyncMock(side_effect=_fake_sleep)):
+            mock_dt.now.side_effect = lambda: times.pop(0) if times else dt_0401
+            mock_dt.fromisoformat = datetime.fromisoformat
+            civitai_bot._shutdown_requested = False
+            try:
+                await civitai_bot.scheduled_reconciliation_cron()
+            finally:
+                civitai_bot._shutdown_requested = False
+
+        assert saved_dates == ["2026-09-08"]
+
+    @pytest.mark.asyncio
+    async def test_does_not_retrigger_if_already_succeeded_today(self, monkeypatch):
+        """If today already succeeded, past target time does not retrigger."""
+        from datetime import datetime
+        from unittest.mock import AsyncMock, patch
+
+        fake_dt = datetime(2026, 9, 8, 4, 5, 0)
+        monkeypatch.setattr(civitai_bot, "_load_active_backfills", lambda: {})
+        monkeypatch.setattr(civitai_bot, "_load_reconciliation_last_success", lambda *a: "2026-09-08")
+
+        create_subproc = AsyncMock()
+
+        async def _fake_sleep(*_a, **_k):
+            civitai_bot._shutdown_requested = True
+
+        with patch("civitai_bot_module.datetime") as mock_dt, \
+             patch.object(civitai_bot.asyncio, "create_subprocess_exec", create_subproc), \
+             patch.object(civitai_bot.asyncio, "sleep", AsyncMock(side_effect=_fake_sleep)):
+            mock_dt.now.return_value = fake_dt
+            mock_dt.fromisoformat = datetime.fromisoformat
+            civitai_bot._shutdown_requested = False
+            try:
+                await civitai_bot.scheduled_reconciliation_cron()
+            finally:
+                civitai_bot._shutdown_requested = False
+
+        create_subproc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cmd_stop_terminates_running_reconciliation(self, monkeypatch):
+        """cmd_stop terminates _current_recon_proc and releases lock."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        proc = self._make_fake_proc(returncode=None)
+        civitai_bot._current_recon_proc = proc
+        civitai_bot._current_scan_proc = None
+
+        update = MagicMock()
+        update.effective_user.id = 8628596870
+        update.message.reply_text = AsyncMock()
+
+        monkeypatch.setattr(civitai_bot, "AUTHORIZED_USER_IDS", {8628596870})
+
+        try:
+            await civitai_bot.cmd_stop(update, None)
+            proc.terminate.assert_called_once()
+            proc.wait.assert_called()
+            update.message.reply_text.assert_called()
+            reply_text = update.message.reply_text.call_args.args[0]
+            assert "已终止每日对账扫描" in reply_text
+        finally:
+            civitai_bot._current_recon_proc = None
+
+    def test_kill_running_scan_includes_recon_proc(self):
+        """_kill_running_scan terminates and returns PID of _current_recon_proc."""
+        from unittest.mock import MagicMock
+        proc = MagicMock()
+        proc.pid = 99887
+        proc.returncode = None
+        proc.terminate = MagicMock()
+
+        civitai_bot._current_recon_proc = proc
+        civitai_bot._current_scan_proc = None
+        try:
+            pids = civitai_bot._kill_running_scan()
+            assert pids == [99887]
+            proc.terminate.assert_called_once()
+        finally:
+            civitai_bot._current_recon_proc = None

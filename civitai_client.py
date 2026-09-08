@@ -140,6 +140,11 @@ def fetch_page(
     metadata, so callers must keep walking on ``([], next_cursor)`` rather than
     treating an empty page as the end of the gallery.
 
+    Tracks:
+      * nsfw=False -> SFW track (civitai.com/api/v1/images?nsfw=false)
+      * nsfw=True  -> NSFW track (civitai.red/api/v1/images?nsfw=true)
+      * nsfw=None  -> ALL track  (civitai.red/api/v1/images?browsingLevel=31)
+
     Raises:
         FetchPageError: on network / HTTP hard failures after retries.
     """
@@ -155,35 +160,26 @@ def fetch_page(
         params["page"] = 1
     if sort is not None:
         params["sort"] = sort
-    if nsfw is not None:
-        params["nsfw"] = "true" if nsfw else "false"
-    # NSFW content requires civitai.red + browsingLevel + cookies
+
     if nsfw is True:
+        params["nsfw"] = "true"
         actual_base = "https://civitai.red/api/v1"
-    else:
+    elif nsfw is False:
+        params["nsfw"] = "false"
         actual_base = base_url
+    else:
+        # ALL track: browsingLevel=31 covers all content levels on civitai.red
+        params["browsingLevel"] = 31
+        actual_base = "https://civitai.red/api/v1"
 
     try:
         resp = safe_get(f"{actual_base}/images", params=params)
         resp.raise_for_status()
-        items = resp.json().get("items", [])
-
-        # Fallback: if Newest sort returns empty but user exists,
-        # retry with default sort (Civitai API bug workaround).
-        if not items and sort == "Newest":
-            log.warning(
-                "%s: sort=Newest returned 0 items (nsfw=%s), retrying with default sort",
-                username, nsfw,
-            )
-            fallback_params = dict(params)
-            fallback_params.pop("sort", None)
-            fallback_resp = safe_get(f"{actual_base}/images", params=fallback_params)
-            fallback_resp.raise_for_status()
-            items = fallback_resp.json().get("items", [])
-            resp = fallback_resp
-
-        next_cursor = resp.json().get("metadata", {}).get("nextCursor", "")
+        data = resp.json()
+        items = data.get("items", [])
+        next_cursor = data.get("metadata", {}).get("nextCursor", "")
         return items, next_cursor
     except requests.RequestException as e:
-        log.warning("Page query failed (nsfw=%s): %s", nsfw, e)
-        raise FetchPageError(f"fetch_page failed for @{username} (nsfw={nsfw}): {e}") from e
+        track_label = "NSFW" if nsfw is True else ("SFW" if nsfw is False else "ALL")
+        log.warning("Page query failed (track=%s): %s", track_label, e)
+        raise FetchPageError(f"fetch_page failed for @{username} (track={track_label}): {e}") from e
