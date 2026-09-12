@@ -394,8 +394,14 @@ def normalize_to_original(
 
 def download_image(url: str, save_path: Path, timeout: int = 120) -> DownloadResult:
     if save_path.exists():
-        log.info("Already exists: %s, skipped", save_path.name)
-        return DownloadResult(True)
+        if save_path.stat().st_size == 0:
+            # A zero-byte leftover is a recoverable download failure, not a
+            # successful download: delete it and re-fetch.
+            log.warning("Existing %s is 0 bytes; re-downloading", save_path.name)
+            save_path.unlink()
+        else:
+            log.info("Already exists: %s, skipped", save_path.name)
+            return DownloadResult(True)
     tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
     max_bytes = MAX_IMAGE_DOWNLOAD_MB * 1024 * 1024
     try:
@@ -426,6 +432,13 @@ def download_image(url: str, save_path: Path, timeout: int = 120) -> DownloadRes
                 # An oversized image cannot succeed on retry — permanent failure.
                 tmp_path.unlink(missing_ok=True)
                 return DownloadResult(False, True)
+            if downloaded == 0:
+                # HTTP 200 with an empty body: keeping a zero-byte file would
+                # freeze the loss via the Already-exists short-circuit. Treat
+                # as a transient failure so the next scan retries.
+                tmp_path.unlink(missing_ok=True)
+                log.warning("Image download for %s returned an empty body; will retry", url)
+                return DownloadResult(False)
             tmp_path.rename(save_path)
             log.info("Downloaded: %s (%d bytes)", save_path.name, save_path.stat().st_size)
             return DownloadResult(True)
@@ -454,8 +467,14 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> Downlo
       * ``<= 0`` — disable the size cap (download every video regardless of size).
     """
     if save_path.exists():
-        log.info("Already exists: %s, skipped", save_path.name)
-        return DownloadResult(True)
+        if save_path.stat().st_size == 0:
+            # A zero-byte leftover is a recoverable download failure, not a
+            # successful download: delete it and re-fetch.
+            log.warning("Existing %s is 0 bytes; re-downloading", save_path.name)
+            save_path.unlink()
+        else:
+            log.info("Already exists: %s, skipped", save_path.name)
+            return DownloadResult(True)
     tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
     try:
         with safe_get(url, stream=True) as resp:
@@ -513,6 +532,17 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> Downlo
                                     f.flush()
                                     raise _VideoSizeCapExceeded()
                                 f.write(chunk)
+                        if downloaded == 0:
+                            # HTTP 200 with an empty body: a zero-byte video
+                            # would freeze the loss via Already-exists. Treat
+                            # as a transient failure and let the attempt loop
+                            # retry.
+                            tmp_path.unlink(missing_ok=True)
+                            log.warning(
+                                "Video download returned an empty body (attempt %d/3); will retry",
+                                attempt + 1,
+                            )
+                            continue
                         tmp_path.rename(save_path)
                         log.info(
                             "Video downloaded: %s (%.1f MB)",
