@@ -757,11 +757,11 @@ class TestScheduledReconciliationCron:
     @pytest.mark.asyncio
     async def test_triggers_cross_hour_past_target_time(self, monkeypatch):
         """At 04:05 (past 03:30 target), triggers and runs if today not succeeded."""
-        from datetime import datetime
+        from datetime import datetime, timezone
         from unittest.mock import AsyncMock, patch
 
-        fake_dt = datetime(2026, 9, 8, 4, 5, 0)
-        monkeypatch.setattr(civitai_bot, "_load_active_backfills", lambda: {})
+        fake_dt = datetime(2026, 9, 8, 4, 5, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(civitai_bot, "_load_active_backfills", dict)
         monkeypatch.setattr(civitai_bot, "_load_reconciliation_last_success", lambda *a: None)
         saved_dates = []
         monkeypatch.setattr(civitai_bot, "_save_reconciliation_last_success", lambda d, *a: saved_dates.append(d))
@@ -792,14 +792,14 @@ class TestScheduledReconciliationCron:
     @pytest.mark.asyncio
     async def test_lock_conflict_0359_retries_and_succeeds_at_0401(self, monkeypatch):
         """03:59 rc=75 lock conflict -> 04:01 past target hour still triggers and succeeds."""
-        from datetime import datetime
+        from datetime import datetime, timezone
         from unittest.mock import AsyncMock, patch
 
-        dt_0359 = datetime(2026, 9, 8, 3, 59, 0)
-        dt_0401 = datetime(2026, 9, 8, 4, 1, 0)
+        dt_0359 = datetime(2026, 9, 8, 3, 59, 0, tzinfo=timezone.utc)
+        dt_0401 = datetime(2026, 9, 8, 4, 1, 0, tzinfo=timezone.utc)
         times = [dt_0359, dt_0401]
 
-        monkeypatch.setattr(civitai_bot, "_load_active_backfills", lambda: {})
+        monkeypatch.setattr(civitai_bot, "_load_active_backfills", dict)
         last_success = [None]
         monkeypatch.setattr(civitai_bot, "_load_reconciliation_last_success", lambda *a: last_success[0])
         saved_dates = []
@@ -824,7 +824,7 @@ class TestScheduledReconciliationCron:
         with patch("civitai_bot_module.datetime") as mock_dt, \
              patch.object(civitai_bot.asyncio, "create_subprocess_exec", AsyncMock(side_effect=_fake_create_subproc)), \
              patch.object(civitai_bot.asyncio, "sleep", AsyncMock(side_effect=_fake_sleep)):
-            mock_dt.now.side_effect = lambda: times.pop(0) if times else dt_0401
+            mock_dt.now.side_effect = lambda *a, **k: times.pop(0) if times else dt_0401
             mock_dt.fromisoformat = datetime.fromisoformat
             civitai_bot._shutdown_requested = False
             try:
@@ -837,11 +837,11 @@ class TestScheduledReconciliationCron:
     @pytest.mark.asyncio
     async def test_does_not_retrigger_if_already_succeeded_today(self, monkeypatch):
         """If today already succeeded, past target time does not retrigger."""
-        from datetime import datetime
+        from datetime import datetime, timezone
         from unittest.mock import AsyncMock, patch
 
-        fake_dt = datetime(2026, 9, 8, 4, 5, 0)
-        monkeypatch.setattr(civitai_bot, "_load_active_backfills", lambda: {})
+        fake_dt = datetime(2026, 9, 8, 4, 5, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(civitai_bot, "_load_active_backfills", dict)
         monkeypatch.setattr(civitai_bot, "_load_reconciliation_last_success", lambda *a: "2026-09-08")
 
         create_subproc = AsyncMock()

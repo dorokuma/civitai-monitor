@@ -16,7 +16,7 @@ import asyncio
 import importlib.util
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -32,7 +32,6 @@ sys.modules["civitai_bot_hardening_module"] = civitai_bot
 _spec.loader.exec_module(civitai_bot)
 
 import bot_ui
-
 
 # ---------------------------------------------------------------------------
 # Shared fixtures / helpers
@@ -325,7 +324,7 @@ class TestCronAlertDedup:
     async def _run_scan_cron_failures(self, monkeypatch, tmp_path, iterations=2):
         """Run scheduled_scan_cron through `iterations` failing cycles."""
         _isolate_backfill_state(monkeypatch, tmp_path)
-        monkeypatch.setattr(civitai_bot, "_load_active_backfills", lambda: {})
+        monkeypatch.setattr(civitai_bot, "_load_active_backfills", dict)
         create_subproc = AsyncMock(return_value=self._make_failing_proc(1))
         n = [0]
 
@@ -405,7 +404,7 @@ class TestCronAlertDedup:
     async def test_reconciliation_failure_alerts(self, monkeypatch, tmp_path, alert_bot):
         """scheduled_reconciliation_cron failure path pages admins once."""
         _isolate_backfill_state(monkeypatch, tmp_path)
-        monkeypatch.setattr(civitai_bot, "_load_active_backfills", lambda: {})
+        monkeypatch.setattr(civitai_bot, "_load_active_backfills", dict)
         monkeypatch.setattr(civitai_bot, "_load_reconciliation_last_success", lambda *a: None)
         monkeypatch.setattr(civitai_bot, "_save_reconciliation_last_success", lambda *a, **k: None)
 
@@ -422,7 +421,7 @@ class TestCronAlertDedup:
             if n[0] >= 2:
                 civitai_bot._shutdown_requested = True
 
-        fake_dt = datetime(2026, 9, 11, 4, 5, 0)
+        fake_dt = datetime(2026, 9, 11, 4, 5, 0, tzinfo=timezone.utc)
         mock_dt = MagicMock()
         mock_dt.now.return_value = fake_dt
         mock_dt.fromisoformat = datetime.fromisoformat

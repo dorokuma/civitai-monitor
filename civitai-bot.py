@@ -42,10 +42,10 @@ from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from bot_ui import paginated_user_keyboard, resolve_callback_username
-from state_store import _atomic_write
 
 # Import unified config from monitor / config_io (re-exported by monitor)
 from monitor import MonitorConfig, cleanup_old_caches, load_config, write_config
+from state_store import _atomic_write
 
 # Transient Telegram transport failures during long-polling / send. PTB already
 # retries these in its network loop; they must not page admins as "unhandled".
@@ -182,7 +182,7 @@ def _cron_alert_gate(job: str, *, failing: bool, today: str | None = None) -> st
     the failure is still present — acceptable, and better than silence.
     """
     if today is None:
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     state = _cron_alert_state.setdefault(job, {"failing": False, "last_alert_date": ""})
     was_failing = bool(state["failing"])
     if failing:
@@ -453,7 +453,7 @@ def _load_reconciliation_last_success(cfg: MonitorConfig | None = None) -> str |
     try:
         data = json.loads(path.read_text())
         return data.get("last_success_date")
-    except Exception:
+    except (OSError, json.JSONDecodeError):
         return None
 
 
@@ -1838,7 +1838,7 @@ async def scheduled_reconciliation_cron() -> None:
             except ValueError:
                 target_hour, target_minute = 3, 30
 
-            now = datetime.now()
+            now = datetime.now(timezone.utc)
             today_str = now.strftime("%Y-%m-%d")
             target_dt = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
             last_success = _load_reconciliation_last_success(cfg)

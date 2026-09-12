@@ -7,7 +7,7 @@ import logging
 import os
 import re
 import time
-from datetime import date
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -455,7 +455,7 @@ def claim_backlog_truncation_alert(
         {username: {track: "YYYY-MM-DD"}}
     """
     if not today:
-        today = date.today().isoformat()
+        today = datetime.now(timezone.utc).date().isoformat()
     path = backlog_alert_file(seen_dir)
     lock_path = _save_lock_path(seen_dir, name="backlog_alert")
     for attempt in range(3):
@@ -507,7 +507,7 @@ def rollback_backlog_truncation_alert(
     Cross-process safe via FileLock + ``_atomic_write``.
     """
     if not today:
-        today = date.today().isoformat()
+        today = datetime.now(timezone.utc).date().isoformat()
     path = backlog_alert_file(seen_dir)
     lock_path = _save_lock_path(seen_dir, name="backlog_alert")
     for attempt in range(3):

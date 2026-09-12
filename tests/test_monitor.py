@@ -44,6 +44,12 @@ from monitor import (
 # nsfw_tracks
 # ---------------------------------------------------------------------------
 
+def _utc_today_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).date().isoformat()
+
+
 class TestNsfwTracks:
     def test_sfw_only(self):
         assert nsfw_tracks("sfw_only") == [False]
@@ -1360,7 +1366,7 @@ class TestIncrementalWindowDecouplingAndBacklogAlert:
             return pages[p]
 
         with patch("monitor._fetch_and_process_page", side_effect=fake_fetch),              patch("monitor.time.sleep"),              patch("monitor.save_seen_ids"):
-            seen = m.run_incremental(
+            m.run_incremental(
                 "alice",
                 seen_ids=pushed,
                 tg_id="123",
@@ -1384,6 +1390,7 @@ class TestIncrementalWindowDecouplingAndBacklogAlert:
     def test_backlog_truncation_alert_fires_when_max_pages_reached_with_new_items(self, tmp_path, caplog):
         """When incremental hits max_pages and last page had new items, send TG alert and log warning."""
         import logging
+
         import monitor as m
 
         # 5 pages, all with new items
@@ -1468,27 +1475,28 @@ class TestIncrementalWindowDecouplingAndBacklogAlert:
             i = next(counter)
             return ([{"id": i}], {i}, f"cursor_{i}")
 
-        return fake_fetch, dict(
-            username=username,
-            seen_ids=set(),
-            tg_id="123",
-            seen_dir=tmp_path,
-            nsfw_setting=nsfw_setting,
-            output_dir=tmp_path,
-            size_suffixes=[],
-            bot_token="tok",
-            chat_id="cid",
-            base_url="http://base",
-            limit=100,
-            video_enabled=False,
-            max_video_size_mb=10,
-            max_pages=max_pages,
-            hole_window_items=500,
-        )
+        return fake_fetch, {
+            "username": username,
+            "seen_ids": set(),
+            "tg_id": "123",
+            "seen_dir": tmp_path,
+            "nsfw_setting": nsfw_setting,
+            "output_dir": tmp_path,
+            "size_suffixes": [],
+            "bot_token": "tok",
+            "chat_id": "cid",
+            "base_url": "http://base",
+            "limit": 100,
+            "video_enabled": False,
+            "max_video_size_mb": 10,
+            "max_pages": max_pages,
+            "hole_window_items": 500,
+        }
 
     def test_backlog_truncation_alert_throttled_same_track_same_day(self, tmp_path, caplog):
         """Same (username, track) sends TG once per day; second trigger logs WARNING only."""
         import logging
+
         import monitor as m
 
         fake_fetch, kwargs = self._run_incremental_truncated(tmp_path, max_pages=2)
@@ -1512,7 +1520,6 @@ class TestIncrementalWindowDecouplingAndBacklogAlert:
     def test_backlog_truncation_alert_different_tracks_each_send_once(self, tmp_path):
         """Different tracks for the same user each get one Telegram alert the same day."""
         import json
-        from datetime import date
 
         import monitor as m
 
@@ -1533,13 +1540,12 @@ class TestIncrementalWindowDecouplingAndBacklogAlert:
         assert "@alice 积压超过单次扫描容量 (track: NSFW)，请 /backfill" in msgs
         assert "@alice 积压超过单次扫描容量 (track: ALL)，请 /backfill" in msgs
         state = json.loads((tmp_path / "backlog_truncation_alerts.json").read_text())
-        today = date.today().isoformat()
+        today = _utc_today_iso()
         assert state["alice"] == {"SFW": today, "NSFW": today, "ALL": today}
 
     def test_backlog_truncation_alert_resets_next_day(self, tmp_path):
         """After the stored date is no longer today, the same (username, track) alerts again."""
         import json
-        from datetime import date
 
         import monitor as m
 
@@ -1564,12 +1570,11 @@ class TestIncrementalWindowDecouplingAndBacklogAlert:
             msgs = [c.args[2] for c in mock_tg.call_args_list]
             assert msgs[0] == msgs[1] == "@alice 积压超过单次扫描容量 (track: SFW)，请 /backfill"
             state = json.loads(path.read_text())
-            assert state["alice"]["SFW"] == date.today().isoformat()
+            assert state["alice"]["SFW"] == _utc_today_iso()
 
     def test_backlog_truncation_alert_send_exception_does_not_burn_slot(self, tmp_path):
         """If Telegram send raises, today's slot is not consumed; next trigger retries."""
         import json
-        from datetime import date
 
         import monitor as m
 
@@ -1590,18 +1595,17 @@ class TestIncrementalWindowDecouplingAndBacklogAlert:
             path = tmp_path / "backlog_truncation_alerts.json"
             if path.exists():
                 state = json.loads(path.read_text())
-                assert state.get("alice", {}).get("SFW") != date.today().isoformat()
+                assert state.get("alice", {}).get("SFW") != _utc_today_iso()
 
             m.run_incremental(username, **kwargs)
             assert calls["n"] == 2
             if path.exists():
                 state = json.loads(path.read_text())
-                assert state.get("alice", {}).get("SFW") != date.today().isoformat()
+                assert state.get("alice", {}).get("SFW") != _utc_today_iso()
 
     def test_backlog_truncation_alert_send_false_does_not_burn_slot(self, tmp_path):
         """False from send_to_telegram also leaves the slot free; success then throttles."""
         import json
-        from datetime import date
 
         import monitor as m
 
@@ -1618,12 +1622,12 @@ class TestIncrementalWindowDecouplingAndBacklogAlert:
             path = tmp_path / "backlog_truncation_alerts.json"
             if path.exists():
                 state = json.loads(path.read_text())
-                assert state.get("alice", {}).get("SFW") != date.today().isoformat()
+                assert state.get("alice", {}).get("SFW") != _utc_today_iso()
 
             m.run_incremental(username, **kwargs)
             assert mock_tg.call_count == 2
             state = json.loads(path.read_text())
-            assert state["alice"]["SFW"] == date.today().isoformat()
+            assert state["alice"]["SFW"] == _utc_today_iso()
 
             m.run_incremental(username, **kwargs)
             assert mock_tg.call_count == 2

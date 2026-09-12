@@ -79,7 +79,7 @@ from config_io import (
     DownloadConfig,  # noqa: F401
     HttpConfig,  # noqa: F401
     IncrementalConfig,  # noqa: F401
-    MonitorConfig,  # noqa: F401
+    MonitorConfig,
     ReconciliationConfig,  # noqa: F401
     TelegramConfig,  # noqa: F401
     load_config,
@@ -93,7 +93,6 @@ from state_store import (
     StateWriteError,
     adopt_stale_inflight,
     claim_backlog_truncation_alert,
-    rollback_backlog_truncation_alert,
     clear_inflight,
     clear_pending,
     load_pending_map,
@@ -103,6 +102,7 @@ from state_store import (
     mark_inflight,
     mark_pending,
     pushed_file_for_user,  # noqa: F401
+    rollback_backlog_truncation_alert,
     save_pushed_ids,
     save_seen_ids,
     seen_file_for_user,  # noqa: F401
@@ -950,16 +950,16 @@ def run_incremental(
                 alert_msg = f"@{username} 积压超过单次扫描容量 (track: {label})，请 /backfill"
                 log.warning("%s (page=%d, max_pages=%d)", alert_msg, page, max_pages)
                 try:
-                    if bot_token and chat_id:
-                        if claim_backlog_truncation_alert(seen_dir, username, label):
-                            sent_ok = False
-                            try:
-                                sent_ok = send_to_telegram(bot_token, chat_id, alert_msg)
-                            except Exception as e:
-                                log.warning("Failed to send backlog truncation alert to Telegram: %s", e)
-                            if not sent_ok:
-                                rollback_backlog_truncation_alert(seen_dir, username, label)
-                except Exception as e:
+                    # Alert failures must never kill the scan: catch-all by design.
+                    if bot_token and chat_id and claim_backlog_truncation_alert(seen_dir, username, label):
+                        sent_ok = False
+                        try:
+                            sent_ok = send_to_telegram(bot_token, chat_id, alert_msg)
+                        except Exception as e:  # noqa: BLE001
+                            log.warning("Failed to send backlog truncation alert to Telegram: %s", e)
+                        if not sent_ok:
+                            rollback_backlog_truncation_alert(seen_dir, username, label)
+                except Exception as e:  # noqa: BLE001
                     log.warning("Failed to send backlog truncation alert to Telegram: %s", e)
 
         if all_seen:
@@ -1611,10 +1611,9 @@ def main() -> None:
         creators_done=0, creators_total=total_creators, pushed_count=0,
     )
 
-    pushed_count = 0
     exit_code = 0
     try:
-        pushed_count, had_fetch_error = _process_creator_queue(
+        _pushed_count, had_fetch_error = _process_creator_queue(
             subs, cfg,
             seen_dir=seen_dir, output_dir=output_dir,
             user_filter=args.user, start_time=start_time,

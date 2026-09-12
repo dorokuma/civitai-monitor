@@ -38,29 +38,29 @@ LOG = "civitai-monitor"
 
 def _push_kwargs(output_dir: Path) -> dict:
     """Keyword args for process_and_push without any state persistence."""
-    return dict(
-        size_suffixes=[],
-        output_dir=output_dir,
-        bot_token="t",
-        chat_id="c",
-        video_enabled=False,
-        max_video_size_mb=10,
-    )
+    return {
+        "size_suffixes": [],
+        "output_dir": output_dir,
+        "bot_token": "t",
+        "chat_id": "c",
+        "video_enabled": False,
+        "max_video_size_mb": 10,
+    }
 
 
 def _fetch_page_kwargs(output_dir: Path) -> dict:
-    return dict(
-        base_url="https://x",
-        limit=10,
-        size_suffixes=[],
-        output_dir=output_dir,
-        bot_token="t",
-        chat_id="c",
-        video_enabled=False,
-        max_video_size_mb=10,
-        pushed_dir=output_dir,
-        tg_id="tg1",
-    )
+    return {
+        "base_url": "https://x",
+        "limit": 10,
+        "size_suffixes": [],
+        "output_dir": output_dir,
+        "bot_token": "t",
+        "chat_id": "c",
+        "video_enabled": False,
+        "max_video_size_mb": 10,
+        "pushed_dir": output_dir,
+        "tg_id": "tg1",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +119,7 @@ class TestMaliciousIdDropped:
             m, "process_and_push",
             lambda img, *a, **k: processed.append(img["id"]) or True,
         )
-        new_on_page, page_ids, _cursor = m._fetch_and_process_page(
+        _new_on_page, page_ids, _cursor = m._fetch_and_process_page(
             "alice", False, "", set(), set(), **_fetch_page_kwargs(tmp_path),
         )
         assert page_ids == {10, 999}           # "../../.." and "/abs/path" gone
@@ -407,7 +407,7 @@ class TestPerItemIsolation:
             return True
 
         monkeypatch.setattr(m, "process_and_push", fake_push)
-        new_on_page, page_ids, _cursor = m._fetch_and_process_page(
+        _new_on_page, page_ids, _cursor = m._fetch_and_process_page(
             "alice", False, "", set(), set(), **_fetch_page_kwargs(tmp_path),
         )
         assert page_ids == {1, 2}  # second item still processed
