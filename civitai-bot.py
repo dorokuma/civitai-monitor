@@ -427,8 +427,11 @@ def _load_interval() -> int:
     """
     try:
         data = json.loads(INTERVAL_CONFIG.read_text())
+    except FileNotFoundError:
+        log.info("No interval config at %s, using default 600s", INTERVAL_CONFIG)
+        return 600
     except (json.JSONDecodeError, OSError) as e:
-        log.warning("Failed to load interval config, using default 600s: %s", e)
+        log.warning("Invalid interval config, using default 600s: %s", e)
         return 600
     seconds = data.get("seconds", 600) if isinstance(data, dict) else None
     if isinstance(seconds, int) and not isinstance(seconds, bool) and seconds > 0:
