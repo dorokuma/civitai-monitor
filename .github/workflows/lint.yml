@@ -16,7 +16,10 @@ jobs:
           python-version: "3.13"
 
       - name: Install ruff
-        run: pip install ruff
+        # Pinned: CI installs latest ruff, and new ruff releases add default
+        # rules that break lint without any code change. Bump deliberately
+        # (after satisfying any new findings), not automatically.
+        run: pip install ruff==0.16.7
 
       - name: Run ruff
         run: ruff check .
