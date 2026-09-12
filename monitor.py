@@ -122,6 +122,58 @@ from telegram_media import (
     set_tg_api_base,
 )
 
+_ORIGINAL_SEND_TO_TELEGRAM = send_to_telegram
+
+
+def _tm_send_detailed(
+    bot_token: str,
+    chat_id: str,
+    text: str,
+    file_paths: list[Path] | None,
+) -> tuple[bool, bool]:
+    """Call telegram_media.send_to_telegram_detailed (hardened contract).
+
+    Looked up lazily so this module keeps importing even while
+    telegram_media.py is mid-hardening; a missing implementation raises
+    instead of silently degrading to the lossy bool API this hardening
+    exists to fix.
+    """
+    import telegram_media as _tm
+
+    fn = getattr(_tm, "send_to_telegram_detailed", None)
+    if fn is None:
+        raise ImportError(
+            "telegram_media.send_to_telegram_detailed is missing; update "
+            "telegram_media.py to the hardened contract"
+        )
+    return fn(bot_token, chat_id, text, file_paths)
+
+
+def send_to_telegram_detailed(
+    bot_token: str,
+    chat_id: str,
+    text: str,
+    file_paths: list[Path] | None,
+) -> tuple[bool, bool]:
+    """Detailed send contract consumed by _send (implemented in telegram_media).
+
+    Returns ``(delivered, media_failed)``:
+      * delivered — the user-visible push succeeded (the text-only fallback
+        counts as delivered when the media upload failed);
+      * media_failed — file_paths was given and the files exist locally but
+        the media upload ultimately failed, so the media still has to be
+        (re)sent even when delivered is True.
+
+    Compatibility seam: existing tests monkeypatch the legacy bool
+    ``send_to_telegram`` symbol on this module; when that seam has been
+    replaced, route through it and report no media failure so the old
+    bool-API tests keep their semantics. Production always takes the
+    detailed path below.
+    """
+    if send_to_telegram is not _ORIGINAL_SEND_TO_TELEGRAM:
+        return send_to_telegram(bot_token, chat_id, text, file_paths), False
+    return _tm_send_detailed(bot_token, chat_id, text, file_paths)
+
 # Re-export for callers that still read monitor._tg_api_base-style names.
 # Prefer set_tg_api_base() / get_tg_api_base().
 
@@ -144,6 +196,76 @@ MAX_IMAGE_DOWNLOAD_MB = 30
 # disk (this also blocks path traversal via a crafted "extension").
 IMAGE_EXT_WHITELIST = frozenset({".jpeg", ".jpg", ".png", ".gif", ".webp"})
 VIDEO_EXT_WHITELIST = frozenset({".mp4", ".webm", ".mov", ".mkv", ".avi"})
+
+
+# ---------------------------------------------------------------------------
+# Message length budgets
+# ---------------------------------------------------------------------------
+
+# Telegram hard limits (Bot API): 4096 characters for a text message, 1024
+# for a media caption (counted in UTF-16 code units). Oversized input is
+# rejected with HTTP 400, after which the send path falls back (or retries)
+# on an input that can never succeed — e.g. a forged createdAt pushes the
+# caption over the limit and the downloaded media is silently lost or
+# retried forever. Budgets sit below the hard limits with headroom.
+TELEGRAM_TEXT_BUDGET = 4000
+TELEGRAM_CAPTION_BUDGET = 1000
+CREATED_AT_BUDGET = 200
+
+
+def _telegram_text_units(text: str) -> int:
+    """Length of ``text`` in UTF-16 code units (what the Bot API counts)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _clip(text: str, limit: int) -> str:
+    """Clip ``text`` to at most ``limit`` Telegram characters (UTF-16 units).
+
+    Truncated text gets an ellipsis appended so consumers can see the cut;
+    the result never exceeds ``limit`` units (one unit is reserved for the
+    ellipsis and surrogate pairs are never split). A trailing backslash left
+    behind by cutting in the middle of a Markdown escape sequence would
+    itself break ``parse_mode=Markdown`` parsing, so it is dropped too.
+    """
+    if limit < 1:
+        return ""
+    if _telegram_text_units(text) <= limit:
+        return text
+    kept: list[str] = []
+    used = 0
+    for ch in text:
+        width = 2 if ord(ch) > 0xFFFF else 1
+        if used + width > limit - 1:
+            break
+        kept.append(ch)
+        used += width
+    return "".join(kept).rstrip("\\") + "…"
+
+
+def _drop_empty_files(files: list[Path] | None) -> list[Path] | None:
+    """Return ``files`` minus any 0-byte files; ``None`` if nothing remains.
+
+    A 0-byte media file can never upload (Telegram answers 400 and the send
+    path would fall back to text with the media silently lost). Callers
+    treat an all-empty result as "no media" and send the text-only notice —
+    the same handling as a permanent download failure, because retrying an
+    empty file cannot succeed.
+    """
+    if not files:
+        return files
+    kept: list[Path] = []
+    for fp in files:
+        try:
+            if fp.exists() and fp.stat().st_size == 0:
+                log.warning(
+                    "Dropping 0-byte media file (Telegram cannot upload it): %s",
+                    fp.name,
+                )
+                continue
+        except OSError:
+            pass  # stat failed — let the upload attempt surface the problem
+        kept.append(fp)
+    return kept or None
 
 
 # ---------------------------------------------------------------------------
@@ -531,7 +653,7 @@ def process_and_push(
     civitai_url = f"https://civitai.com/images/{item_id}"
     # createdAt is attacker-controllable text interpolated into a Markdown
     # caption — escape it exactly like the username.
-    created_at = escape_markdown(item.get("createdAt", ""))
+    created_at = _clip(escape_markdown(item.get("createdAt", "")), CREATED_AT_BUDGET)
     safe_user = escape_markdown(username)
 
     is_video = (
@@ -543,6 +665,16 @@ def process_and_push(
     )
 
     def _send(text: str, files: list[Path] | None) -> bool:
+        # 0-byte media can never upload (Telegram answers 400 and the send
+        # path would fall back to text with the media silently lost). Drop
+        # it up front and send the text-only notice — the same handling as a
+        # permanent download failure, because retrying an empty file cannot
+        # succeed.
+        files = _drop_empty_files(files)
+        # Caption vs text budget: Telegram caps media captions at 1024 chars
+        # and plain messages at 4096 — clip below both so a forged createdAt
+        # can never push a send into guaranteed-400 territory.
+        text = _clip(text, TELEGRAM_CAPTION_BUDGET if files else TELEGRAM_TEXT_BUDGET)
         if pushed_dir is not None and tg_id is not None:
             try:
                 mark_inflight(pushed_dir, tg_id, username, item_id)
@@ -552,10 +684,28 @@ def process_and_push(
                     "crash-recovery guard",
                     item_id, username,
                 )
-        outcome = send_to_telegram(bot_token, chat_id, text, files)
+        delivered, media_failed = send_to_telegram_detailed(bot_token, chat_id, text, files)
         try:
+            if delivered and media_failed:
+                # The text fallback reached the user, but the locally
+                # downloaded media did NOT leave this machine. The item must
+                # NOT be marked pushed: park it as pending (preserving the
+                # retries counter) so the next scan retries the media upload,
+                # capped by PENDING_MAX_RETRIES in _fetch_and_process_page.
+                if pushed_dir is not None and tg_id is not None:
+                    existing = load_pending_map(pushed_dir, tg_id, username)
+                    prev_retries = existing[item_id][1] if item_id in existing else 0
+                    retries = max(prev_retries, 0)
+                    mark_pending(pushed_dir, tg_id, username, item_id, retries=retries)
+                    clear_inflight(pushed_dir, tg_id, username, item_id)
+                    log.info(
+                        "Parked id=%d for @%s as pending (media upload failed after "
+                        "text fallback, retries=%d)",
+                        item_id, username, retries,
+                    )
+                return False
             return _finalize_send_outcome(
-                outcome, item_id, username,
+                delivered, item_id, username,
                 pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
             )
         except StateWriteError:
@@ -587,7 +737,8 @@ def process_and_push(
                     "crash-recovery guard",
                     item_id, username,
                 )
-        send_to_telegram(bot_token, chat_id, text, None)
+        # Text-only notice — the 4096 text limit applies here too.
+        send_to_telegram(bot_token, chat_id, _clip(text, TELEGRAM_TEXT_BUDGET), None)
         if pushed_dir is not None and tg_id is not None:
             existing = load_pending_map(pushed_dir, tg_id, username)
             prev_retries = existing[item_id][1] if item_id in existing else 0
@@ -603,7 +754,9 @@ def process_and_push(
         return False
 
     if is_video:
-        video_url = item.get("url") or item.get("meta", {}).get("videoUrl", "")
+        meta = item.get("meta")
+        meta = meta if isinstance(meta, dict) else {}
+        video_url = item.get("url") or meta.get("videoUrl", "")
         if not video_url:
             log.warning("Video %s: no URL found", item_id)
             return False
@@ -871,8 +1024,14 @@ def run_incremental(
     max_video_size_mb: int,
     max_pages: int = 50,
     hole_window_items: int = 500,
+    shutdown_flag: Callable[[], bool] = lambda: False,
 ) -> set[int]:
-    """Check latest content using cursor pagination. Propagates FetchPageError."""
+    """Check latest content using cursor pagination. Propagates FetchPageError.
+
+    ``shutdown_flag`` mirrors run_full/run_reconciliation: once it turns
+    True, pagination stops at the top of the page loop and the results
+    collected so far are returned.
+    """
     all_seen: set[int] = set(seen_ids)
     tracks = nsfw_tracks(nsfw_setting)
 
@@ -883,6 +1042,9 @@ def run_incremental(
         visited_cursors: set[str] = set()
         last_new_count = 0
         while page < max_pages:
+            if shutdown_flag():
+                log.info("%s: shutdown requested, stopping incremental at page %d", label, page)
+                break
             page += 1
             visited_cursors.add(cursor)
             pushed_ids = load_pushed_ids(seen_dir, tg_id, username)
@@ -1308,6 +1470,23 @@ signal.signal(signal.SIGTERM, _monitor_signal_handler)
 signal.signal(signal.SIGINT, _monitor_signal_handler)
 
 
+def _release_process_lock(lock_fd: int, lock_file: Path) -> None:
+    """Release the monitor process lock by closing the fd.
+
+    Deliberately NO os.unlink(): unlink-after-close opens a classic race
+    window — another process can acquire the lock on this inode between our
+    close and our unlink, then a third process creates a fresh lock file and
+    locks it too, leaving two processes that both believe they hold the
+    monitor lock. With a persistent lock file the flock semantics alone are
+    correct (the kernel tracks the lock per inode), so the file stays on
+    disk across runs.
+    """
+    try:
+        os.close(lock_fd)
+    except OSError:
+        pass
+
+
 def _acquire_process_lock() -> int | None:
     """Acquire the .monitor.lock file with an exclusive fcntl lock."""
     lock_file = SCRIPT_DIR / LOCK_FILE_NAME
@@ -1328,16 +1507,9 @@ def _acquire_process_lock() -> int | None:
     except OSError:
         pass
 
-    def _release_lock() -> None:
-        try:
-            os.close(lock_fd)
-        except OSError:
-            pass
-        try:
-            os.unlink(lock_file)
-        except OSError:
-            pass
-    atexit.register(_release_lock)
+    # Persistent lock file: release only closes the fd (see
+    # _release_process_lock for why the file is never unlinked).
+    atexit.register(_release_process_lock, lock_fd, lock_file)
     return lock_fd
 
 
@@ -1361,7 +1533,23 @@ def _write_status(
         "pushed_count": pushed_count,
         "elapsed_seconds": int((_dt.datetime.now(_dt.timezone.utc) - start_time).total_seconds()),
     }
-    STATUS_PATH.write_text(json.dumps(payload))
+    # Atomic write (tmp → flush+fsync → replace, mirroring
+    # state_store._atomic_write): /status consumers read this file while the
+    # monitor rewrites it, and a torn read would surface as broken JSON in
+    # the bot. Status is best-effort — log and never raise.
+    tmp_path = STATUS_PATH.with_name(STATUS_PATH.name + ".tmp")
+    try:
+        with open(tmp_path, "w") as f:
+            f.write(json.dumps(payload))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, STATUS_PATH)
+    except OSError as e:
+        log.warning("Failed to write monitor status file (best effort): %s", e)
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _clear_status(interrupted: bool, start_time: _dt.datetime) -> None:
@@ -1451,6 +1639,7 @@ def _process_single_creator(
                 **common,
                 max_pages=incremental_max_pages,
                 hole_window_items=hole_window_items,
+                shutdown_flag=lambda: _monitor_shutdown_requested,
             )
 
         if not user_seen:

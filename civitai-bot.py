@@ -419,12 +419,25 @@ def _unregister_backfill(tg_id: str, username: str) -> None:
 
 
 def _load_interval() -> int:
-    """Load interval from file, default 600s (10 min)."""
+    """Load interval from file, default 600s (10 min).
+
+    The JSON top level must be an object and ``seconds`` a positive int;
+    anything else (scalar/array top level, non-int seconds) falls back to 600
+    instead of crashing the scan cron with AttributeError.
+    """
     try:
-        return json.loads(INTERVAL_CONFIG.read_text()).get("seconds", 600)
-    except (json.JSONDecodeError, OSError, FileNotFoundError) as e:
+        data = json.loads(INTERVAL_CONFIG.read_text())
+    except (json.JSONDecodeError, OSError) as e:
         log.warning("Failed to load interval config, using default 600s: %s", e)
         return 600
+    seconds = data.get("seconds", 600) if isinstance(data, dict) else None
+    if isinstance(seconds, int) and not isinstance(seconds, bool) and seconds > 0:
+        return seconds
+    log.warning(
+        "Invalid interval config (top-level %s, seconds=%r), using default 600s",
+        type(data).__name__, seconds,
+    )
+    return 600
 
 
 def _save_interval(seconds: int) -> None:
@@ -1836,6 +1849,14 @@ async def scheduled_reconciliation_cron() -> None:
             try:
                 target_hour, target_minute = [int(x) for x in time_str.split(":", 1)]
             except ValueError:
+                target_hour, target_minute = 3, 30
+            # "25:00"/"03:60" parse as ints but would blow up datetime.replace
+            # *outside* the try above and kill the whole cron coroutine.
+            if not (0 <= target_hour <= 23 and 0 <= target_minute <= 59):
+                log.warning(
+                    "Invalid reconciliation time %r (need HH:MM, 00-23:00-59); falling back to 03:30",
+                    time_str,
+                )
                 target_hour, target_minute = 3, 30
 
             now = datetime.now(timezone.utc)

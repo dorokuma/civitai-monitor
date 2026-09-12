@@ -2,6 +2,18 @@
 
 This file follows the [Keep a Changelog](https://keepachangelog.com/) format, and version numbers follow [SemVer](https://semver.org/).
 
+## [1.3.0] - 2026-09-12
+
+### Fixed
+- **Media can no longer be silently lost**: upload retries rewind file handles (a retried upload no longer sends 0 bytes), zero-byte files are rejected before sending, and when the media exists but its upload ultimately fails the item is parked as pending (retried next scan) instead of being marked pushed by the text fallback.
+- **Message length budgets**: createdAt is capped and captions/messages are clipped to Telegram limits (1000 media / 4000 text), so a tampered `createdAt` cannot push media over the caption limit into the same silent-loss path.
+- **API response guards**: non-dict JSON payloads raise `FetchPageError` (alerted scan failure) instead of a silently swallowed AttributeError; a tampered `meta` field is treated as missing instead of crashing the item every scan.
+- **Cron robustness**: an invalid `reconciliation.time` falls back to 03:30 instead of killing the reconciliation loop; `load_config` survives `yaml.YAMLError` (falls back to the minimal config); `_load_interval` rejects non-dict/non-int payloads instead of killing the scan loop.
+- **State hygiene**: `active_backfills.json` ownership corrected (service user can resume backfills again); `monitor_status.json` is written atomically; the monitor lock file is no longer unlinked (removes the classic flock+unlink double-acquire window); `interval.json` is no longer tracked in git.
+
+### Security
+- Weekly backup archives are now 0600/0700 (they contain the bot token and Civitai cookies; they were world-readable).
+
 ## [1.2.0] - 2026-09-12
 
 ### Fixed

@@ -69,6 +69,24 @@ def escape_markdown(text: str) -> str:
     return out
 
 
+def _rewind_upload_files(files: dict | None) -> None:
+    """seek(0) every file object inside a requests ``files`` mapping.
+
+    Values may be bare file objects or ``(name, fileobj, mime)`` tuples.
+    Retry attempts must re-read the payload from the start: an already
+    consumed handle uploads 0 bytes, Telegram answers 400, and the media
+    would be permanently lost to the text-only fallback.
+    """
+    if not files:
+        return
+    for value in files.values():
+        candidates: tuple = value if isinstance(value, (tuple, list)) else (value,)
+        for obj in candidates:
+            seek = getattr(obj, "seek", None)
+            if callable(seek):
+                obj.seek(0)
+
+
 def _telegram_post(
     url: str,
     *,
@@ -79,10 +97,20 @@ def _telegram_post(
     """POST to Telegram with limited retries for 429 Retry-After + short backoff.
 
     Timeouts are re-raised immediately (caller treats them as uncertain delivery).
+    File objects in ``files`` are rewound (seek(0)) before every attempt so a
+    retry re-uploads the full payload instead of 0 bytes.
     """
     last_resp: requests.Response | None = None
     last_exc: Exception | None = None
     for attempt in range(max_retries):
+        # Rewind upload handles before every attempt: requests consumes the
+        # file objects in `files`, so an un-rewound retry would upload 0 bytes
+        # and Telegram would answer 400 (media lost to the text fallback).
+        try:
+            _rewind_upload_files(kwargs.get("files"))
+        except OSError as e:
+            log.warning("Telegram upload aborted: cannot rewind file handle: %s", e)
+            raise requests.RequestException(f"upload file rewind failed: {e}") from e
         try:
             resp = requests.post(url, timeout=timeout, **kwargs)
             last_resp = resp
@@ -131,18 +159,25 @@ def _telegram_post(
     raise RuntimeError("telegram post: exhausted retries without response")
 
 
-def send_to_telegram(
+def send_to_telegram_detailed(
     bot_token: str,
     chat_id: str,
     text: str,
     file_paths: list[Path] | None = None,
-) -> bool | None:
-    """Send a Telegram message.
+) -> tuple[bool, bool]:
+    """Send a Telegram message and report the media outcome separately.
 
-    Returns:
-      True  — confirmed delivery
-      False — confirmed failure (safe to retry)
-      None  — uncertain (timeout after request left; may already be delivered)
+    Returns (delivered, media_failed):
+      delivered    — the user-visible push is confirmed: media delivered, or
+                     media failed but the text fallback was delivered.
+      media_failed — True only when ``file_paths`` were provided with existing
+                     files and the media upload ultimately failed (0-byte
+                     upload, HTTP 400, 429 exhausted, transport error, or an
+                     uncertain timeout). A pure-text send never sets it.
+
+    Anti-duplicate policy (unchanged): after a transport timeout the text
+    fallback is NOT sent (the media may already be in the chat); that
+    outcome is (False, True).
     """
     api_base = f"{_tg_api_base}/bot{bot_token}"
 
@@ -152,21 +187,46 @@ def send_to_telegram(
             is_video = any(fp.suffix.lower() in (".mp4", ".webm", ".mov") for fp in valid_files)
 
             if is_video:
-                return _send_telegram_video(api_base, chat_id, text, valid_files[0])
+                ok, media_failed = _send_telegram_video_with_status(api_base, chat_id, text, valid_files[0])
+            else:
+                ok, media_failed = _send_telegram_media_group_with_status(api_base, chat_id, text, valid_files)
+            return ok is True, media_failed
 
-            return _send_telegram_media_group(api_base, chat_id, text, valid_files)
-
-    return _send_telegram_text(api_base, chat_id, text)
+    return _send_telegram_text(api_base, chat_id, text), False
 
 
-def _send_telegram_video(api_base: str, chat_id: str, text: str, video_path: Path) -> bool | None:
-    """Send a video to Telegram. <=50 MB: sendVideo (inline play). >50 MB: sendDocument.
+def send_to_telegram(
+    bot_token: str,
+    chat_id: str,
+    text: str,
+    file_paths: list[Path] | None = None,
+) -> bool:
+    """Send a Telegram message (thin legacy wrapper).
 
-    Delivery policy (anti-duplicate):
+    Returns True when the user-visible push is confirmed, False otherwise
+    (confirmed failure, or uncertain timeout delivery — the historical None
+    "uncertain" marker is folded into False). See
+    :func:`send_to_telegram_detailed` for the separate media outcome.
+    """
+    ok, _ = send_to_telegram_detailed(bot_token, chat_id, text, file_paths)
+    return ok
+
+
+def _send_telegram_video_with_status(
+    api_base: str, chat_id: str, text: str, video_path: Path
+) -> tuple[bool | None, bool]:
+    """Send a video, reporting (ok, media_failed) for send_to_telegram_detailed.
+
+    ``ok`` keeps the legacy three-state meaning of ``_send_telegram_video``:
       * HTTP success → True
-      * Clear HTTP error → text-only fallback (media was rejected; safe to notify)
-      * Timeout after the request left the client → None (uncertain; no text fallback)
+      * Clear HTTP error → text-only fallback result (media was rejected; safe
+        to notify) — True when the fallback text was delivered
+      * Timeout after the request left the client → None (uncertain; no text
+        fallback — the video may already be in the chat)
       * Other transport errors → False without text (retry media next scan)
+
+    ``media_failed`` is True whenever the media upload did not succeed
+    (HTTP error, transport error, or uncertain timeout).
     """
     size_mb = video_path.stat().st_size / 1048576
     try:
@@ -185,26 +245,36 @@ def _send_telegram_video(api_base: str, chat_id: str, text: str, video_path: Pat
                 timeout=300,
             )
         if resp.ok:
-            return True
+            return True, False
         log.warning("Video send failed: %s", resp.text[:200])
-        return _send_telegram_text(api_base, chat_id, text)
+        return _send_telegram_text(api_base, chat_id, text), True
     except requests.Timeout as e:
         log.warning(
             "Video send timeout (may already be delivered); marking uncertain, no text fallback: %s",
             _sanitize_exc(e),
         )
-        return None
+        return None, True
     except requests.RequestException as e:
         log.warning("Video send error (will retry later, no text fallback): %s", _sanitize_exc(e))
-        return False
+        return False, True
 
 
-def _send_telegram_media_group(api_base: str, chat_id: str, text: str, file_paths: list[Path]) -> bool | None:
-    """Send images as a media group.
+def _send_telegram_video(api_base: str, chat_id: str, text: str, video_path: Path) -> bool | None:
+    """Legacy thin wrapper: video send outcome only (see *_with_status)."""
+    ok, _ = _send_telegram_video_with_status(api_base, chat_id, text, video_path)
+    return ok
 
-    Same anti-duplicate policy as ``_send_telegram_video``: never append a
-    text message after a transport timeout (the photo may already be in the chat).
-    Timeout returns None (uncertain) so the caller can park the ID as pending.
+
+def _send_telegram_media_group_with_status(
+    api_base: str, chat_id: str, text: str, file_paths: list[Path]
+) -> tuple[bool | None, bool]:
+    """Send images as a media group, reporting (ok, media_failed).
+
+    ``ok`` keeps the legacy three-state meaning of
+    ``_send_telegram_media_group``. Same anti-duplicate policy as
+    ``_send_telegram_video_with_status``: never append a text message after a
+    transport timeout (the photo may already be in the chat); that outcome is
+    (None, True).
     """
     media = []
     files: dict[str, tuple] = {}
@@ -223,7 +293,7 @@ def _send_telegram_media_group(api_base: str, chat_id: str, text: str, file_path
                 files[f"img{i}"] = (fp.name, fh, "image/jpeg")
 
         if not media:
-            return False
+            return False, True
 
         resp = _telegram_post(
             f"{api_base}/sendMediaGroup",
@@ -232,21 +302,27 @@ def _send_telegram_media_group(api_base: str, chat_id: str, text: str, file_path
             timeout=60,
         )
         if resp.ok:
-            return True
+            return True, False
         log.warning("Media group send failed: %s", resp.text[:200])
-        return _send_telegram_text(api_base, chat_id, text)
+        return _send_telegram_text(api_base, chat_id, text), True
     except requests.Timeout as e:
         log.warning(
             "Media group timeout (may already be delivered); marking uncertain, no text fallback: %s",
             _sanitize_exc(e),
         )
-        return None
+        return None, True
     except requests.RequestException as e:
         log.warning("Media group error (will retry later, no text fallback): %s", _sanitize_exc(e))
-        return False
+        return False, True
     finally:
         for fh in open_handles:
             fh.close()
+
+
+def _send_telegram_media_group(api_base: str, chat_id: str, text: str, file_paths: list[Path]) -> bool | None:
+    """Legacy thin wrapper: media group outcome only (see *_with_status)."""
+    ok, _ = _send_telegram_media_group_with_status(api_base, chat_id, text, file_paths)
+    return ok
 
 
 def _send_telegram_text(api_base: str, chat_id: str, text: str) -> bool:

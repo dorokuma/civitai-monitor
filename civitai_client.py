@@ -218,14 +218,24 @@ def fetch_page(
         params["browsingLevel"] = 31
         actual_base = "https://civitai.red/api/v1"
 
+    track_label = "NSFW" if nsfw is True else ("SFW" if nsfw is False else "ALL")
     try:
         resp = safe_get(f"{actual_base}/images", params=params)
         resp.raise_for_status()
         data = resp.json()
+        # A non-object payload (list/str/number) means the API contract broke:
+        # an AttributeError here would escape the FetchPageError wrapper, the
+        # scan would exit 0 and the failed page would go unnoticed.
+        if not isinstance(data, dict):
+            raise FetchPageError(
+                f"fetch_page failed for @{username} (track={track_label}): "
+                f"unexpected JSON payload type {type(data).__name__}, expected object"
+            )
         items = data.get("items", [])
-        next_cursor = data.get("metadata", {}).get("nextCursor", "")
+        meta = data.get("metadata")
+        meta = meta if isinstance(meta, dict) else {}
+        next_cursor = meta.get("nextCursor", "")
         return items, next_cursor
     except requests.RequestException as e:
-        track_label = "NSFW" if nsfw is True else ("SFW" if nsfw is False else "ALL")
         log.warning("Page query failed (track=%s): %s", track_label, e)
         raise FetchPageError(f"fetch_page failed for @{username} (track={track_label}): {e}") from e

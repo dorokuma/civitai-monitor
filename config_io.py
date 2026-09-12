@@ -211,8 +211,18 @@ def load_config(path: Path | None = None) -> MonitorConfig | None:
     for p in paths:
         if p.exists():
             log.info("Loading config from %s", p)
-            with open(p, encoding="utf-8") as f:
-                raw = yaml.safe_load(f) or {}
+            try:
+                with open(p, encoding="utf-8") as f:
+                    raw = yaml.safe_load(f) or {}
+            except yaml.YAMLError as e:
+                # Non-atomic editor saves can expose a half-written file for a
+                # moment; treat it like a validation failure (return None) so
+                # callers fall back to the minimal config instead of crashing.
+                log.error("Config YAML parse failed for %s: %s", p, e)
+                return None
+            if not isinstance(raw, dict):
+                log.error("Config file %s is not a YAML mapping (got %s)", p, type(raw).__name__)
+                return None
             # Environment variable overrides for sensitive fields
             if os.environ.get("CIVITAI_BOT_TOKEN"):
                 raw.setdefault("telegram", {})["bot_token"] = os.environ["CIVITAI_BOT_TOKEN"]
