@@ -29,5 +29,8 @@ monitor_status.json
 # Runtime state files
 active_backfills.json
 interval.json
+reconciliation_status.json
+# backfill flock sentinels are permanent (never unlinked, see _release_backfill_lock)
+.backfill_lock_*.lck
 # Local optimization documents
 optimization_logs/

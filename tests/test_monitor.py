@@ -398,7 +398,7 @@ class TestPushLifecycleState:
     def test_mark_and_clear_pending(self, tmp_path):
         mark_pending(tmp_path, "tg1", "alice", 42, ts=1000.0, retries=0)
         data = load_pending_map(tmp_path, "tg1", "alice")
-        assert data == {42: (1000.0, 0)}
+        assert data == {42: (1000.0, 0, 0)}
         clear_pending(tmp_path, "tg1", "alice", 42)
         assert load_pending_map(tmp_path, "tg1", "alice") == {}
 
@@ -407,7 +407,7 @@ class TestPushLifecycleState:
         mark_inflight(tmp_path, "tg1", "alice", 8)
         pending = adopt_stale_inflight(tmp_path, "tg1", "alice")
         assert set(pending.keys()) == {7, 8}
-        assert all(r == 0 for _, r in pending.values())
+        assert all(r == 0 for _, r, _mf in pending.values())
         assert load_push_timestamps(tmp_path, "inflight", "tg1", "alice") == {}
 
     def test_adopt_stale_inflight_preserves_existing_retries(self, tmp_path):
@@ -457,14 +457,14 @@ class TestPushLifecycleState:
         update_pending_map(tmp_path, "tg1", "bob", add={1: (10.0, 0), 2: (20.0, 1)})
         update_pending_map(tmp_path, "tg1", "bob", add={3: (30.0, 0)}, remove={1})
         data = load_pending_map(tmp_path, "tg1", "bob")
-        assert data == {2: (20.0, 1), 3: (30.0, 0)}
+        assert data == {2: (20.0, 1, 0), 3: (30.0, 0, 0)}
 
     def test_pending_legacy_float_loads_as_retries_zero(self, tmp_path):
         """Old on-disk format was id→float; must still load."""
         path = tmp_path / "pending_push_tg1_alice.json"
         path.write_text('{"42": 1000.5}')
         data = load_pending_map(tmp_path, "tg1", "alice")
-        assert data == {42: (1000.5, 0)}
+        assert data == {42: (1000.5, 0, 0)}
 
     def test_pending_confirm_window_constant(self):
         assert PENDING_CONFIRM_SECONDS == 30 * 60

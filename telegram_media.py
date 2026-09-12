@@ -84,7 +84,16 @@ def _rewind_upload_files(files: dict | None) -> None:
         for obj in candidates:
             seek = getattr(obj, "seek", None)
             if callable(seek):
-                obj.seek(0)
+                try:
+                    obj.seek(0)
+                except ValueError as e:
+                    # A closed handle raises ValueError ("seek of closed
+                    # file"), not OSError. Left bare it would escape the retry
+                    # loop in _telegram_post and hit the per-item catch;
+                    # mapping it onto OSError funnels it into the existing
+                    # rewind guard there, which converts it to
+                    # requests.RequestException like any other rewind failure.
+                    raise OSError(f"cannot rewind file handle: {e}") from e
 
 
 def _telegram_post(
@@ -175,9 +184,11 @@ def send_to_telegram_detailed(
                      upload, HTTP 400, 429 exhausted, transport error, or an
                      uncertain timeout). A pure-text send never sets it.
 
-    Anti-duplicate policy (unchanged): after a transport timeout the text
-    fallback is NOT sent (the media may already be in the chat); that
-    outcome is (False, True).
+    Timeout policy: after an uncertain transport timeout the text fallback
+    is NOT sent (the media may already be in the chat) and the outcome is
+    (False, True). The caller must not mark the item pushed; the monitor
+    re-sends the whole item on a later scan, which can duplicate an
+    already-delivered media — accepted over silently dropping it.
     """
     api_base = f"{_tg_api_base}/bot{bot_token}"
 
@@ -227,6 +238,12 @@ def _send_telegram_video_with_status(
 
     ``media_failed`` is True whenever the media upload did not succeed
     (HTTP error, transport error, or uncertain timeout).
+
+    Caller view: send_to_telegram_detailed folds ``ok`` via ``ok is True``,
+    so a timeout surfaces to the monitor as (False, True) — not pushed, and
+    the whole item is re-sent on a later scan. A video that was in fact
+    delivered before the timeout may therefore be pushed twice; that
+    trade-off is accepted over silently losing the media.
     """
     size_mb = video_path.stat().st_size / 1048576
     try:
@@ -271,10 +288,13 @@ def _send_telegram_media_group_with_status(
     """Send images as a media group, reporting (ok, media_failed).
 
     ``ok`` keeps the legacy three-state meaning of
-    ``_send_telegram_media_group``. Same anti-duplicate policy as
+    ``_send_telegram_media_group``. Same timeout policy as
     ``_send_telegram_video_with_status``: never append a text message after a
     transport timeout (the photo may already be in the chat); that outcome is
-    (None, True).
+    (None, True) here and folds to (False, True) in send_to_telegram_detailed
+    — the monitor re-sends the whole item on a later scan, so a group that
+    was in fact delivered before the timeout may be pushed twice (accepted
+    over silently losing the media).
     """
     media = []
     files: dict[str, tuple] = {}

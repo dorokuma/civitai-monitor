@@ -232,6 +232,21 @@ def fetch_page(
                 f"unexpected JSON payload type {type(data).__name__}, expected object"
             )
         items = data.get("items", [])
+        # A non-list `items` (str/int/None) means the API contract broke: it
+        # used to crash downstream (AttributeError/TypeError) outside the
+        # FetchPageError classification, silently skipping the creator while
+        # the scan still exited 0.
+        if not isinstance(items, list):
+            raise FetchPageError(
+                f"fetch_page failed for @{username} (track={track_label}): "
+                f"unexpected items type {type(items).__name__}, expected list"
+            )
+        # Lenient element guard, mirroring the metadata fallback below: drop
+        # non-object entries instead of crashing on a downstream .get(). A
+        # whole-payload contract break is already handled by the list-type
+        # check above; individual junk entries only shrink the page, so filter
+        # them and keep going (same lenient philosophy as the metadata guard).
+        items = [i for i in items if isinstance(i, dict)]
         meta = data.get("metadata")
         meta = meta if isinstance(meta, dict) else {}
         next_cursor = meta.get("nextCursor", "")

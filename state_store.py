@@ -20,8 +20,12 @@ PENDING_CONFIRM_SECONDS = 30 * 60  # 30 minutes
 # (caps the "maybe already delivered" loop at a single extra push attempt).
 PENDING_MAX_RETRIES = 1
 
-# Pending records: id → (ts, retries). Legacy on-disk value may be a bare float.
-PendingMap = dict[int, tuple[float, int]]
+# Pending records: id → (ts, retries, media_failed). ``media_failed`` is 1
+# when the media is KNOWN not to have reached Telegram (upload failed after
+# the text fallback, or a transient download failure) and 0 when delivery is
+# merely uncertain (timeout, crash mid-send). Legacy on-disk values (bare
+# float, or {"ts", "retries"} without "media_failed") load with mf=0.
+PendingMap = dict[int, tuple[float, int, int]]
 
 
 class StateWriteError(Exception):
@@ -293,17 +297,46 @@ def clear_inflight(state_dir: Path, tg_id: str, username: str, item_id: int) -> 
     )
 
 
-def _parse_pending_value(v: Any) -> tuple[float, int] | None:
+def _parse_pending_value(v: Any) -> tuple[float, int, int] | None:
+    """Parse an on-disk pending value into (ts, retries, media_failed).
+
+    Backward compatible with every historical shape: the current
+    {"ts", "retries", "media_failed"} dict, the v1.3.0 {"ts", "retries"} dict
+    (media_failed defaults to 0) and the ancient bare-float form.
+    """
     try:
         if isinstance(v, dict):
-            return float(v.get("ts", 0)), int(v.get("retries", 0))
-        return float(v), 0
+            return (
+                float(v.get("ts", 0)),
+                int(v.get("retries", 0)),
+                1 if v.get("media_failed", 0) else 0,
+            )
+        return float(v), 0, 0
     except (TypeError, ValueError):
         return None
 
 
+def _normalize_pending_entry(entry: Any) -> tuple[float, int, int]:
+    """Coerce an in-memory pending entry to (ts, retries, media_failed).
+
+    Accepts the extended 3-tuple and the legacy (ts, retries) 2-tuple
+    (media_failed defaults to 0) so callers written against the old
+    PendingMap shape keep working.
+    """
+    try:
+        ts = float(entry[0])
+        retries = int(entry[1])
+        mf = entry[2] if len(entry) > 2 else 0
+    except (TypeError, ValueError, IndexError) as e:
+        raise ValueError(f"malformed pending entry: {entry!r}") from e
+    return ts, retries, 1 if mf else 0
+
+
 def load_pending_map(state_dir: Path, tg_id: str, username: str) -> PendingMap:
-    """Load pending id → (ts, retries). Supports legacy float-only values."""
+    """Load pending id → (ts, retries, media_failed).
+
+    Supports legacy float-only and (ts, retries) values (media_failed 0).
+    """
     path = _push_state_file(state_dir, "pending", tg_id, username)
     if not path.exists():
         return {}
@@ -328,8 +361,8 @@ def load_pending_map(state_dir: Path, tg_id: str, username: str) -> PendingMap:
 
 def _write_pending_map(path: Path, data: PendingMap) -> None:
     serializable = {
-        str(k): {"ts": ts, "retries": retries}
-        for k, (ts, retries) in sorted(data.items())
+        str(k): {"ts": ts, "retries": retries, "media_failed": mf}
+        for k, (ts, retries, mf) in sorted(data.items())
     }
     _atomic_write(path, json.dumps(serializable, indent=2))
 
@@ -353,7 +386,9 @@ def update_pending_map(
             with FileLock(str(lock_path), timeout=10):
                 data = load_pending_map(state_dir, tg_id, username)
                 if add:
-                    data.update(add)
+                    data.update(
+                        {iid: _normalize_pending_entry(v) for iid, v in add.items()}
+                    )
                 if remove:
                     for iid in remove:
                         data.pop(iid, None)
@@ -384,11 +419,25 @@ def mark_pending(
     *,
     ts: float | None = None,
     retries: int = 0,
+    media_failed: bool = False,
 ) -> None:
-    """Record uncertain delivery (timeout or leftover inflight after crash)."""
+    """Record uncertain delivery (timeout or leftover inflight after crash).
+
+    ``media_failed=True`` marks the record as "the media definitively did
+    not leave this machine" (upload failed after the text fallback, or a
+    transient download failure). The monitor re-sends such records as soon
+    as the item reappears on a page, regardless of PENDING_CONFIRM_SECONDS;
+    uncertain (mf=0) records keep the fresh-confirm promotion semantics.
+    """
     update_pending_map(
         state_dir, tg_id, username,
-        add={item_id: (ts if ts is not None else time.time(), int(retries))},
+        add={
+            item_id: (
+                ts if ts is not None else time.time(),
+                int(retries),
+                1 if media_failed else 0,
+            )
+        },
     )
 
 
@@ -402,8 +451,11 @@ def adopt_stale_inflight(state_dir: Path, tg_id: str, username: str) -> PendingM
     If a leftover inflight ID already has a pending entry (e.g. the process
     crashed after mark_pending but before clear_inflight in the outcome=None
     path), the existing retries count is preserved so the PENDING_MAX_RETRIES
-    cap is not bypassed. New inflight IDs (genuine crash mid-send, no prior
-    pending) are adopted with retries=0 as before.
+    cap is not bypassed. The OLDER of the two timestamps wins (a fresh
+    inflight stamp must not reset the confirm window mid-retry) and the
+    media_failed flag is OR-merged (adoption is delivery-uncertain, so an
+    existing mf=1 survives). New inflight IDs (genuine crash mid-send, no
+    prior pending) are adopted with retries=0 and media_failed=0 as before.
 
     Returns the pending map after adoption.
     """
@@ -420,10 +472,17 @@ def adopt_stale_inflight(state_dir: Path, tg_id: str, username: str) -> PendingM
     add: PendingMap = {}
     for iid, ts in inflight.items():
         if iid in existing:
-            _ts, retries = existing[iid]
-            add[iid] = (ts, retries)
+            prev_ts, retries, mf = existing[iid]
+            # Keep the OLDER ts: the inflight marker is re-stamped on every
+            # send attempt, so adopting its fresh ts would restart the
+            # confirm window mid-retry (after a later crash the item would
+            # look freshly parked instead of awaiting its retry).
+            # mf is OR-merged: adoption is delivery-uncertain (the inflight
+            # marker implies nothing about delivery), so it can never clear
+            # an existing mf=1 — mf | 0 == mf.
+            add[iid] = (min(float(ts), prev_ts), retries, mf)
         else:
-            add[iid] = (ts, 0)
+            add[iid] = (float(ts), 0, 0)
     update_pending_map(
         state_dir, tg_id, username,
         add=add,

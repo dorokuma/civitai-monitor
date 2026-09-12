@@ -609,13 +609,21 @@ def _finalize_send_outcome(
         # retries=0 on every scan, bypassing PENDING_MAX_RETRIES.
         if pushed_dir is not None and tg_id is not None:
             existing = load_pending_map(pushed_dir, tg_id, username)
-            prev_retries = existing[item_id][1] if item_id in existing else 0
+            prev = existing.get(item_id)
+            prev_retries = prev[1] if prev else 0
             retries = max(prev_retries, 0)
-            mark_pending(pushed_dir, tg_id, username, item_id, retries=retries)
+            # mf is sticky (OR-preserved): a prior known-not-delivered record
+            # must not be downgraded to "uncertain" by a later outcome.
+            prev_mf = bool(prev[2]) if prev else False
+            mark_pending(
+                pushed_dir, tg_id, username, item_id,
+                retries=retries, media_failed=prev_mf,
+            )
             clear_inflight(pushed_dir, tg_id, username, item_id)
             log.info(
-                "Parked id=%d for @%s as pending (uncertain delivery, retries=%d)",
-                item_id, username, retries,
+                "Parked id=%d for @%s as pending (uncertain delivery, retries=%d, "
+                "media_failed=%d)",
+                item_id, username, retries, int(prev_mf),
             )
         return False
     # outcome is False: send definitively failed.
@@ -696,11 +704,17 @@ def process_and_push(
                     existing = load_pending_map(pushed_dir, tg_id, username)
                     prev_retries = existing[item_id][1] if item_id in existing else 0
                     retries = max(prev_retries, 0)
-                    mark_pending(pushed_dir, tg_id, username, item_id, retries=retries)
+                    # mf=1: the locally downloaded media did NOT leave this
+                    # machine, so the next scan must RE-send it — the record
+                    # must never be fresh-promoted like an uncertain one.
+                    mark_pending(
+                        pushed_dir, tg_id, username, item_id,
+                        retries=retries, media_failed=True,
+                    )
                     clear_inflight(pushed_dir, tg_id, username, item_id)
                     log.info(
                         "Parked id=%d for @%s as pending (media upload failed after "
-                        "text fallback, retries=%d)",
+                        "text fallback, retries=%d, media_failed=1)",
                         item_id, username, retries,
                     )
                 return False
@@ -722,11 +736,13 @@ def process_and_push(
     def _send_transient_download_failure(text: str) -> bool:
         """Send a text-only notice for a transient download failure.
 
-        The item is parked as pending (reusing the existing retries counter)
-        so the next scan can retry the full download+push. It is NOT marked
-        as pushed — the user should get another chance to receive the media.
-        The retry count is capped by PENDING_MAX_RETRIES via the existing
-        pending mechanism in _fetch_and_process_page.
+        The item is parked as pending (reusing the existing retries counter,
+        media_failed=1: no media left this machine) so the next scan that
+        finds the item on a page retries the full download+push
+        unconditionally (not gated by PENDING_CONFIRM_SECONDS). It is NOT
+        marked as pushed — the user should get another chance to receive the
+        media. The retry count is capped by PENDING_MAX_RETRIES via the
+        existing pending mechanism in _fetch_and_process_page.
         """
         if pushed_dir is not None and tg_id is not None:
             try:
@@ -743,7 +759,12 @@ def process_and_push(
             existing = load_pending_map(pushed_dir, tg_id, username)
             prev_retries = existing[item_id][1] if item_id in existing else 0
             try:
-                mark_pending(pushed_dir, tg_id, username, item_id, retries=prev_retries)
+                # mf=1: the download failed before any upload, so the next
+                # on-page scan must perform a real re-send.
+                mark_pending(
+                    pushed_dir, tg_id, username, item_id,
+                    retries=prev_retries, media_failed=True,
+                )
                 clear_inflight(pushed_dir, tg_id, username, item_id)
             except StateWriteError:
                 log.error(
@@ -904,25 +925,57 @@ def _fetch_and_process_page(
     new_on_page = [img for img in valid_items if img["id"] not in pushed_ids]
     did_push_attempt = False
 
-    for item_id, (ts, retries) in list(pending.items()):
+    for item_id, (ts, retries, media_failed) in list(pending.items()):
         if item_id in page_ids:
             continue
         age = now - float(ts)
-        if age < PENDING_CONFIRM_SECONDS:
-            _record_push_success(
-                item_id, username,
-                pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
+        if media_failed and retries < PENDING_MAX_RETRIES:
+            # mf=1: the media is KNOWN not to have reached Telegram. The item
+            # is not on this page, so it cannot be re-sent this scan — and the
+            # fresh promotion below is only sound for *uncertain* (mf=0)
+            # records, whose purpose is avoiding a duplicate push. Promoting
+            # a mf=1 record here silently dropped the media whenever another
+            # track (e.g. SFW) scanned first and the item's own track had
+            # not. Keep it pending; the on-page branch performs the real
+            # re-send when the item reappears on a page.
+            log.info(
+                "Pending id=%d for @%s is off-page with media_failed=1 "
+                "(age=%.0fs, retries=%d); keeping pending for a real re-send",
+                item_id, username, age, retries,
             )
+            continue
+        if age < PENDING_CONFIRM_SECONDS:
+            # Fresh: mf=0 records may already be delivered (re-sending could
+            # duplicate — the original anti-duplicate promotion), and mf=1
+            # records reaching this point have retries at the cap, i.e. they
+            # are terminal. Promote without re-send.
+            try:
+                _record_push_success(
+                    item_id, username,
+                    pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
+                )
+            except StateWriteError as e:
+                log.warning(
+                    "Could not promote fresh pending id=%d for @%s: %s",
+                    item_id, username, e,
+                )
             continue
         log.info(
             "Pending id=%d for @%s is off-window and expired (%.0fs, retries=%d); "
             "promoting without re-send",
             item_id, username, age, retries,
         )
-        _record_push_success(
-            item_id, username,
-            pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
-        )
+        try:
+            _record_push_success(
+                item_id, username,
+                pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
+            )
+        except StateWriteError as e:
+            log.warning(
+                "Could not promote expired pending id=%d for @%s: %s",
+                item_id, username, e,
+            )
+            continue
 
     if new_on_page:
         for img in reversed(new_on_page):
@@ -944,37 +997,80 @@ def _fetch_and_process_page(
                     continue
 
                 if item_id in pending:
-                    ts, retries = pending[item_id]
+                    ts, retries, media_failed = pending[item_id]
                     age = now - float(ts)
-                    if age < PENDING_CONFIRM_SECONDS:
+                    if media_failed and retries >= PENDING_MAX_RETRIES:
+                        # Terminal: the re-send cap is reached — existing
+                        # capping semantics, surfaced as a warning because a
+                        # mf=1 promote means the media is definitively lost.
+                        log.warning(
+                            "Pending id=%d for @%s still media_failed=1 with "
+                            "retries=%d (cap %d); promoting to pushed without "
+                            "further re-send",
+                            item_id, username, retries, PENDING_MAX_RETRIES,
+                        )
+                        _record_push_success(
+                            item_id, username,
+                            pushed_ids=pushed_ids, pushed_dir=pushed_dir,
+                            tg_id=tg_id,
+                        )
+                        continue
+                    if media_failed:
+                        # mf=1: the media is KNOWN not to have been delivered
+                        # (upload failed after the text fallback, or a
+                        # transient download failure). A fresh pending ts is
+                        # NOT evidence of delivery, so the
+                        # PENDING_CONFIRM_SECONDS gate must not apply —
+                        # gating here silently promoted every media-failed
+                        # item on the next 600s scan (the production bug
+                        # this fixes). Reserve the retry, then re-send below.
                         log.info(
-                            "Pending id=%d for @%s is fresh (%.0fs < %ds); promoting to pushed without re-send",
+                            "Pending id=%d for @%s media_failed=1 (age=%.0fs, "
+                            "retries=%d); re-sending media without the "
+                            "fresh-confirm gate",
+                            item_id, username, age, retries,
+                        )
+                        mark_pending(
+                            pushed_dir, tg_id, username, item_id,
+                            ts=now, retries=retries + 1, media_failed=True,
+                        )
+                        pending[item_id] = (now, retries + 1, 1)
+                    elif age < PENDING_CONFIRM_SECONDS:
+                        log.info(
+                            "Pending id=%d for @%s is fresh (%.0fs < %ds); "
+                            "promoting to pushed without re-send",
                             item_id, username, age, PENDING_CONFIRM_SECONDS,
                         )
                         _record_push_success(
                             item_id, username,
-                            pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
+                            pushed_ids=pushed_ids, pushed_dir=pushed_dir,
+                            tg_id=tg_id,
                         )
                         continue
-                    if retries >= PENDING_MAX_RETRIES:
+                    elif retries >= PENDING_MAX_RETRIES:
                         log.info(
-                            "Pending id=%d for @%s expired with retries=%d; promoting without further re-send",
+                            "Pending id=%d for @%s expired with retries=%d; "
+                            "promoting without further re-send",
                             item_id, username, retries,
                         )
                         _record_push_success(
                             item_id, username,
-                            pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
+                            pushed_ids=pushed_ids, pushed_dir=pushed_dir,
+                            tg_id=tg_id,
                         )
                         continue
-                    log.info(
-                        "Pending id=%d for @%s expired (%.0fs, retries=%d); one retry push",
-                        item_id, username, age, retries,
-                    )
-                    mark_pending(
-                        pushed_dir, tg_id, username, item_id,
-                        ts=now, retries=retries + 1,
-                    )
-                    pending[item_id] = (now, retries + 1)
+                    else:
+                        log.info(
+                            "Pending id=%d for @%s expired (%.0fs, retries=%d); "
+                            "one retry push",
+                            item_id, username, age, retries,
+                        )
+                        mark_pending(
+                            pushed_dir, tg_id, username, item_id,
+                            ts=now, retries=retries + 1,
+                            media_failed=bool(media_failed),
+                        )
+                        pending[item_id] = (now, retries + 1, int(bool(media_failed)))
 
                 did_push_attempt = True
                 process_and_push(

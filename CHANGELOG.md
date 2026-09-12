@@ -2,6 +2,16 @@
 
 This file follows the [Keep a Changelog](https://keepachangelog.com/) format, and version numbers follow [SemVer](https://semver.org/).
 
+## [1.4.0] - 2026-09-13
+
+### Fixed
+- **Media-retry lifecycle actually works now**: pending entries carry a `media_failed` flag (backward-compatible with the old `(ts, retries)` on-disk format). A media upload that certainly failed is no longer swallowed by the 30-minute fresh-promotion branches (production logs showed 110 silent promotions, 0 real retries): on-page items with retries left are re-sent unconditionally, off-page items are kept pending until they reappear, and exhausted items are promoted with a warning.
+- **adopt_stale_inflight no longer refreshes the pending timestamp** (merges with min(ts) and ORs media_failed), so a crash mid-retry cannot reset the confirmation window.
+- **Downloads reject empty bodies** (0-byte "success" files are deleted and retried later) and the "Already exists" short-circuit re-downloads a zero-byte existing file instead of freezing the loss.
+- **API guards completed**: `items` that is not a list raises `FetchPageError` (was a silently skipped creator with exit 0); non-dict items are filtered.
+- **Cron/process hygiene**: /scan now registers its process so /stop can kill it; backfill lock files are no longer unlinked (removes the flock+unlink double-acquire window); the off-page promotion loop is per-item exception isolated; `reconciliation_status.json` and backfill lock files are gitignored.
+- telegram_media docstrings now document the timeout -> full-resend policy (duplicates preferred over loss).
+
 ## [1.3.0] - 2026-09-12
 
 ### Fixed

@@ -357,7 +357,8 @@ def _acquire_backfill_lock(tg_id: str, username: str) -> tuple[int, Path] | None
     """Acquire an exclusive fcntl flock for the backfill. Returns (fd, path) or None.
 
     The lock is held until the caller releases it via _release_backfill_lock().
-    Use the .backfill_lock_*.lck file as a sentinel; remove the file on release.
+    The .backfill_lock_*.lck file is a permanent sentinel: _release_backfill_lock
+    never unlinks it (unlink-after-unlock would race with a concurrent opener).
     """
     lock_path = SCRIPT_DIR / f".backfill_lock_{tg_id}_{username}.lck"
     fd = None
@@ -375,14 +376,19 @@ def _acquire_backfill_lock(tg_id: str, username: str) -> tuple[int, Path] | None
 
 
 def _release_backfill_lock(fd: int, path: Path) -> None:
-    """Release the fcntl flock and remove the lock file."""
+    """Release the fcntl flock (the lock file itself is left on disk).
+
+    Deliberately NOT unlinked: unlink-after-unlock races with a waiter that
+    has just opened the same path — it would flock the fresh inode while we
+    still hold the orphaned one, letting two processes both believe they own
+    the lock. The file is a permanent sentinel; flock on the live inode is
+    what protects concurrent backfills, and the _resume_stale_backfills
+    probe no longer amplifies the race either. `path` stays in the signature
+    for call-site compatibility.
+    """
     try:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
-    except OSError:
-        pass
-    try:
-        os.unlink(path)
     except OSError:
         pass
 
@@ -481,7 +487,7 @@ def _save_reconciliation_last_success(date_str: str, cfg: MonitorConfig | None =
 
 _scan_interval: int = 600
 
-# Track current scheduled-scan / reconciliation subprocesses so cmd_stop can terminate
+# Track current scheduled-scan / manual-scan (/scan) / reconciliation subprocesses so cmd_stop can terminate
 # them without using pgrep — pgrep "python3.*monitor.py" would also match a
 # running backfill subprocess and kill the wrong thing.
 _current_scan_proc: asyncio.subprocess.Process | None = None
@@ -1109,6 +1115,15 @@ async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             stderr=asyncio.subprocess.PIPE,
             cwd=str(SCRIPT_DIR),
         )
+        # Publish the handle so /stop (cmd_stop) and _kill_running_scan can
+        # terminate a manual scan too — same registration pattern as
+        # scheduled_scan_cron below. /scan and the cron share one slot: a
+        # manual scan started while a scheduled scan runs overwrites the
+        # registration (the two monitor.py processes serialise themselves via
+        # .monitor.lock, so the loser exits 75 on its own). Cleanup only
+        # clears the slot while this proc still owns it.
+        global _current_scan_proc
+        _current_scan_proc = proc
         try:
             _out, err = await communicate_with_idle_timeout(proc, timeout=1800)
         except asyncio.TimeoutError:
@@ -1120,6 +1135,13 @@ async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 await proc.wait()
             await update.message.reply_text("⏱ 扫描空闲超时（30 分钟无输出）已终止。")
             return
+        finally:
+            # Unregister once the subprocess is done (or was terminated) so a
+            # finished handle never lingers in the /stop slot. Only clear the
+            # slot while this proc still owns it — a concurrent cron
+            # registration wins.
+            if _current_scan_proc is proc:
+                _current_scan_proc = None
         stderr = err.decode("utf-8") if isinstance(err, bytes) else err
         if proc.returncode == 75:
             progress = _read_scan_status()
