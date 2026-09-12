@@ -41,7 +41,7 @@ from telegram import BotCommand, Update
 from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
-from bot_ui import paginated_user_keyboard
+from bot_ui import paginated_user_keyboard, resolve_callback_username
 from state_store import _atomic_write
 
 # Import unified config from monitor / config_io (re-exported by monitor)
@@ -102,6 +102,15 @@ async def _shutdown_background_tasks(application: Application) -> None:
 # Admin chat ids to alert on unhandled errors (populated from config in main()).
 _ADMIN_CHAT_IDS: list[int] = []
 
+# Bot handle used by the cron loops for failure alerts (populated in post_init;
+# the cron coroutines have no other way to reach the Bot instance).
+_alert_bot = None
+
+# State-flip alert dedup for cron failures: job -> {"failing": bool,
+# "last_alert_date": "YYYY-MM-DD"}. Alerts fire on the success->failure flip
+# and at most once per day while a failure persists (anti-storm).
+_cron_alert_state: dict[str, dict] = {}
+
 # Debounce identical admin error alerts (once per error class / 5 minutes).
 _last_error_alert: dict[str, float] = {}
 _ERROR_ALERT_INTERVAL = 300.0
@@ -159,6 +168,69 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception:
         # Never let the error handler itself crash the dispatcher.
         log.debug("error_handler: admin-alert dispatch failed", exc_info=True)
+
+
+def _cron_alert_gate(job: str, *, failing: bool, today: str | None = None) -> str | None:
+    """Decide whether a cron outcome should page the admins (anti-storm gate).
+
+    Dedup strategy — alert on state flip only:
+      * success -> failure  : alert immediately ("fail")
+      * failure -> failure  : silent, except ONE summary per 24h ("digest")
+      * failure -> success  : one recovery notice ("recover")
+      * success -> success  : nothing
+    State is in-process: it resets on restart, which re-arms a single alert if
+    the failure is still present — acceptable, and better than silence.
+    """
+    if today is None:
+        today = datetime.now().strftime("%Y-%m-%d")
+    state = _cron_alert_state.setdefault(job, {"failing": False, "last_alert_date": ""})
+    was_failing = bool(state["failing"])
+    if failing:
+        if not was_failing:
+            state["failing"] = True
+            state["last_alert_date"] = today
+            return "fail"
+        if state["last_alert_date"] != today:
+            state["last_alert_date"] = today
+            return "digest"
+        return None
+    if was_failing:
+        state["failing"] = False
+        state["last_alert_date"] = ""
+        return "recover"
+    return None
+
+
+_CRON_ALERT_LABELS = {"scan": "定时扫描", "reconciliation": "每日对账"}
+
+
+async def _report_cron_outcome(job: str, *, failing: bool, detail: str = "") -> None:
+    """Best-effort Telegram alert about a cron outcome.
+
+    Never raises: a failing send (or any other error here) must never take
+    down the cron loop. Sends one message per admin chat in _ADMIN_CHAT_IDS.
+    """
+    try:
+        kind = _cron_alert_gate(job, failing=failing)
+        if kind is None:
+            return
+        label = _CRON_ALERT_LABELS.get(job, job)
+        if kind == "recover":
+            text = f"✅ {label}已恢复正常"
+        else:
+            head = f"⚠️ {label}失败" if kind == "fail" else f"⚠️ {label}仍在失败（每日摘要）"
+            text = f"{head}\n{detail}" if detail else head
+        bot = _alert_bot
+        if bot is None or not _ADMIN_CHAT_IDS:
+            log.debug("Cron alert skipped (no bot/admin chats configured): %s", text)
+            return
+        for cid in _ADMIN_CHAT_IDS:
+            try:
+                await bot.send_message(chat_id=cid, text=text)
+            except Exception:
+                log.debug("Failed to deliver cron alert to admin %s", cid, exc_info=True)
+    except Exception:
+        log.debug("Cron alert dispatch failed", exc_info=True)
 
 
 def _application_builder_for_config(token: str, api_base_url: str):
@@ -734,7 +806,10 @@ async def cmd_remove_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -
 
         # Remove user
         if data.startswith("rem:"):
-            username = data.split(":", 1)[1]
+            # bot_ui short-hashes usernames that would push callback_data past
+            # Telegram's 64-byte limit; resolve hashes back to the real
+            # username (plain names pass through unchanged).
+            username = resolve_callback_username(data.split(":", 1)[1])
             cfg = read_config()
             users = get_users(cfg, uid)
             if username not in users:
@@ -890,6 +965,14 @@ async def cmd_cleanup(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             days = int(args[1])
         except ValueError:
             await update.message.reply_text("Usage: `/cleanup [days]` — days must be a number.", parse_mode="Markdown")
+            return
+        if days < 1:
+            # 0 or negative makes cleanup_old_caches treat every cached file
+            # as already expired and wipes the whole downloads cache.
+            await update.message.reply_text(
+                "Usage: `/cleanup [days]` — days 必须为 ≥ 1 的整数（0/负数会清空全部缓存，已拒绝）。",
+                parse_mode="Markdown",
+            )
             return
 
     if not DOWNLOAD_DIR.exists():
@@ -1164,7 +1247,8 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
 
         # Start backfill
         if data.startswith("bf:"):
-            username = data.split(":", 1)[1]
+            # Same short-hash resolution as the remove panel (see bot_ui).
+            username = resolve_callback_username(data.split(":", 1)[1])
             await query.edit_message_text(f"⏳ 正在全量回填 @{username}...\n这可能需要一段时间，完成后会通知你", reply_markup=None)
 
             try:
@@ -1213,14 +1297,27 @@ async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProce
          restarted bot can detect a backfill already in progress and not resume
          it. The lock is held for the full backfill lifetime.
 
-    The heartbeat is now an ``asyncio`` task scheduled via ``loop.call_later``,
-    bound to the lifetime of this coroutine. The ``finally`` block cancels the
-    heartbeat and unregisters the backfill, regardless of how we exit (success,
-    timeout, exception). This eliminates the daemon-thread leak that previously
-    kept ``active_backfills.json`` populated forever after a hung task.
+    The heartbeat is an ``asyncio`` timer scheduled via ``loop.call_later``,
+    bound to the lifetime of this coroutine. Each tick carries a generation
+    number: the ``finally`` block bumps the generation BEFORE cancelling, so a
+    tick racing the shutdown can neither refresh nor re-arm the heartbeat (a
+    leaked heartbeat would keep ``active_backfills.json`` fresh forever and
+    permanently suppress scheduled scans until restart). The ``finally`` block
+    also unregisters the backfill regardless of how we exit (success, timeout,
+    exception).
 
-    Returns CompletedProcess, None (timeout), or 'busy' (cross-process lock held).
+    Usernames are re-validated against USERNAME_RE at entry (see below).
+
+    Returns CompletedProcess, None (timeout/invalid username), or 'busy'
+    (cross-process lock held).
     """
+    # Re-validate at the trust boundary: usernames can arrive via Telegram
+    # callback_data or restart-resume paths, and must never reach subprocess
+    # argv or the .backfill_lock_*.lck file name unchecked.
+    if not USERNAME_RE.fullmatch(username or ""):
+        log.error("Backfill rejected: invalid username %r", username)
+        return None
+
     tg_id_str = str(tg_uid)
 
     # Layer 1: cross-process lock. If another bot process holds it, bail out
@@ -1240,17 +1337,33 @@ async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProce
         _register_backfill(tg_id_str, username)
         loop = asyncio.get_running_loop()
         heartbeat_handle: asyncio.TimerHandle | None = None
+        # Generation guard: each tick is armed with the generation that was
+        # current when it was scheduled. The finally block bumps the
+        # generation BEFORE cancelling, so a tick that already fired (or fires
+        # after the coroutine exited) sees a stale generation and refuses to
+        # refresh the registry or reschedule itself. Without this guard a tick
+        # racing the finally block re-arms the heartbeat forever, keeping
+        # active_backfills.json fresh so _sweep_stale_backfills can never
+        # clean it up — scheduled scans/reconciliation would be skipped until
+        # the next bot restart.
+        heartbeat_generation = 0
 
-        def _heartbeat_tick() -> None:
-            """Refresh active_backfills.json. Schedules itself again."""
+        def _heartbeat_tick(generation: int) -> None:
+            """Refresh active_backfills.json. Reschedules itself while current."""
             nonlocal heartbeat_handle
+            if generation != heartbeat_generation:
+                log.debug(
+                    "Backfill heartbeat for @%s: generation %d superseded (%d is current) — stopping",
+                    username, generation, heartbeat_generation,
+                )
+                return
             try:
                 _register_backfill(tg_id_str, username)
             except Exception as e:
                 log.exception("Backfill heartbeat for @%s failed: %s", username, e)  # noqa: TRY401
-            heartbeat_handle = loop.call_later(10.0, _heartbeat_tick)
+            heartbeat_handle = loop.call_later(10.0, _heartbeat_tick, generation)
 
-        heartbeat_handle = loop.call_later(10.0, _heartbeat_tick)
+        heartbeat_handle = loop.call_later(10.0, _heartbeat_tick, heartbeat_generation)
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1290,9 +1403,12 @@ async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProce
                 args=[], returncode=returncode, stdout=out_str, stderr=err_str
             )
         finally:
-            # Heartbeat is always cancelled; active_backfills is always cleared.
-            # This is the only path that touches the registry for a backfill, so
-            # a hung task can no longer leak state.
+            # Heartbeat is always invalidated; active_backfills is always
+            # cleared. This is the only path that touches the registry for a
+            # backfill, so a hung task can no longer leak state. Bump the
+            # generation BEFORE cancel(): cancel() alone cannot stop a tick
+            # that already fired and re-armed itself.
+            heartbeat_generation += 1
             if heartbeat_handle is not None:
                 heartbeat_handle.cancel()
             _unregister_backfill(tg_id_str, username)
@@ -1599,6 +1715,7 @@ async def scheduled_scan_cron() -> None:
                 returncode = int(rc) if rc is not None else -1
                 if returncode == 0:
                     log.info("Scheduled scan completed")
+                    await _report_cron_outcome("scan", failing=False)
                 elif returncode == 75:
                     # monitor.py exits 75 when .monitor.lock is held (i.e. a
                     # backfill claimed the slot). Treat as "skipped", not a
@@ -1606,8 +1723,18 @@ async def scheduled_scan_cron() -> None:
                     log.info("Scheduled scan skipped: monitor lock held (backfill in progress)")
                 else:
                     log.warning("Scheduled scan failed (exit %d)", returncode)
+                    await _report_cron_outcome(
+                        "scan",
+                        failing=True,
+                        detail=f"monitor.py 非零退出（exit {returncode}），本轮扫描可能未完成；将按当前间隔自动重试",
+                    )
             except Exception as e:
                 log.exception("Scheduled scan error: %s", e)  # noqa: TRY401
+                await _report_cron_outcome(
+                    "scan",
+                    failing=True,
+                    detail=f"扫描调度异常：{type(e).__name__}: {e}",
+                )
             if _shutdown_requested:
                 break
             await asyncio.sleep(current_interval)
@@ -1752,6 +1879,7 @@ async def scheduled_reconciliation_cron() -> None:
                         log.info("Daily deep reconciliation completed successfully")
                         _save_reconciliation_last_success(today_str, cfg)
                         daily_retry_count = 0
+                        await _report_cron_outcome("reconciliation", failing=False)
                     elif returncode == 75:
                         log.info("Daily reconciliation skipped: monitor lock held (will retry in 60s)")
                         await asyncio.sleep(60)
@@ -1759,12 +1887,25 @@ async def scheduled_reconciliation_cron() -> None:
                     else:
                         log.warning("Daily reconciliation finished with code %d (will retry)", returncode)
                         daily_retry_count += 1
+                        await _report_cron_outcome(
+                            "reconciliation",
+                            failing=True,
+                            detail=(
+                                f"reconcile 非零退出（exit {returncode}），"
+                                f"今日第 {daily_retry_count}/{MAX_DAILY_RETRIES} 次重试"
+                            ),
+                        )
                         await asyncio.sleep(60)
                         continue
                 except Exception as e:
                     log.exception("Daily reconciliation error: %s", e)  # noqa: TRY401
                     _current_recon_proc = None
                     daily_retry_count += 1
+                    await _report_cron_outcome(
+                        "reconciliation",
+                        failing=True,
+                        detail=f"对账调度异常：{type(e).__name__}: {e}（今日第 {daily_retry_count} 次重试）",
+                    )
                     await asyncio.sleep(60)
                     continue
 
@@ -1790,6 +1931,8 @@ async def scheduled_reconciliation_cron() -> None:
 
 
 async def post_init(application: Application) -> None:
+    global _alert_bot
+    _alert_bot = application.bot
     commands = [
         BotCommand("add", "增加监控对象（支持用户名/链接/@）"),
         BotCommand("remove", "取消监控对象（按钮选择）"),

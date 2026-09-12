@@ -2,6 +2,21 @@
 
 This file follows the [Keep a Changelog](https://keepachangelog.com/) format, and version numbers follow [SemVer](https://semver.org/).
 
+## [1.2.0] - 2026-09-12
+
+### Fixed
+- **Download path traversal**: API-provided item ids are coerced to `int`, file extensions are whitelisted per media type, and the final download path is resolve-checked to stay inside the output directory; a tampered API response can no longer overwrite arbitrary files.
+- **Per-item and per-creator exception isolation**: one malformed API item no longer crashes the scan process and silently skips every later subscription; scans now log, continue, and exit with a stable signal.
+- **Retry-After hardening**: HTTP-date and non-numeric headers no longer crash `RateLimitError` construction, and the wait is capped at 120s so a hostile header cannot pin the monitor lock indefinitely.
+- **Bot token never reaches log files**: Telegram transport errors are sanitized (`/bot<token>` -> `/bot***`) before logging.
+- **State writes degrade gracefully on disk-full**: OSError in `_atomic_write` is wrapped as `StateWriteError` (with tmp cleanup), matching the existing lock-timeout recovery path.
+- **Backfill heartbeat race**: generation guard prevents a self-rescheduling heartbeat from keeping `active_backfills.json` alive forever, which permanently suppressed scheduled scans until restart.
+- **Image downloads capped** (30MB, streamed abort) and `/cleanup` rejects day counts below 1.
+- **CI**: GitHub Actions pinned to commit SHAs.
+
+### Added
+- **Scan/reconciliation failure alerts in Telegram**: admin chats are notified on success->failure transitions, with continuous-failure dedup and a recovery notice; silent missed scans are now visible.
+
 ## [1.1.5] - 2026-08-26
 
 ### Fixed

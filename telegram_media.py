@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import time
 from pathlib import Path
 
@@ -26,6 +27,22 @@ _tg_api_base = "https://api.telegram.org"
 # Limited retries for transient Telegram API pressure (429 etc.)
 _TG_MAX_RETRIES = 4
 _TG_SHORT_RETRY_BASE = 1.0
+
+# requests.RequestException strings embed the full request URL
+# (https://api.telegram.org/bot<token>/...), so logging an exception verbatim
+# leaks the bot token into the log file.  Mask every "/bot<token>" segment
+# before it reaches a log call.
+_BOT_TOKEN_URL_RE = re.compile(r"/bot[^/\s]+")
+
+
+def _sanitize_text(text: str) -> str:
+    """Mask "/bot<token>" URL segments (-> "/bot***"); other text is untouched."""
+    return _BOT_TOKEN_URL_RE.sub("/bot***", str(text))
+
+
+def _sanitize_exc(exc: BaseException) -> str:
+    """Stringify an exception for logging with any bot token masked out."""
+    return _sanitize_text(str(exc))
 
 
 def set_tg_api_base(url: str) -> None:
@@ -102,7 +119,7 @@ def _telegram_post(
                 wait = _TG_SHORT_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5)
                 log.warning(
                     "Telegram transport error, short retry in %.1fs (attempt %d/%d): %s",
-                    wait, attempt + 1, max_retries, e,
+                    wait, attempt + 1, max_retries, _sanitize_exc(e),
                 )
                 time.sleep(wait)
                 continue
@@ -174,11 +191,11 @@ def _send_telegram_video(api_base: str, chat_id: str, text: str, video_path: Pat
     except requests.Timeout as e:
         log.warning(
             "Video send timeout (may already be delivered); marking uncertain, no text fallback: %s",
-            e,
+            _sanitize_exc(e),
         )
         return None
     except requests.RequestException as e:
-        log.warning("Video send error (will retry later, no text fallback): %s", e)
+        log.warning("Video send error (will retry later, no text fallback): %s", _sanitize_exc(e))
         return False
 
 
@@ -221,11 +238,11 @@ def _send_telegram_media_group(api_base: str, chat_id: str, text: str, file_path
     except requests.Timeout as e:
         log.warning(
             "Media group timeout (may already be delivered); marking uncertain, no text fallback: %s",
-            e,
+            _sanitize_exc(e),
         )
         return None
     except requests.RequestException as e:
-        log.warning("Media group error (will retry later, no text fallback): %s", e)
+        log.warning("Media group error (will retry later, no text fallback): %s", _sanitize_exc(e))
         return False
     finally:
         for fh in open_handles:
@@ -241,5 +258,5 @@ def _send_telegram_text(api_base: str, chat_id: str, text: str) -> bool:
         )
         return resp.ok
     except requests.RequestException as e:
-        log.error("Message send failed: %s", e)
+        log.error("Message send failed: %s", _sanitize_exc(e))
         return False

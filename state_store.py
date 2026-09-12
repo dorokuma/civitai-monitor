@@ -41,14 +41,32 @@ def _atomic_write(path: Path, text: str) -> None:
     The fsync before rename lowers the window where a system-level crash
     loses the last write (rename is atomic on the same filesystem, but
     the tmp file's data may still be in the page cache).
+
+    OSError (disk full / ENOSPC, permission denied, ...) is wrapped into
+    ``StateWriteError`` — same contract as the FileLock ``Timeout`` path —
+    so every write entry point (which only catches ``Timeout``) surfaces a
+    single error type to callers instead of letting a raw OSError crash
+    the monitor process. A half-written tmp file is removed on failure;
+    the target file itself is never unlinked (after a successful replace
+    the tmp path is already gone, so the cleanup is a no-op then).
     """
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    tmp.replace(path)
-    path.chmod(0o600)
+    try:
+        with open(tmp, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(path)
+        path.chmod(0o600)
+    except OSError as e:
+        # Best-effort cleanup; never mask the original write error.
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError as cleanup_err:
+            log.warning("Could not remove tmp state file %s: %s", tmp, cleanup_err)
+        raise StateWriteError(
+            f"OSError writing state file {path}: {e} (errno: {e.errno})"
+        ) from e
 
 
 def _safe_user_token(username: str) -> str:

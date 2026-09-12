@@ -2,7 +2,50 @@
 
 from __future__ import annotations
 
+import hashlib
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+# Telegram hard limit: callback_data must be 1-64 bytes.
+_CALLBACK_DATA_MAX_BYTES = 64
+
+# In-process mapping of short_hash -> username, used when a username would
+# push a row's callback_data past Telegram's 64-byte limit.
+#
+# Lifecycle & limits: entries are appended when a keyboard is rendered and
+# live for as long as the bot process — the same lifetime as the inline
+# panels themselves. After a bot restart the mapping is empty, so buttons
+# rendered by a previous process can no longer be resolved to a username
+# (the consumer falls back to exact-name matching and rejects the unknown
+# segment; the user simply re-opens the panel). The 12-hex-char hash gives a
+# 48-bit space — ample for a watch list of a few dozen names. On the
+# astronomically unlikely collision the first username wins and only that
+# one button could mis-resolve.
+_CALLBACK_HASH_TO_USERNAME: dict[str, str] = {}
+
+
+def _short_hash(username: str) -> str:
+    return hashlib.sha256(username.encode("utf-8")).hexdigest()[:12]
+
+
+def _encode_callback_data(item_prefix: str, username: str) -> str:
+    """callback_data for a user row; short-hashed when it would exceed 64 bytes."""
+    data = f"{item_prefix}:{username}"
+    if len(data.encode("utf-8")) <= _CALLBACK_DATA_MAX_BYTES:
+        return data
+    short = _short_hash(username)
+    _CALLBACK_HASH_TO_USERNAME.setdefault(short, username)
+    return f"{item_prefix}:{short}"
+
+
+def resolve_callback_username(raw: str) -> str:
+    """Map a callback_data username segment back to the real username.
+
+    Short-hash segments are resolved via the in-process mapping; anything
+    else (plain names, segments from keyboards rendered by an older bot
+    process) is returned unchanged so consumers can match by exact name.
+    """
+    return _CALLBACK_HASH_TO_USERNAME.get(raw, raw)
 
 
 def paginated_user_keyboard(
@@ -45,7 +88,7 @@ def paginated_user_keyboard(
         keyboard.append([
             InlineKeyboardButton(
                 item_label_fmt.format(u=u),
-                callback_data=f"{item_prefix}:{u}",
+                callback_data=_encode_callback_data(item_prefix, u),
             )
         ])
 

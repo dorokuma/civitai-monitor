@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import random
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,14 @@ MAX_API_PAGE_LIMIT = 200
 MIN_API_PAGE_LIMIT = 1
 
 HTTP_REQUEST_TIMEOUT = 30
+
+# Default 429 wait when the Retry-After header is missing or unusable.
+DEFAULT_RETRY_AFTER_SECONDS = 30
+# Upper bound (seconds) for a single 429 wait.  tenacity sleeps for exactly the
+# value returned by _rate_limit_wait, so a huge/bogus Retry-After (or an
+# HTTP-date far in the future) would otherwise stall the monitor for hours
+# while it holds .monitor.lock.  Anything above the cap waits the cap instead.
+MAX_RATE_LIMIT_WAIT_SECONDS = 120
 
 # ---------------------------------------------------------------------------
 # Global HTTP session (enforces Referer + User-Agent on every request)
@@ -57,10 +67,40 @@ def init_session(http_cfg: HttpConfig) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _parse_retry_after(raw: str | None) -> int:
+    """Best-effort parse of a Retry-After header value (RFC 7231 section 7.1.3).
+
+    The header may be either delay-seconds ("30") or an HTTP-date
+    ("Wed, 21 Oct 2015 07:28:00 GMT") — both are legal, but plain
+    ``int("Wed, ...")`` raises ValueError mid-construction and nobody catches
+    it, crashing the whole scan round.  Unparseable values and values <= 0
+    (e.g. an HTTP-date already in the past) fall back to
+    DEFAULT_RETRY_AFTER_SECONDS instead.
+    """
+    if raw is None:
+        return DEFAULT_RETRY_AFTER_SECONDS
+    text = str(raw).strip()
+    if not text:
+        return DEFAULT_RETRY_AFTER_SECONDS
+    try:
+        seconds = int(text)
+    except ValueError:
+        try:
+            dt = parsedate_to_datetime(text)
+        except (TypeError, ValueError, OverflowError):
+            return DEFAULT_RETRY_AFTER_SECONDS
+        if dt is None:
+            return DEFAULT_RETRY_AFTER_SECONDS
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        seconds = int((dt - datetime.now(timezone.utc)).total_seconds())
+    return seconds if seconds > 0 else DEFAULT_RETRY_AFTER_SECONDS
+
+
 class RateLimitError(requests.RequestException):
     """Raised when the API returns 429 Too Many Requests."""
     def __init__(self, response: requests.Response) -> None:
-        self.retry_after = int(response.headers.get("Retry-After", 30))
+        self.retry_after = _parse_retry_after(response.headers.get("Retry-After"))
         super().__init__(f"429 Rate Limited, retry after {self.retry_after}s")
 
 
@@ -78,10 +118,16 @@ class FetchPageError(Exception):
 
 
 def _rate_limit_wait(retry_state) -> float:
-    """Respect Retry-After header when rate-limited, fall back to exponential backoff."""
+    """Respect Retry-After header when rate-limited, fall back to exponential backoff.
+
+    The Retry-After wait is capped at MAX_RATE_LIMIT_WAIT_SECONDS: tenacity
+    sleeps for exactly the returned value, so a bogus/huge upstream value must
+    never hang the monitor (it holds .monitor.lock while scanning).
+    """
     exc = retry_state.outcome.exception()
     if isinstance(exc, RateLimitError):
-        return exc.retry_after + random.uniform(0, 2)
+        wait = exc.retry_after + random.uniform(0, 2)
+        return min(wait, MAX_RATE_LIMIT_WAIT_SECONDS)
     return wait_exponential(multiplier=1, min=2, max=30)(retry_state)
 
 

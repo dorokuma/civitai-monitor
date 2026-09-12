@@ -129,6 +129,22 @@ from telegram_media import (
 IMAGE_DOWNLOAD_TIMEOUT = 120
 VIDEO_DOWNLOAD_TIMEOUT = 120
 
+# Hard cap for one image download, in MB. The API response (and therefore the
+# image URL) is untrusted: a tampered URL may point at an arbitrarily large
+# file and would otherwise fill the disk. Videos already stream-count against
+# max_video_size_mb; images get this fixed cap (well above any real Civitai
+# original). Exceeding it aborts the download and is treated as a permanent
+# failure — retrying cannot make the file smaller.
+MAX_IMAGE_DOWNLOAD_MB = 30
+
+# Whitelists for the filename extension taken from the last segment of the
+# API-provided download URL. Civitai originals always carry one of these; any
+# other extension (".php", ".svg", ".pth", query strings, ...) means the
+# response was tampered with, and the item is dropped instead of written to
+# disk (this also blocks path traversal via a crafted "extension").
+IMAGE_EXT_WHITELIST = frozenset({".jpeg", ".jpg", ".png", ".gif", ".webp"})
+VIDEO_EXT_WHITELIST = frozenset({".mp4", ".webm", ".mov", ".mkv", ".avi"})
+
 
 # ---------------------------------------------------------------------------
 # Download result classification
@@ -163,6 +179,45 @@ def _is_permanent_request_error(exc: requests.RequestException) -> bool:
     # An HTTPError raised manually (e.g. download_video's "last status")
     # without a .response is treated as transient by default.
     return resp is not None and resp.status_code in _PERMANENT_HTTP_STATUSES
+
+
+# ---------------------------------------------------------------------------
+# Path safety — API responses are untrusted input (see tests/test_path_safety.py)
+# ---------------------------------------------------------------------------
+
+
+def _coerce_item_id(raw_id: Any) -> int | None:
+    """Coerce an API-supplied item id to ``int``; ``None`` if it is not one.
+
+    Civitai item ids are plain integers. A tampered response can supply
+    ``"../../.."`` or an absolute path; interpolating that into a download
+    filename would escape the downloads dir. Non-numeric values are rejected;
+    numeric strings are normalized to ``int``. ``bool`` is rejected even
+    though it is an ``int`` subclass.
+    """
+    if isinstance(raw_id, bool):
+        return None
+    try:
+        return int(raw_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_path_within(child: Path, parent: Path) -> bool:
+    """True if ``child`` resolves to a location inside ``parent``.
+
+    Defense in depth for download paths: after building
+    ``output_dir / f"{item_id}{ext}"`` the resolved path must still live under
+    the resolved output dir (catches traversal ids, symlinked filenames, or
+    any other escape).
+    """
+    try:
+        child_resolved = child.resolve()
+        parent_resolved = parent.resolve()
+    except OSError:
+        return False
+    return child_resolved == parent_resolved or parent_resolved in child_resolved.parents
+
 
 LOCK_PATH = SCRIPT_DIR / LOCK_FILE_NAME
 STATUS_PATH = SCRIPT_DIR / STATUS_FILE_NAME
@@ -220,14 +275,35 @@ def download_image(url: str, save_path: Path, timeout: int = 120) -> DownloadRes
         log.info("Already exists: %s, skipped", save_path.name)
         return DownloadResult(True)
     tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
+    max_bytes = MAX_IMAGE_DOWNLOAD_MB * 1024 * 1024
     try:
         with safe_get(url, stream=True, timeout=timeout) as resp:
             resp.raise_for_status()
             save_path.parent.mkdir(parents=True, exist_ok=True)
+            # Streaming size cap (same pattern as download_video): count bytes
+            # and abort past MAX_IMAGE_DOWNLOAD_MB so a tampered/unbounded URL
+            # cannot fill the disk.
+            downloaded = 0
+            exceeded = False
             with open(tmp_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=65536):
                     if chunk:
+                        downloaded += len(chunk)
+                        if downloaded > max_bytes:
+                            log.warning(
+                                "Image too large while streaming "
+                                "(%.1f MB > %d MB cap), deleting tmp: %s",
+                                downloaded / 1024 / 1024,
+                                MAX_IMAGE_DOWNLOAD_MB,
+                                url,
+                            )
+                            exceeded = True
+                            break
                         f.write(chunk)
+            if exceeded:
+                # An oversized image cannot succeed on retry — permanent failure.
+                tmp_path.unlink(missing_ok=True)
+                return DownloadResult(False, True)
             tmp_path.rename(save_path)
             log.info("Downloaded: %s (%d bytes)", save_path.name, save_path.stat().st_size)
             return DownloadResult(True)
@@ -442,16 +518,27 @@ def process_and_push(
     tg_id: str | None = None,
 ) -> bool:
     """Download a single item (image or video) and push to Telegram."""
-    item_id = item["id"]
+    # Path safety: the id builds on-disk filenames — reject anything that is
+    # not an int so tampered payloads never reach path construction.
+    raw_id = item.get("id")
+    item_id = _coerce_item_id(raw_id)
+    if item_id is None:
+        log.warning(
+            "Dropping item with malformed id %r for @%s (id must be an int)",
+            raw_id, username,
+        )
+        return False
     civitai_url = f"https://civitai.com/images/{item_id}"
-    created_at = item.get("createdAt", "")
+    # createdAt is attacker-controllable text interpolated into a Markdown
+    # caption — escape it exactly like the username.
+    created_at = escape_markdown(item.get("createdAt", ""))
     safe_user = escape_markdown(username)
 
     is_video = (
         video_enabled
         and (
             item.get("type") == "video"
-            or str(item.get("url", "")).lower().endswith((".mp4", ".webm", ".mov"))
+            or str(item.get("url", "")).lower().endswith(tuple(VIDEO_EXT_WHITELIST))
         )
     )
 
@@ -522,6 +609,12 @@ def process_and_push(
             return False
 
         filepath = output_dir / "videos" / f"{item_id}.mp4"
+        if not _is_path_within(filepath, output_dir):
+            log.warning(
+                "Dropping video id=%d for @%s: resolved path %s escapes output dir %s",
+                item_id, username, filepath, output_dir,
+            )
+            return False
         dl = download_video(video_url, filepath, max_video_size_mb)
 
         if dl.success:
@@ -554,8 +647,20 @@ def process_and_push(
         return pushed
 
     orig_url = normalize_to_original(item.get("url", ""), size_suffixes)
-    ext = os.path.splitext(orig_url.split("/")[-1])[1] or ".jpeg"
+    ext = os.path.splitext(orig_url.split("/")[-1])[1].lower() or ".jpeg"
+    if ext not in IMAGE_EXT_WHITELIST:
+        log.warning(
+            "Dropping image id=%d for @%s: URL extension %r not in whitelist",
+            item_id, username, ext,
+        )
+        return False
     filepath = output_dir / f"{item_id}{ext}"
+    if not _is_path_within(filepath, output_dir):
+        log.warning(
+            "Dropping image id=%d for @%s: resolved path %s escapes output dir %s",
+            item_id, username, filepath, output_dir,
+        )
+        return False
     dl = download_image(orig_url, filepath)
 
     if dl.success:
@@ -622,10 +727,28 @@ def _fetch_and_process_page(
     if not items:
         return [], set(), next_cursor
 
-    page_ids = {img["id"] for img in items}
+    # Path safety: coerce every id to int up front. Malformed ids are dropped
+    # (with a warning) so they never enter page_ids or the processing loop —
+    # this also keeps min(page_ids) in run_incremental int-only.
+    page_ids: set[int] = set()
+    valid_items: list[dict[str, Any]] = []
+    for img in items:
+        raw_id = img.get("id")
+        item_id = _coerce_item_id(raw_id)
+        if item_id is None:
+            log.warning(
+                "Dropping item with malformed id %r from @%s page (id must be an int)",
+                raw_id, username,
+            )
+            continue
+        if not isinstance(raw_id, int):
+            img = {**img, "id": item_id}
+        page_ids.add(item_id)
+        valid_items.append(img)
+
     pending = adopt_stale_inflight(pushed_dir, tg_id, username)
     now = time.time()
-    new_on_page = [img for img in items if img["id"] not in pushed_ids]
+    new_on_page = [img for img in valid_items if img["id"] not in pushed_ids]
     did_push_attempt = False
 
     for item_id, (ts, retries) in list(pending.items()):
@@ -651,56 +774,75 @@ def _fetch_and_process_page(
     if new_on_page:
         for img in reversed(new_on_page):
             item_id = img["id"]
-            if item_id in pushed_ids:
+            # Defensive re-check: ids were coerced above, but never let a
+            # non-int reach path construction (defense in depth).
+            if isinstance(item_id, bool) or not isinstance(item_id, int):
+                log.warning(
+                    "Skipping item with non-int id %r for @%s (path safety)",
+                    item_id, username,
+                )
                 continue
 
-            if item_id in pending:
-                ts, retries = pending[item_id]
-                age = now - float(ts)
-                if age < PENDING_CONFIRM_SECONDS:
-                    log.info(
-                        "Pending id=%d for @%s is fresh (%.0fs < %ds); promoting to pushed without re-send",
-                        item_id, username, age, PENDING_CONFIRM_SECONDS,
-                    )
-                    _record_push_success(
-                        item_id, username,
-                        pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
-                    )
+            # Per-item isolation: a single bad item (malformed payload, send
+            # crash, unexpected state error) must not abort the rest of this
+            # page or the whole creator scan.
+            try:
+                if item_id in pushed_ids:
                     continue
-                if retries >= PENDING_MAX_RETRIES:
-                    log.info(
-                        "Pending id=%d for @%s expired with retries=%d; promoting without further re-send",
-                        item_id, username, retries,
-                    )
-                    _record_push_success(
-                        item_id, username,
-                        pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
-                    )
-                    continue
-                log.info(
-                    "Pending id=%d for @%s expired (%.0fs, retries=%d); one retry push",
-                    item_id, username, age, retries,
-                )
-                mark_pending(
-                    pushed_dir, tg_id, username, item_id,
-                    ts=now, retries=retries + 1,
-                )
-                pending[item_id] = (now, retries + 1)
 
-            did_push_attempt = True
-            process_and_push(
-                img, username,
-                size_suffixes=size_suffixes,
-                output_dir=output_dir,
-                bot_token=bot_token,
-                chat_id=chat_id,
-                video_enabled=video_enabled,
-                max_video_size_mb=max_video_size_mb,
-                pushed_ids=pushed_ids,
-                pushed_dir=pushed_dir,
-                tg_id=tg_id,
-            )
-            time.sleep(2.0 + random.random() * 1.0)
+                if item_id in pending:
+                    ts, retries = pending[item_id]
+                    age = now - float(ts)
+                    if age < PENDING_CONFIRM_SECONDS:
+                        log.info(
+                            "Pending id=%d for @%s is fresh (%.0fs < %ds); promoting to pushed without re-send",
+                            item_id, username, age, PENDING_CONFIRM_SECONDS,
+                        )
+                        _record_push_success(
+                            item_id, username,
+                            pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
+                        )
+                        continue
+                    if retries >= PENDING_MAX_RETRIES:
+                        log.info(
+                            "Pending id=%d for @%s expired with retries=%d; promoting without further re-send",
+                            item_id, username, retries,
+                        )
+                        _record_push_success(
+                            item_id, username,
+                            pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
+                        )
+                        continue
+                    log.info(
+                        "Pending id=%d for @%s expired (%.0fs, retries=%d); one retry push",
+                        item_id, username, age, retries,
+                    )
+                    mark_pending(
+                        pushed_dir, tg_id, username, item_id,
+                        ts=now, retries=retries + 1,
+                    )
+                    pending[item_id] = (now, retries + 1)
+
+                did_push_attempt = True
+                process_and_push(
+                    img, username,
+                    size_suffixes=size_suffixes,
+                    output_dir=output_dir,
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                    video_enabled=video_enabled,
+                    max_video_size_mb=max_video_size_mb,
+                    pushed_ids=pushed_ids,
+                    pushed_dir=pushed_dir,
+                    tg_id=tg_id,
+                )
+                time.sleep(2.0 + random.random() * 1.0)
+            except Exception:
+                log.exception(
+                    "Unhandled error while processing id=%s for @%s; skipping item",
+                    item_id, username,
+                )
+                continue
 
     if not did_push_attempt:
         return [], page_ids, next_cursor
@@ -1091,26 +1233,34 @@ def cleanup_old_caches(output_dir: Path, keep_days: int, max_total_gb: int = 0) 
     if not output_dir.exists():
         return 0
 
-    removed = 0
+    if keep_days < 1:
+        # Defensive lower bound (the bot clamps too — this is defense in
+        # depth): keep_days < 1 puts the cutoff at/after "now", and a negative
+        # value would delete EVERYTHING. Refuse to delete anything.
+        log.warning(
+            "cleanup_old_caches: keep_days=%d < 1; refusing to delete anything",
+            keep_days,
+        )
+        return 0
 
-    if keep_days > 0:
-        cutoff = time.time() - keep_days * 86400
-        for root, dirs, files in os.walk(output_dir):
-            for fname in files:
-                fpath = Path(root) / fname
-                try:
-                    if fpath.stat().st_mtime < cutoff:
-                        fpath.unlink()
-                        removed += 1
-                except OSError:
-                    pass
-            for dname in dirs:
-                dpath = Path(root) / dname
-                try:
-                    if not any(dpath.iterdir()):
-                        dpath.rmdir()
-                except OSError:
-                    pass
+    removed = 0
+    cutoff = time.time() - keep_days * 86400
+    for root, dirs, files in os.walk(output_dir):
+        for fname in files:
+            fpath = Path(root) / fname
+            try:
+                if fpath.stat().st_mtime < cutoff:
+                    fpath.unlink()
+                    removed += 1
+            except OSError:
+                pass
+        for dname in dirs:
+            dpath = Path(root) / dname
+            try:
+                if not any(dpath.iterdir()):
+                    dpath.rmdir()
+            except OSError:
+                pass
 
     if max_total_gb > 0:
         max_bytes = max_total_gb * 1024 * 1024 * 1024
@@ -1324,6 +1474,97 @@ def _process_single_creator(
     return union, new_count
 
 
+def _process_creator_queue(
+    subs: dict[str, Any],
+    cfg: MonitorConfig,
+    *,
+    seen_dir: Path,
+    output_dir: Path,
+    user_filter: str,
+    start_time: _dt.datetime,
+) -> tuple[int, bool]:
+    """Walk every (TG user, creator) pair and process each one.
+
+    Returns ``(pushed_count, had_fetch_error)``.
+
+    Per-creator isolation: an unexpected failure while processing one creator
+    (a corrupted API page, an unexpected state error, ...) is logged and the
+    loop continues with the next creator — one bad page must not kill the
+    whole scan round. ``StateWriteError`` keeps its dedicated recovery handler
+    inside ``_process_single_creator``; ``FetchPageError`` is contained here
+    but still reported via ``had_fetch_error`` so main can preserve the
+    historical exit code 2.
+    """
+    total_creators = sum(len(v) for v in subs.values())
+    pushed_count = 0
+    creator_idx = 0
+    had_fetch_error = False
+    for tg_id, user_list in subs.items():
+        if _monitor_shutdown_requested:
+            log.info("monitor.py: shutdown requested, stopping user loop")
+            break
+        tg_id_str = str(tg_id)
+        for entry in user_list:
+            if _monitor_shutdown_requested:
+                log.info("monitor.py: shutdown requested, stopping creator loop")
+                break
+            username = entry.get("name", str(entry)) if isinstance(entry, dict) else str(entry)
+            if user_filter and username != user_filter:
+                log.info("Skipping @%s (--user filter active)", username)
+                continue
+            creator_idx += 1
+            _write_status(
+                start_time=start_time, mode=cfg.mode, current_creator=username,
+                creators_done=creator_idx, creators_total=total_creators,
+                pushed_count=pushed_count,
+            )
+            log.info("=" * 50)
+            log.info("Processing @%s (TG:%s, %s mode)...", username, tg_id_str, cfg.mode)
+            try:
+                _seen_after, new_count = _process_single_creator(
+                    username, tg_id_str, seen_dir, output_dir,
+                    mode=cfg.mode, nsfw=cfg.nsfw,
+                    size_suffixes=cfg.download.size_suffixes,
+                    bot_token=cfg.telegram.bot_token,
+                    chat_id=cfg.telegram.chat_id,
+                    base_url=cfg.api.base_url,
+                    page_limit=cfg.api.images_per_page,
+                    video_enabled=cfg.video_enabled,
+                    max_video_size_mb=cfg.max_video_size_mb,
+                    incremental_max_pages=cfg.incremental.max_pages,
+                    hole_window_items=getattr(cfg.incremental, "hole_window_items", 500),
+                    reconcile_max_pages=cfg.reconciliation.max_pages_per_track,
+                    reconcile_consecutive_no_new=cfg.reconciliation.max_consecutive_no_new_pages,
+                )
+            except FetchPageError as e:
+                had_fetch_error = True
+                log.error(
+                    "Page fetch failed for @%s (TG:%s): %s; continuing with next creator",
+                    username, tg_id_str, e,
+                )
+                continue
+            except Exception:
+                log.exception(
+                    "Unhandled error while processing @%s (TG:%s); "
+                    "skipping to the next creator",
+                    username, tg_id_str,
+                )
+                continue
+            pushed_count += new_count
+            if cfg.mode == "full" and new_count > 0:
+                log.info(
+                    "Full backfill complete for @%s (TG:%s): %d new items",
+                    username, tg_id_str, new_count,
+                )
+                send_to_telegram(
+                    cfg.telegram.bot_token, cfg.telegram.chat_id,
+                    _build_backfill_summary(
+                        username, new_count, cfg.mode, cfg.nsfw, cfg.video_enabled,
+                    ),
+                )
+    return pushed_count, had_fetch_error
+
+
 def main() -> None:
     # Step 1: process lock.
     if _acquire_process_lock() is None:
@@ -1371,58 +1612,18 @@ def main() -> None:
     )
 
     pushed_count = 0
-    creator_idx = 0
     exit_code = 0
     try:
-        for tg_id, user_list in subs.items():
-            if _monitor_shutdown_requested:
-                log.info("monitor.py: shutdown requested, stopping user loop")
-                break
-            tg_id_str = str(tg_id)
-            for entry in user_list:
-                if _monitor_shutdown_requested:
-                    log.info("monitor.py: shutdown requested, stopping creator loop")
-                    break
-                username = entry.get("name", str(entry)) if isinstance(entry, dict) else str(entry)
-                if args.user and username != args.user:
-                    log.info("Skipping @%s (--user filter active)", username)
-                    continue
-                creator_idx += 1
-                _write_status(
-                    start_time=start_time, mode=cfg.mode, current_creator=username,
-                    creators_done=creator_idx, creators_total=total_creators,
-                    pushed_count=pushed_count,
-                )
-                log.info("=" * 50)
-                log.info("Processing @%s (TG:%s, %s mode)...", username, tg_id_str, cfg.mode)
-                _seen_after, new_count = _process_single_creator(
-                    username, tg_id_str, seen_dir, output_dir,
-                    mode=cfg.mode, nsfw=cfg.nsfw,
-                    size_suffixes=cfg.download.size_suffixes,
-                    bot_token=cfg.telegram.bot_token,
-                    chat_id=cfg.telegram.chat_id,
-                    base_url=cfg.api.base_url,
-                    page_limit=cfg.api.images_per_page,
-                    video_enabled=cfg.video_enabled,
-                    max_video_size_mb=cfg.max_video_size_mb,
-                    incremental_max_pages=cfg.incremental.max_pages,
-                    hole_window_items=getattr(cfg.incremental, "hole_window_items", 500),
-                    reconcile_max_pages=cfg.reconciliation.max_pages_per_track,
-                    reconcile_consecutive_no_new=cfg.reconciliation.max_consecutive_no_new_pages,
-                )
-                pushed_count += new_count
-                if cfg.mode == "full" and new_count > 0:
-                    log.info(
-                        "Full backfill complete for @%s (TG:%s): %d new items",
-                        username, tg_id_str, new_count,
-                    )
-                    send_to_telegram(
-                        cfg.telegram.bot_token, cfg.telegram.chat_id,
-                        _build_backfill_summary(
-                            username, new_count, cfg.mode, cfg.nsfw, cfg.video_enabled,
-                        ),
-                    )
+        pushed_count, had_fetch_error = _process_creator_queue(
+            subs, cfg,
+            seen_dir=seen_dir, output_dir=output_dir,
+            user_filter=args.user, start_time=start_time,
+        )
+        if had_fetch_error:
+            exit_code = 2
     except FetchPageError as e:
+        # Unreachable while every creator call is isolated inside the queue;
+        # kept as a safety net for future refactors.
         log.error("Fatal page fetch failure: %s", e)
         exit_code = 2
     finally:
