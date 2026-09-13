@@ -102,6 +102,7 @@ from state_store import (
     mark_inflight,
     mark_pending,
     pushed_file_for_user,  # noqa: F401
+    record_push_history,
     rollback_backlog_truncation_alert,
     save_pushed_ids,
     save_seen_ids,
@@ -611,6 +612,13 @@ def _record_push_success(
         raise
     clear_pending(pushed_dir, tg_id, username, item_id)
     clear_inflight(pushed_dir, tg_id, username, item_id)
+    # Durable per-push history for the bot's weekly activity report.
+    # Best-effort: a history write failure must never fail a confirmed push —
+    # the report merely under-counts until the next successful push.
+    try:
+        record_push_history(pushed_dir, tg_id, username, item_id)
+    except (StateWriteError, OSError) as e:
+        log.warning("Could not record push history for @%s: %s", username, e)
 
 
 def _finalize_send_outcome(

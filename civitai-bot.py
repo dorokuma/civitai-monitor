@@ -32,7 +32,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 
@@ -45,7 +45,7 @@ from bot_ui import paginated_user_keyboard, resolve_callback_username
 
 # Import unified config from monitor / config_io (re-exported by monitor)
 from monitor import MonitorConfig, cleanup_old_caches, load_config, write_config
-from state_store import _atomic_write
+from state_store import _atomic_write, load_push_history
 
 # Transient Telegram transport failures during long-polling / send. PTB already
 # retries these in its network loop; they must not page admins as "unhandled".
@@ -1793,14 +1793,17 @@ async def scheduled_scan_cron() -> None:
                 returncode = int(rc) if rc is not None else -1
                 if returncode == 0:
                     log.info("Scheduled scan completed")
+                    _scan_stats["success"] += 1
                     await _report_cron_outcome("scan", failing=False)
                 elif returncode == 75:
                     # monitor.py exits 75 when .monitor.lock is held (i.e. a
                     # backfill claimed the slot). Treat as "skipped", not a
                     # failure — back off for the rest of the interval.
                     log.info("Scheduled scan skipped: monitor lock held (backfill in progress)")
+                    _scan_stats["skipped"] += 1
                 else:
                     log.warning("Scheduled scan failed (exit %d)", returncode)
+                    _scan_stats["failure"] += 1
                     detail = f"monitor.py 非零退出（exit {returncode}），本轮扫描可能未完成；将按当前间隔自动重试"
                     reason = _last_scan_error_line()
                     if reason:
@@ -1812,6 +1815,7 @@ async def scheduled_scan_cron() -> None:
                     )
             except Exception as e:
                 log.exception("Scheduled scan error: %s", e)  # noqa: TRY401
+                _scan_stats["failure"] += 1
                 await _report_cron_outcome(
                     "scan",
                     failing=True,
@@ -1891,6 +1895,198 @@ def _sweep_stale_backfills(max_age_minutes: int) -> int:
             except Exception as e:
                 log.exception("Could not parse last_active %r for @%s: %s", last_active_str, username, e)  # noqa: TRY401
     return removed
+
+
+# ---------------------------------------------------------------------------
+# Weekly Telegram report — a digest sent to the admins every Sunday 21:00 UTC.
+#
+# The alert crons only cover hard failures (scan exits non-zero). This report
+# surfaces the *silent* failure modes: an upstream 200-but-empty page, a
+# subscription that quietly stopped updating — everything "green" while the
+# owner hasn't received a single push in weeks and nobody notices. It gives a
+# weekly at-a-glance view of scan health and per-subscription activity.
+#
+# State policy: the scan counters and the "already sent today" marker live in
+# memory, same trade-off as the cron alerts — losing them on restart costs at
+# most one duplicate report, which is acceptable.
+# ---------------------------------------------------------------------------
+
+# datetime.weekday() value for Sunday.
+_WEEKLY_REPORT_WEEKDAY = 6
+_WEEKLY_REPORT_HOUR_UTC = 21
+_WEEKLY_REPORT_MINUTE_UTC = 0
+# The report counts pushes over the last 7 days...
+_WEEKLY_REPORT_WINDOW_DAYS = 7
+# ...and flags subscriptions whose last push is older than this (or missing).
+_WEEKLY_REPORT_STALE_DAYS = 14
+
+# Scan-outcome counters for the report. Incremented by scheduled_scan_cron
+# (success / failure / skipped-75 branches); zeroed after the report is sent.
+_scan_stats: dict[str, int] = {"success": 0, "failure": 0, "skipped": 0}
+
+# ISO date (YYYY-MM-DD, UTC) of the last weekly report actually sent.
+_weekly_report_last_sent_date: str | None = None
+
+
+def _reset_scan_stats() -> None:
+    global _scan_stats
+    _scan_stats = {"success": 0, "failure": 0, "skipped": 0}
+
+
+def _weekly_report_due(now: datetime, last_sent_date: str | None) -> bool:
+    """True when the weekly report should fire at ``now`` (aware UTC datetime).
+
+    Fires on Sundays at/after 21:00 UTC, at most once per calendar day: the
+    marker is written right after a successful send, so within one Sunday
+    evening the report is emitted exactly once (a restart may re-send once).
+    """
+    if now.weekday() != _WEEKLY_REPORT_WEEKDAY:
+        return False
+    if (now.hour, now.minute) < (_WEEKLY_REPORT_HOUR_UTC, _WEEKLY_REPORT_MINUTE_UTC):
+        return False
+    return last_sent_date != now.strftime("%Y-%m-%d")
+
+
+def _collect_weekly_creator_stats(cfg: MonitorConfig | None = None) -> list[dict]:
+    """Per-subscription push activity over the report window.
+
+    Reads the durable push history that monitor.py records on every
+    successful push (state_store.record_push_history). Returns one dict per
+    configured subscription: username, tg_id, pushes_7d, last_push_ts.
+    """
+    if cfg is None:
+        cfg = read_config()
+    data_dir = Path(cfg.data.data_dir) if cfg.data.data_dir else SCRIPT_DIR
+    pushed_dir = data_dir / "seen_ids"
+    cutoff = time.time() - _WEEKLY_REPORT_WINDOW_DAYS * 86400
+    stats: list[dict] = []
+    subs = cfg.subscriptions or {}
+    for tg_id, raw_users in subs.items():
+        for u in raw_users or []:
+            username = u.get("name", str(u)) if isinstance(u, dict) else str(u)
+            history = load_push_history(pushed_dir, tg_id, username)
+            stats.append(
+                {
+                    "username": username,
+                    "tg_id": tg_id,
+                    "pushes_7d": sum(1 for ts in history.values() if ts >= cutoff),
+                    "last_push_ts": max(history.values(), default=None),
+                }
+            )
+    stats.sort(key=lambda s: s["username"].lower())
+    return stats
+
+
+def _format_last_push_date(last_push_ts: float | None) -> str:
+    if last_push_ts is None:
+        return "无记录"
+    return datetime.fromtimestamp(last_push_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _build_weekly_report(
+    scan_stats: dict[str, int],
+    creator_stats: list[dict],
+    recon_last_success: str | None,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Assemble the weekly report message (pure function; unit-tested).
+
+    ``creator_stats`` entries: {"username", "pushes_7d", "last_push_ts"}.
+    Subscriptions with no push in the last 14 days (or none on record) get
+    the ⚠️ marker — that is exactly the silent-stall signal a human must
+    confirm (possible upstream stop or mirror failure).
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    week_start = now - timedelta(days=_WEEKLY_REPORT_WINDOW_DAYS)
+    lines = [
+        "📅 每周监控日报",
+        f"统计区间: {week_start.strftime('%Y-%m-%d')} ~ {now.strftime('%Y-%m-%d')} (UTC)",
+        "",
+        "🗂 扫描健康（过去 7 天）",
+        f"✅ 成功: {scan_stats.get('success', 0)} 次",
+        f"❌ 失败: {scan_stats.get('failure', 0)} 次",
+        f"⏭️ 跳过: {scan_stats.get('skipped', 0)} 次",
+        "",
+        "👥 订阅活跃度（近 7 天推送数 / 最近推送）",
+    ]
+    if not creator_stats:
+        lines.append("• （当前无订阅）")
+    for s in creator_stats:
+        last_ts = s.get("last_push_ts")
+        stale = last_ts is None or (
+            now.timestamp() - last_ts > _WEEKLY_REPORT_STALE_DAYS * 86400
+        )
+        flag = " ⚠️ 超过 14 天未推送（可能上游停更或镜像失效，请人工确认）" if stale else ""
+        lines.append(
+            f"• @{s['username']}: 近 7 天 {s.get('pushes_7d', 0)} 条，"
+            f"最近推送 {_format_last_push_date(last_ts)}{flag}"
+        )
+    lines.append("")
+    lines.append("🔄 深度对账")
+    if recon_last_success:
+        lines.append(f"最近成功: {recon_last_success}")
+    else:
+        lines.append("最近成功: 无记录 ⚠️")
+    return "\n".join(lines)
+
+
+async def _send_weekly_report() -> bool:
+    """Build + send the weekly report. Returns True when a send was recorded.
+
+    Telegram-side failures never propagate: per-chat failures are logged,
+    and only a fully undelivered report returns False so the cron retries
+    on the next tick instead of losing the week's report silently.
+    """
+    bot = _alert_bot
+    if bot is None or not _ADMIN_CHAT_IDS:
+        log.debug("Weekly report skipped (no bot/admin chats configured)")
+        return False
+    cfg = read_config()
+    creator_stats = _collect_weekly_creator_stats(cfg)
+    recon_date = _load_reconciliation_last_success(cfg)
+    text = _build_weekly_report(dict(_scan_stats), creator_stats, recon_date)
+    delivered = 0
+    for cid in _ADMIN_CHAT_IDS:
+        try:
+            await bot.send_message(chat_id=cid, text=text)
+            delivered += 1
+        except Exception:
+            log.warning("Failed to deliver weekly report to admin %s", cid, exc_info=True)
+    if delivered == 0:
+        log.warning("Weekly report could not be delivered to any admin; will retry")
+        return False
+    return True
+
+
+async def scheduled_weekly_report_cron() -> None:
+    """Send the weekly activity report every Sunday at/after 21:00 UTC.
+
+    Mirrors the reconciliation cron's scheduling shape: a 30s polling loop
+    that checks a time condition plus a "sent today" marker. Send failures
+    never propagate — the loop just retries on the next tick.
+    """
+    global _weekly_report_last_sent_date
+    try:
+        while not _shutdown_requested:
+            now = datetime.now(timezone.utc)
+            if _weekly_report_due(now, _weekly_report_last_sent_date):
+                try:
+                    sent = await _send_weekly_report()
+                except Exception:
+                    # A broken report must never take down the cron loop.
+                    log.exception("Weekly report send failed; will retry next tick")
+                else:
+                    if sent:
+                        _weekly_report_last_sent_date = now.strftime("%Y-%m-%d")
+                        _reset_scan_stats()
+                        log.info("Weekly report sent; scan counters reset")
+            if _shutdown_requested:
+                break
+            await asyncio.sleep(30)
+    finally:
+        log.info("Weekly report cron stopped.")
 
 
 async def scheduled_reconciliation_cron() -> None:
@@ -2055,6 +2251,8 @@ async def post_init(application: Application) -> None:
     scan_task.add_done_callback(_on_cron_done)
     recon_task = _track_task(asyncio.create_task(scheduled_reconciliation_cron()))
     recon_task.add_done_callback(_on_cron_done)
+    weekly_task = _track_task(asyncio.create_task(scheduled_weekly_report_cron()))
+    weekly_task.add_done_callback(_on_cron_done)
     log.info(f"Slash commands registered. Scheduled scan every {_scan_interval//60}min. Ready.")
 
 

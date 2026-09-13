@@ -282,6 +282,91 @@ def update_push_timestamps(
     return load_push_timestamps(state_dir, kind, tg_id, username)
 
 
+# ---------------------------------------------------------------------------
+# Push history: durable id -> unix-ts log of successful pushes.
+#
+# Unlike inflight/pending (transient lifecycle state, cleared as soon as a
+# push resolves), these entries persist until pruned by age. This is the
+# data source for the bot's weekly activity report (per-subscription push
+# count over the last 7 days + last push date), which needs to observe
+# completed pushes after the fact.
+# ---------------------------------------------------------------------------
+
+# Keep ~5 weeks of history: the weekly report window is 7 days and the
+# "stale subscription" threshold is 14 days; 35 days bounds file growth
+# while leaving ample margin for bot downtime around report time.
+PUSH_HISTORY_RETENTION_DAYS = 35
+
+
+def push_history_file_for_user(pushed_dir: Path, tg_id: str, username: str) -> Path:
+    pushed_dir.mkdir(parents=True, exist_ok=True)
+    return pushed_dir / f"push_history_{tg_id}_{_safe_user_token(username)}.json"
+
+
+def load_push_history(pushed_dir: Path, tg_id: str, username: str) -> dict[int, float]:
+    """Read-only load of the durable id -> unix-ts push history for one user.
+
+    Corrupt / unreadable / missing file -> empty dict (same policy as
+    load_pushed_ids); the weekly report treats empty as "no push on record".
+    """
+    path = push_history_file_for_user(pushed_dir, tg_id, username)
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text())
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[int, float] = {}
+        for k, v in raw.items():
+            try:
+                if isinstance(v, dict):
+                    out[int(k)] = float(v.get("ts", 0))
+                else:
+                    out[int(k)] = float(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        log.warning("Corrupt push history for @%s, starting empty", username)
+        return {}
+
+
+def record_push_history(
+    pushed_dir: Path,
+    tg_id: str,
+    username: str,
+    item_id: int,
+    *,
+    ts: float | None = None,
+) -> None:
+    """Append one successful push to the durable history (prunes by age).
+
+    Raises ``StateWriteError`` if the lock cannot be acquired after 3
+    attempts. Callers that treat history as best-effort (monitor.py's
+    push-success path) wrap this in try/except and never fail a confirmed
+    push because of it.
+    """
+    path = push_history_file_for_user(pushed_dir, tg_id, username)
+    lock_path = _save_lock_path(pushed_dir, name="push_history")
+    cutoff = time.time() - PUSH_HISTORY_RETENTION_DAYS * 86400
+    for attempt in range(3):
+        try:
+            with FileLock(str(lock_path), timeout=10):
+                data = load_push_history(pushed_dir, tg_id, username)
+                data[item_id] = ts if ts is not None else time.time()
+                data = {k: v for k, v in data.items() if v >= cutoff}
+                _write_push_timestamps(path, data)
+            return
+        except Timeout:
+            if attempt < 2:
+                time.sleep(2)
+            else:
+                raise StateWriteError(
+                    f"Timeout recording push history for @{username} "
+                    f"after 3 attempts (lock: {lock_path})"
+                )
+
+
 def mark_inflight(state_dir: Path, tg_id: str, username: str, item_id: int) -> None:
     """Pre-claim an item ID before the Telegram request leaves the process."""
     update_push_timestamps(

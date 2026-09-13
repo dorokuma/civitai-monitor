@@ -308,6 +308,61 @@ civitai-monitor/
 
 ---
 
+## Backup & restore
+
+### What is backed up
+
+A root crontab job runs every **Sunday 04:00 UTC** and writes a compressed
+archive to `/srv/backups/civitai-monitor/YYYYMMDD.tar.gz` (mode 0600):
+
+```
+umask 077; tar czf /srv/backups/civitai-monitor/$(date +%Y%m%d).tar.gz \
+  --exclude=downloads --exclude=__pycache__ --exclude=.git \
+  --exclude=.pytest_cache --exclude=.ruff_cache --exclude=.venv \
+  /srv/civitai-monitor/ /srv/.civitai-monitor/
+```
+
+- `/srv/civitai-monitor/` — code, `config.yaml`, per-subscription state
+  (`seen_ids/`) and bot runtime files (`interval.json`,
+  `active_backfills.json`, `reconciliation_status.json`, ...).
+- `/srv/.civitai-monitor/` — secrets kept outside the repo: `.env`,
+  `telegram-api.env`, `civitai_cookies.txt`.
+- Excluded on purpose: `downloads/` (re-downloadable cache), `.venv/`
+  (recreatable from `requirements.lock`), `.git/` and tool caches.
+- Archives older than 90 days are deleted by the same cron line.
+
+> **GNU tar gotcha:** `--exclude` is a positional option. Placed AFTER the
+> file operands it silently matches nothing (and tar exits non-zero, which
+> also breaks any `&&`-chained cleanup such as the 90-day prune below).
+> Keep the excludes BEFORE the operands.
+
+### Restoring from a backup
+
+Verified by drill on 2026-09-13: an archive made with the excludes above
+contains `seen_ids/*.json`, `config.yaml`, the state JSON files and
+`/srv/.civitai-monitor/.env`, and `.venv/` / `downloads/` are absent.
+
+```bash
+# 1. Unpack — the archive stores srv/... paths relative to /
+mkdir -p /tmp/restore && cd /tmp/restore
+tar xzf /srv/backups/civitai-monitor/YYYYMMDD.tar.gz
+
+# 2. Copy the trees back
+cp -a /tmp/restore/srv/civitai-monitor /srv/
+cp -a /tmp/restore/srv/.civitai-monitor /srv/
+
+# 3. Rebuild the virtualenv (excluded from the backup)
+cd /srv/civitai-monitor
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.lock
+
+# 4. Fix ownership and restart the service
+chown -R civitai:civitai /srv/civitai-monitor /srv/.civitai-monitor
+systemctl restart civitai-bot
+```
+
+---
+
 ## Disclaimer & License
 
 ### Disclaimer

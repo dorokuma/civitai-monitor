@@ -2,6 +2,19 @@
 
 This file follows the [Keep a Changelog](https://keepachangelog.com/) format, and version numbers follow [SemVer](https://semver.org/).
 
+## [1.5.0] - 2026-09-13
+
+### Added
+- **Weekly Telegram report** (Sundays 21:00 UTC to admin chats): scan success/failure/skip counts for the week, per-subscription push counts and last-push dates (subscriptions silent for 14+ days are flagged for manual review), and the last reconciliation date. Guards against the silent-failure mode where everything looks green while subscriptions quietly stop producing.
+- **Push history**: every confirmed push records a timestamp (35-day rolling retention) powering the report; write failures never fail confirmed pushes.
+- **CodeQL workflow** (python, SHA-pinned actions) alongside lint/test.
+
+### Fixed
+- **Backup archives were including everything**: the tar command's `--exclude` flags were positional arguments after the file list, so GNU tar ignored them - `downloads` (11 GB) was never excluded and the 90-day cleanup never ran. Excludes moved before operands, `.venv` excluded, and the archive shrank from 2.69 GiB to ~0.5 MB. Restore procedure documented in README (including venv recreation).
+
+### Changed
+- coverage baseline: monitor 75%, state_store 82%, civitai_client 83%, config_io 84%, telegram_media 78% (TOTAL 78%) with new tests for the push-history paths.
+
 ## [1.4.0] - 2026-09-13
 
 ### Fixed
