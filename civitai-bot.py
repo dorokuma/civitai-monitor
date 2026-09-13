@@ -204,6 +204,46 @@ def _cron_alert_gate(job: str, *, failing: bool, today: str | None = None) -> st
 _CRON_ALERT_LABELS = {"scan": "定时扫描", "reconciliation": "每日对账"}
 
 
+def _last_scan_error_line(log_path: str | None = None) -> str:
+    """Best-effort: most recent monitor page-fetch error from the shared log.
+
+    The systemd unit appends both the bot and the spawned monitor to the same
+    log file, so when a scheduled scan exits non-zero the underlying reason
+    (e.g. a Civitai API 503) is in the tail. Returns "" when nothing useful
+    is found - the alert then carries the exit code only.
+    """
+    candidates: list[Path] = []
+    if log_path:
+        candidates.append(Path(log_path))
+    else:
+        try:
+            target = os.readlink("/proc/self/fd/1")
+            if target.startswith("/"):
+                candidates.append(Path(target))
+        except OSError:
+            pass
+        candidates.append(Path("/var/log/civitai-bot.log"))
+    for cand in candidates:
+        try:
+            if not cand.exists() or cand.stat().st_size == 0:
+                continue
+            with cand.open("rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 65536))
+                tail = f.read().decode("utf-8", "replace")
+            hits = [
+                line for line in tail.splitlines()
+                if "Page query failed" in line or "Fatal page fetch failure" in line
+            ]
+            if hits:
+                reason = hits[-1].split("civitai-monitor: ", 1)[-1].strip()
+                return reason[:200]
+        except OSError:
+            continue
+    return ""
+
+
 async def _report_cron_outcome(job: str, *, failing: bool, detail: str = "") -> None:
     """Best-effort Telegram alert about a cron outcome.
 
@@ -1761,10 +1801,14 @@ async def scheduled_scan_cron() -> None:
                     log.info("Scheduled scan skipped: monitor lock held (backfill in progress)")
                 else:
                     log.warning("Scheduled scan failed (exit %d)", returncode)
+                    detail = f"monitor.py 非零退出（exit {returncode}），本轮扫描可能未完成；将按当前间隔自动重试"
+                    reason = _last_scan_error_line()
+                    if reason:
+                        detail += f"\n原因: {reason}"
                     await _report_cron_outcome(
                         "scan",
                         failing=True,
-                        detail=f"monitor.py 非零退出（exit {returncode}），本轮扫描可能未完成；将按当前间隔自动重试",
+                        detail=detail,
                     )
             except Exception as e:
                 log.exception("Scheduled scan error: %s", e)  # noqa: TRY401

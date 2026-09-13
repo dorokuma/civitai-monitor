@@ -352,3 +352,33 @@ class TestLoadInterval:
     def test_missing_file_falls_back(self, tmp_path, monkeypatch):
         monkeypatch.setattr(civitai_bot, "INTERVAL_CONFIG", tmp_path / "missing.json")
         assert civitai_bot._load_interval() == 600
+
+
+class TestLastScanErrorLine:
+    def test_extracts_last_page_failure_reason(self, tmp_path):
+        log = tmp_path / "bot.log"
+        log.write_text(
+            "2026-09-13 00:00:14 +0000 [INFO] civitai-monitor: Scan starting\n"
+            "2026-09-13 00:00:20 +0000 [WARNING] civitai-monitor: Page query failed (track=SFW): "
+            "503 Server Error: Service Unavailable for url: https://civitai.com/api/v1/images?username=x\n"
+            "2026-09-13 00:01:00 +0000 [INFO] civitai-bot: Scheduled scan starting...\n"
+        )
+        reason = civitai_bot._last_scan_error_line(str(log))
+        assert reason.startswith("Page query failed (track=SFW): 503")
+        assert len(reason) <= 200
+
+    def test_last_occurrence_wins(self, tmp_path):
+        log = tmp_path / "bot.log"
+        log.write_text(
+            "x civitai-monitor: Page query failed (track=NSFW): 503 first\n"
+            "y civitai-monitor: Fatal page fetch failure: 503 last\n"
+        )
+        assert "Fatal page fetch failure: 503 last" in civitai_bot._last_scan_error_line(str(log))
+
+    def test_no_error_lines_returns_empty(self, tmp_path):
+        log = tmp_path / "bot.log"
+        log.write_text("all good\n")
+        assert civitai_bot._last_scan_error_line(str(log)) == ""
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        assert civitai_bot._last_scan_error_line(str(tmp_path / "nope.log")) == ""
