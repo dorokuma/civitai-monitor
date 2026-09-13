@@ -127,7 +127,7 @@ def _telegram_post(
                 retry_after_raw = resp.headers.get("Retry-After", "3")
                 try:
                     retry_after = int(float(retry_after_raw))
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     retry_after = 3
                 wait = max(1, retry_after) + random.uniform(0, 1)
                 log.warning(

@@ -542,6 +542,7 @@ def download_video(url: str, save_path: Path, max_size_mb: int = 1024) -> Downlo
                                 "Video download returned an empty body (attempt %d/3); will retry",
                                 attempt + 1,
                             )
+                            last_status = 0
                             continue
                         tmp_path.rename(save_path)
                         log.info(
@@ -850,7 +851,11 @@ def process_and_push(
         )
         return pushed
 
-    orig_url = normalize_to_original(item.get("url", ""), size_suffixes)
+    raw_url = item.get("url")
+    if not isinstance(raw_url, str) or not raw_url:
+        log.warning("Image %s: no usable URL, skipping", item_id)
+        return False
+    orig_url = normalize_to_original(raw_url, size_suffixes)
     ext = os.path.splitext(orig_url.split("/")[-1])[1].lower() or ".jpeg"
     if ext not in IMAGE_EXT_WHITELIST:
         log.warning(
