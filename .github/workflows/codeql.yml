@@ -20,7 +20,7 @@ jobs:
       - name: Initialize CodeQL
         # SHA-pinned: v3 is a moving tag, so pin the commit it currently
         # points at and bump deliberately (same policy as ruff in lint.yml).
-        uses: github/codeql-action/init@faaca9a8f6edddba5725ffe5adefdab6669a2eca # v3.38.0
+        uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         with:
           languages: python
 
