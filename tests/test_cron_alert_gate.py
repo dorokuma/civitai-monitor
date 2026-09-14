@@ -290,7 +290,7 @@ async def test_reconciliation_title_does_not_borrow_scan_error(gate_env, monkeyp
     await civitai_bot._report_cron_outcome(
         "reconciliation",
         failing=True,
-        detail="reconcile 非零退出（exit 1），今日第 1/3 次重试",
+        detail="reconcile 非零退出（exit 1），今日第 1/10 次重试",
     )
     assert len(gate_env["bot"].sent) == 1
     text = gate_env["bot"].sent[0][1]
@@ -375,7 +375,7 @@ def test_recon_headline_generic_when_log_has_only_scan_errors(tmp_path):
     assert civitai_bot._last_recon_error_line(str(log)) == ""
     headline = civitai_bot._cron_failure_headline(
         "reconciliation",
-        "reconcile 非零退出（exit 1），今日第 1/3 次重试",
+        "reconcile 非零退出（exit 1），今日第 1/10 次重试",
         log_path=str(log),
     )
     assert headline == "未能提取失败原因"
@@ -476,7 +476,7 @@ async def test_reconciliation_nonzero_exit_title_names_503(gate_env, monkeypatch
     await civitai_bot._report_cron_outcome(
         "reconciliation",
         failing=True,
-        detail="reconcile 非零退出（exit 2），今日第 1/3 次重试",
+        detail="reconcile 非零退出（exit 2），今日第 1/10 次重试",
     )
     text = gate_env["bot"].sent[0][1]
     first_line = text.split("\n", 1)[0]
