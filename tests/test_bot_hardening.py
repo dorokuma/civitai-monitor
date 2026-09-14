@@ -6,9 +6,8 @@ t1  heartbeat generation guard — a tick that fires after the finally block
 t2  callback_data 64-byte limit — long usernames are short-hashed and
     round-trip via the in-process mapping; short usernames are untouched.
 t3  /cleanup rejects days < 1 without touching the cache.
-t4  cron failure alerts are deduplicated by state flip (one alert per failure
-    episode, one daily digest), and a failing Telegram send never crashes the
-    cron loop.
+t4  cron failure alerts wait 24h without a success (one alert per episode,
+    one daily digest), and a failing Telegram send never crashes the cron loop.
 t5  _run_backfill rejects invalid usernames before any side effect.
 """
 
@@ -16,6 +15,7 @@ import asyncio
 import importlib.util
 import logging
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -55,6 +55,7 @@ def alert_bot(monkeypatch):
     monkeypatch.setattr(civitai_bot, "_ADMIN_CHAT_IDS", [12345])
     monkeypatch.setattr(civitai_bot, "_alert_bot", bot)
     monkeypatch.setattr(civitai_bot, "_cron_alert_state", {})
+    monkeypatch.setattr(civitai_bot, "_cron_alert_disk_loaded", False)
     return bot
 
 
@@ -345,7 +346,13 @@ class TestCronAlertDedup:
 
     @pytest.mark.asyncio
     async def test_consecutive_failures_alert_once(self, monkeypatch, tmp_path, alert_bot):
-        """Two failing scan cycles in a row -> exactly ONE Telegram alert."""
+        """Two failing scan cycles after 24h without success -> exactly ONE alert."""
+        civitai_bot._cron_alert_state["scan"] = {
+            "last_success_ts": time.time() - civitai_bot.CRON_ALERT_WINDOW_S - 10,
+            "alerted": False,
+            "last_alert_date": "",
+        }
+        civitai_bot._cron_alert_disk_loaded = True
         create_subproc = await self._run_scan_cron_failures(
             monkeypatch, tmp_path, iterations=2
         )
@@ -353,7 +360,7 @@ class TestCronAlertDedup:
         assert len(alert_bot.sent) == 1
         chat_id, text = alert_bot.sent[0]
         assert chat_id == 12345
-        assert "定时扫描失败" in text
+        assert "定时扫描已连续 24 小时失败" in text
         assert "exit 1" in text
 
     @pytest.mark.asyncio
@@ -371,30 +378,44 @@ class TestCronAlertDedup:
 
     @pytest.mark.asyncio
     async def test_gate_state_flips(self, alert_bot):
-        """fail -> recover -> fail cycle, all decided in-process."""
+        """24h window: in-window silent, then fail once, recover, clock resets."""
         gate = civitai_bot._cron_alert_gate
-        assert gate("scan", failing=True) == "fail"
-        assert gate("scan", failing=True) is None  # consecutive failure silent
-        assert gate("scan", failing=False) == "recover"
-        assert gate("scan", failing=False) is None
-        assert gate("scan", failing=True) == "fail"  # new episode alerts again
+        t0 = 1_700_000_000.0
+        w = civitai_bot.CRON_ALERT_WINDOW_S
+        assert gate("scan", failing=True, now=t0) is None  # bootstrap, no false alarm
+        assert gate("scan", failing=True, now=t0 + w - 1) is None
+        assert gate("scan", failing=True, now=t0 + w) == "fail"
+        assert gate("scan", failing=True, now=t0 + w + 1) is None
+        assert gate("scan", failing=False, now=t0 + w + 2) == "recover"
+        assert gate("scan", failing=False, now=t0 + w + 3) is None
+        assert gate("scan", failing=True, now=t0 + w + 4) is None  # new episode, clock reset
         assert len(alert_bot.sent) == 0  # the gate only decides; sends are separate
 
     @pytest.mark.asyncio
     async def test_daily_digest_for_persistent_failure(self, alert_bot):
         gate = civitai_bot._cron_alert_gate
-        assert gate("scan", failing=True, today="2026-09-10") == "fail"
-        assert gate("scan", failing=True, today="2026-09-10") is None
-        assert gate("scan", failing=True, today="2026-09-11") == "digest"
-        assert gate("scan", failing=True, today="2026-09-11") is None
+        t0 = 1_700_000_000.0  # 2023-11-14 22:13:20 UTC
+        w = civitai_bot.CRON_ALERT_WINDOW_S
+        assert gate("scan", failing=False, now=t0) is None
+        assert gate("scan", failing=True, now=t0 + w) == "fail"
+        assert gate("scan", failing=True, now=t0 + w + 60) is None
+        next_day = t0 + w + 24 * 3600
+        assert gate("scan", failing=True, now=next_day) == "digest"
+        assert gate("scan", failing=True, now=next_day + 60) is None
 
     @pytest.mark.asyncio
     async def test_report_cron_outcome_end_to_end(self, alert_bot):
         """_report_cron_outcome sends the fail alert once, then recovery once."""
+        civitai_bot._cron_alert_state["reconciliation"] = {
+            "last_success_ts": time.time() - civitai_bot.CRON_ALERT_WINDOW_S - 10,
+            "alerted": False,
+            "last_alert_date": "",
+        }
+        civitai_bot._cron_alert_disk_loaded = True
         await civitai_bot._report_cron_outcome("reconciliation", failing=True, detail="exit 2")
         await civitai_bot._report_cron_outcome("reconciliation", failing=True, detail="exit 2")
         assert len(alert_bot.sent) == 1
-        assert "每日对账失败" in alert_bot.sent[0][1]
+        assert "每日对账已连续 24 小时失败" in alert_bot.sent[0][1]
         assert "exit 2" in alert_bot.sent[0][1]
         await civitai_bot._report_cron_outcome("reconciliation", failing=False)
         assert len(alert_bot.sent) == 2
@@ -403,6 +424,12 @@ class TestCronAlertDedup:
     @pytest.mark.asyncio
     async def test_reconciliation_failure_alerts(self, monkeypatch, tmp_path, alert_bot):
         """scheduled_reconciliation_cron failure path pages admins once."""
+        civitai_bot._cron_alert_state["reconciliation"] = {
+            "last_success_ts": time.time() - civitai_bot.CRON_ALERT_WINDOW_S - 10,
+            "alerted": False,
+            "last_alert_date": "",
+        }
+        civitai_bot._cron_alert_disk_loaded = True
         _isolate_backfill_state(monkeypatch, tmp_path)
         monkeypatch.setattr(civitai_bot, "_load_active_backfills", dict)
         monkeypatch.setattr(civitai_bot, "_load_reconciliation_last_success", lambda *a: None)
@@ -437,7 +464,7 @@ class TestCronAlertDedup:
 
         assert create_subproc.await_count == 2
         assert len(alert_bot.sent) == 1  # consecutive failures dedup to one
-        assert "每日对账失败" in alert_bot.sent[0][1]
+        assert "每日对账已连续 24 小时失败" in alert_bot.sent[0][1]
 
 
 # ---------------------------------------------------------------------------

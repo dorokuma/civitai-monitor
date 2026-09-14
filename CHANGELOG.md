@@ -2,6 +2,25 @@
 
 This file follows the [Keep a Changelog](https://keepachangelog.com/) format, and version numbers follow [SemVer](https://semver.org/).
 
+## [1.5.1] - 2026-09-14
+
+### Changed
+- **Cron failure alerts wait 24 hours without a success**: Telegram pages
+  admins only after a `scan` / `reconciliation` job has gone 24 hours with
+  no success (one alert per continuous failure episode, then one daily
+  digest). A recovery notice is sent only if an alert was actually fired.
+  Gate state is persisted in `cron_alert_state.json` so a process restart
+  does not reset the 24h clock; a fresh process with no history uses the
+  current time as the baseline to avoid a startup false alarm. Manual
+  `/scan` still reports failures immediately.
+
+### Fixed
+- **Failure alert titles name the error**: HTTP status codes (502/503/429),
+  timeouts, and connection errors go in the title (e.g.
+  `❌ 定时扫描已连续 24 小时失败：Civitai API 503 Service Unavailable`).
+  When the log has no structured hit, the most informative tail line is
+  used; a bare exit code is no longer the only alert content.
+
 ## [1.5.0] - 2026-09-13
 
 ### Added

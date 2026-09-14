@@ -34,6 +34,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+from http import HTTPStatus
 from pathlib import Path
 
 import requests
@@ -106,10 +107,12 @@ _ADMIN_CHAT_IDS: list[int] = []
 # the cron coroutines have no other way to reach the Bot instance).
 _alert_bot = None
 
-# State-flip alert dedup for cron failures: job -> {"failing": bool,
-# "last_alert_date": "YYYY-MM-DD"}. Alerts fire on the success->failure flip
-# and at most once per day while a failure persists (anti-storm).
+# 24h-without-success cron alert gate: job -> {"last_success_ts": float,
+# "alerted": bool, "last_alert_date": "YYYY-MM-DD"}. Persisted to
+# cron_alert_state.json so a restart does not reset the window.
 _cron_alert_state: dict[str, dict] = {}
+_cron_alert_disk_loaded = False
+CRON_ALERT_WINDOW_S = 24 * 3600
 
 # Debounce identical admin error alerts (once per error class / 5 minutes).
 _last_error_alert: dict[str, float] = {}
@@ -170,47 +173,218 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
         log.debug("error_handler: admin-alert dispatch failed", exc_info=True)
 
 
-def _cron_alert_gate(job: str, *, failing: bool, today: str | None = None) -> str | None:
-    """Decide whether a cron outcome should page the admins (anti-storm gate).
+def _cron_alert_state_path() -> Path:
+    """Path of the persisted 24h cron-alert gate state.
 
-    Dedup strategy — alert on state flip only:
-      * success -> failure  : alert immediately ("fail")
-      * failure -> failure  : silent, except ONE summary per 24h ("digest")
-      * failure -> success  : one recovery notice ("recover")
-      * success -> success  : nothing
-    State is in-process: it resets on restart, which re-arms a single alert if
-    the failure is still present — acceptable, and better than silence.
+    Override with CIVITAI_CRON_ALERT_STATE (used by tests so they never
+    touch the production file). Default: <SCRIPT_DIR>/cron_alert_state.json.
     """
-    if today is None:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    state = _cron_alert_state.setdefault(job, {"failing": False, "last_alert_date": ""})
-    was_failing = bool(state["failing"])
+    raw = os.environ.get("CIVITAI_CRON_ALERT_STATE")
+    if raw:
+        return Path(raw)
+    return SCRIPT_DIR / "cron_alert_state.json"
+
+
+def _read_cron_alert_state_file() -> dict[str, dict]:
+    """Load persisted gate state. Corrupt/missing files yield {}."""
+    path = _cron_alert_state_path()
+    try:
+        if not path.exists() or path.stat().st_size == 0:
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for job, st in data.items():
+        if not isinstance(job, str) or not isinstance(st, dict):
+            continue
+        try:
+            ts = float(st.get("last_success_ts"))
+        except (TypeError, ValueError):
+            continue
+        out[job] = {
+            "last_success_ts": ts,
+            "alerted": bool(st.get("alerted", False)),
+            "last_alert_date": str(st.get("last_alert_date") or ""),
+        }
+    return out
+
+
+def _persist_cron_alert_state() -> None:
+    """Best-effort atomic write of in-memory gate state. Never raises."""
+    try:
+        payload = json.dumps(_cron_alert_state, indent=2, sort_keys=True)
+        _atomic_write(_cron_alert_state_path(), payload)
+    except Exception:
+        log.debug("Failed to persist cron alert state", exc_info=True)
+
+
+def _ensure_cron_alert_state_loaded() -> None:
+    """Merge on-disk state into memory once per process (or after a test reset)."""
+    global _cron_alert_disk_loaded
+    if _cron_alert_disk_loaded:
+        return
+    _cron_alert_disk_loaded = True
+    disk = _read_cron_alert_state_file()
+    for job, st in disk.items():
+        _cron_alert_state.setdefault(job, st)
+
+
+def _job_alert_state(job: str, now: float) -> dict:
+    """Return per-job gate state, bootstrapping from now when history is missing."""
+    _ensure_cron_alert_state_loaded()
+    if job not in _cron_alert_state:
+        _cron_alert_state[job] = {
+            "last_success_ts": now,
+            "alerted": False,
+            "last_alert_date": "",
+        }
+        _persist_cron_alert_state()
+    return _cron_alert_state[job]
+
+
+def _cron_alert_gate(
+    job: str, *, failing: bool, now: float | None = None
+) -> str | None:
+    """Decide whether a cron outcome should page the admins (24h-success gate).
+
+    Semantics:
+      * no history: record ``now`` as last_success_ts (no startup false alarm)
+      * failure and now - last_success_ts < 24h: silent
+      * failure and window elapsed, not yet alerted: "fail" (once/episode)
+      * failure still ongoing, new UTC day: "digest" (one per day)
+      * success: refresh last_success_ts; "recover" only if we had alerted
+    State is persisted to cron_alert_state.json so a restart does not reset
+    the 24h clock. ``scan`` and ``reconciliation`` share this helper (job key).
+    """
+    if now is None:
+        now = time.time()
+    today = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
+    state = _job_alert_state(job, now)
+    try:
+        last_success = float(state.get("last_success_ts"))
+    except (TypeError, ValueError):
+        last_success = now
+        state["last_success_ts"] = now
+        _persist_cron_alert_state()
+
     if failing:
-        if not was_failing:
-            state["failing"] = True
+        if now - last_success < CRON_ALERT_WINDOW_S:
+            return None
+        if not state.get("alerted"):
+            state["alerted"] = True
             state["last_alert_date"] = today
+            _persist_cron_alert_state()
             return "fail"
-        if state["last_alert_date"] != today:
+        if state.get("last_alert_date") != today:
             state["last_alert_date"] = today
+            _persist_cron_alert_state()
             return "digest"
         return None
-    if was_failing:
-        state["failing"] = False
-        state["last_alert_date"] = ""
+
+    was_alerted = bool(state.get("alerted"))
+    state["last_success_ts"] = now
+    state["alerted"] = False
+    state["last_alert_date"] = ""
+    _persist_cron_alert_state()
+    if was_alerted:
         return "recover"
     return None
 
 
 _CRON_ALERT_LABELS = {"scan": "定时扫描", "reconciliation": "每日对账"}
 
+_SCAN_ERROR_MARKERS = (
+    "Page query failed",
+    "Fatal page fetch failure",
+    "fetch_page failed",
+)
+_SCAN_ERROR_FALLBACK_MARKERS = (
+    "Service Unavailable",
+    "Server Error",
+    "Too Many Requests",
+    "Rate Limited",
+    "timed out",
+    "ReadTimeout",
+    "ConnectTimeout",
+    "ConnectionError",
+    "Connection refused",
+    "Max retries exceeded",
+    "Failed to establish",
+)
+_BARE_EXIT_NOISE = (
+    "Scheduled scan failed (exit",
+    "Daily reconciliation finished with code",
+    "monitor.py 非零退出",
+    "reconcile 非零退出",
+)
+_HTTP_CODE_RE = re.compile(r"\b(401|403|404|429|500|502|503|504)\b")
+_TIMEOUT_MARKERS = ("timed out", "timeout", "readtimeout", "connecttimeout")
+_CONN_MARKERS = (
+    "connectionerror",
+    "connection refused",
+    "connection reset",
+    "max retries exceeded",
+    "failed to establish",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "network is unreachable",
+)
+
+
+def _looks_like_bare_exit(text: str) -> bool:
+    """True when the only useful token is a subprocess exit code."""
+    if not re.search(r"\bexit\s+\d+\b", text) and "非零退出" not in text:
+        return False
+    low = text.lower()
+    return not (
+        _HTTP_CODE_RE.search(text)
+        or any(m in low for m in _TIMEOUT_MARKERS)
+        or any(m in low for m in _CONN_MARKERS)
+    )
+
+
+def _humanize_scan_error(reason: str) -> str:
+    """Turn a raw log line into a short title fragment (never a bare exit code)."""
+    text = (reason or "").strip()
+    if not text:
+        return ""
+    m = _HTTP_CODE_RE.search(text)
+    if m:
+        code = int(m.group(1))
+        try:
+            phrase = HTTPStatus(code).phrase
+        except ValueError:
+            phrase = ""
+        if phrase:
+            return f"Civitai API {code} {phrase}"
+        return f"Civitai API {code}"
+    low = text.lower()
+    if any(marker in low for marker in _TIMEOUT_MARKERS):
+        return "连接超时"
+    if any(marker in low for marker in _CONN_MARKERS):
+        return "连接错误"
+    if _looks_like_bare_exit(text):
+        return ""
+    cleaned = text
+    for sep in ("civitai-monitor: ", "civitai-bot: "):
+        if sep in cleaned:
+            cleaned = cleaned.split(sep, 1)[-1]
+    cleaned = cleaned.strip()
+    return cleaned[:160]
+
 
 def _last_scan_error_line(log_path: str | None = None) -> str:
-    """Best-effort: most recent monitor page-fetch error from the shared log.
+    """Best-effort: most recent monitor page-fetch / transport error from the log.
 
     The systemd unit appends both the bot and the spawned monitor to the same
     log file, so when a scheduled scan exits non-zero the underlying reason
-    (e.g. a Civitai API 503) is in the tail. Returns "" when nothing useful
-    is found - the alert then carries the exit code only.
+    (e.g. a Civitai API 503) is in the tail. Prefers structured page-fetch
+    lines; otherwise the most informative HTTP/timeout/connection line.
+    Returns an empty string when nothing useful is found — callers must not fall back
+    to a bare exit code as the only alert content.
     """
     candidates: list[Path] = []
     if log_path:
@@ -232,13 +406,35 @@ def _last_scan_error_line(log_path: str | None = None) -> str:
                 size = f.tell()
                 f.seek(max(0, size - 65536))
                 tail = f.read().decode("utf-8", "replace")
+            lines = tail.splitlines()
             hits = [
-                line for line in tail.splitlines()
-                if "Page query failed" in line or "Fatal page fetch failure" in line
+                line for line in lines
+                if any(m in line for m in _SCAN_ERROR_MARKERS)
             ]
+            if not hits:
+                hits = [
+                    line for line in lines
+                    if any(m in line for m in _SCAN_ERROR_FALLBACK_MARKERS)
+                    and not any(n in line for n in _BARE_EXIT_NOISE)
+                ]
+            if not hits:
+                hits = [
+                    line for line in lines
+                    if (
+                        "[ERROR]" in line
+                        or "[WARNING]" in line
+                        or " Error" in line
+                        or line.endswith("Error")
+                    )
+                    and not any(n in line for n in _BARE_EXIT_NOISE)
+                    and "Scheduled scan starting" not in line
+                ]
             if hits:
-                reason = hits[-1].split("civitai-monitor: ", 1)[-1].strip()
-                return reason[:200]
+                reason = hits[-1]
+                for sep in ("civitai-monitor: ", "civitai-bot: "):
+                    if sep in reason:
+                        reason = reason.split(sep, 1)[-1]
+                return reason.strip()[:200]
         except OSError:
             continue
     return ""
@@ -249,6 +445,8 @@ async def _report_cron_outcome(job: str, *, failing: bool, detail: str = "") -> 
 
     Never raises: a failing send (or any other error here) must never take
     down the cron loop. Sends one message per admin chat in _ADMIN_CHAT_IDS.
+    Failure titles name the HTTP/timeout/connection error; they never consist
+    of a bare exit code alone.
     """
     try:
         kind = _cron_alert_gate(job, failing=failing)
@@ -258,7 +456,14 @@ async def _report_cron_outcome(job: str, *, failing: bool, detail: str = "") -> 
         if kind == "recover":
             text = f"✅ {label}已恢复正常"
         else:
-            head = f"⚠️ {label}失败" if kind == "fail" else f"⚠️ {label}仍在失败（每日摘要）"
+            raw = _last_scan_error_line()
+            headline = _humanize_scan_error(raw) or _humanize_scan_error(detail)
+            if not headline:
+                headline = "未能从日志提取失败原因"
+            if kind == "fail":
+                head = f"❌ {label}已连续 24 小时失败：{headline}"
+            else:
+                head = f"❌ {label}仍在失败（每日摘要）：{headline}"
             text = f"{head}\n{detail}" if detail else head
         bot = _alert_bot
         if bot is None or not _ADMIN_CHAT_IDS:
