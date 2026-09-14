@@ -2,6 +2,36 @@
 
 This file follows the [Keep a Changelog](https://keepachangelog.com/) format, and version numbers follow [SemVer](https://semver.org/).
 
+## [1.5.2] - 2026-09-14
+
+### Fixed
+- **HTTP status titles require code-phrase adjacency**: a status code is
+  titled `Civitai API N` only when the number sits within 40 characters of
+  an error phrase (`Server Error`, `Client Error`, `Bad Gateway`,
+  `Gateway Time-out`, `Service Unavailable`, `Rate Limited`,
+  `Too Many Requests`) or an explicit form (`HTTP 502`, `status=503`,
+  `503, url=`). Soft words `Timeout` / `Unavailable` no longer unlock a
+  bare number, so `timed out after 500 ms` and
+  `TimeoutError while saving 503 items` are not titled as Civitai API
+  500/503. This release adds hits for the custom `RateLimitError` format
+  (`429 Rate Limited, retry after Ns`) and explicit forms (`HTTP 502`,
+  `status=503`, `503, url=`); requests-native `429 Client Error` already
+  titled as 429.
+- **Reconciliation alert titles stay job-scoped**: recon humanizes the
+  latest `[RECONCILE]` / recon-run log window (not scan lines). A site-wide
+  503 that also fails reconcile is titled `Civitai API 503 Service Unavailable`;
+  if that window has no extractable error, the title stays
+  `未能提取失败原因` instead of borrowing the last scan error. A recon
+  scheduler exception is named in the title rather than collapsed to the
+  generic fallback.
+- **Cron-alert state persist failures are rate-limited**: the first write
+  failure logs WARNING (with traceback); repeats within 24 hours are debug.
+  A later successful persist after a failure logs `告警状态持久化已恢复`.
+  Persist errors still never raise.
+
+### Changed
+- `VERSION` is 1.5.2 (the 1.5.1 bump had been omitted from `VERSION`).
+
 ## [1.5.1] - 2026-09-14
 
 ### Changed

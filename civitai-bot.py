@@ -113,6 +113,9 @@ _alert_bot = None
 _cron_alert_state: dict[str, dict] = {}
 _cron_alert_disk_loaded = False
 CRON_ALERT_WINDOW_S = 24 * 3600
+# Persist-failure rate limit: first WARNING, then debug for 24h; info on recover.
+_cron_alert_persist_had_failure = False
+_cron_alert_persist_warned_at: float | None = None
 
 # Debounce identical admin error alerts (once per error class / 5 minutes).
 _last_error_alert: dict[str, float] = {}
@@ -213,12 +216,31 @@ def _read_cron_alert_state_file() -> dict[str, dict]:
 
 
 def _persist_cron_alert_state() -> None:
-    """Best-effort atomic write of in-memory gate state. Never raises."""
+    """Best-effort atomic write of in-memory gate state. Never raises.
+
+    First persist failure logs WARNING (with traceback); repeats within
+    24 hours are debug. A later success after a failure logs recovery.
+    """
+    global _cron_alert_persist_had_failure, _cron_alert_persist_warned_at
     try:
         payload = json.dumps(_cron_alert_state, indent=2, sort_keys=True)
         _atomic_write(_cron_alert_state_path(), payload)
     except Exception:
-        log.debug("Failed to persist cron alert state", exc_info=True)
+        _cron_alert_persist_had_failure = True
+        now = time.time()
+        if (
+            _cron_alert_persist_warned_at is None
+            or now - _cron_alert_persist_warned_at >= CRON_ALERT_WINDOW_S
+        ):
+            _cron_alert_persist_warned_at = now
+            log.warning("Failed to persist cron alert state", exc_info=True)
+        else:
+            log.debug("Failed to persist cron alert state", exc_info=True)
+        return
+    if _cron_alert_persist_had_failure:
+        _cron_alert_persist_had_failure = False
+        _cron_alert_persist_warned_at = None
+        log.info("告警状态持久化已恢复")
 
 
 def _ensure_cron_alert_state_loaded() -> None:
@@ -320,7 +342,27 @@ _BARE_EXIT_NOISE = (
     "monitor.py 非零退出",
     "reconcile 非零退出",
 )
-_HTTP_CODE_RE = re.compile(r"\b(401|403|404|429|500|502|503|504)\b")
+_HTTP_STATUS_CODES = r"401|403|404|429|500|502|503|504"
+# Phrases that must sit next to the status code. Soft words Timeout/Unavailable
+# are NOT included: they remain timeout/connection classifiers, not HTTP keys.
+_HTTP_ERROR_PHRASE = (
+    r"Server Error|Client Error|Bad Gateway|Gateway Time-?out|"
+    r"Service Unavailable|Rate Limited|Too Many Requests"
+)
+# Status code and error phrase within 40 characters (no digits in the gap).
+_HTTP_ADJACENT_RE = re.compile(
+    rf"(?:\b(?P<pre>{_HTTP_STATUS_CODES})\b\D{{0,40}}(?:{_HTTP_ERROR_PHRASE})"
+    rf"|(?:{_HTTP_ERROR_PHRASE})\D{{0,40}}\b(?P<post>{_HTTP_STATUS_CODES})\b)",
+    re.IGNORECASE,
+)
+# Explicit forms that do not need a phrase: HTTP 502, status=503, aiohttp 503, url=
+_HTTP_EXPLICIT_RE = re.compile(
+    rf"(?:HTTP(?:/\d+(?:\.\d+)?)?\s+\b(?P<http>{_HTTP_STATUS_CODES})\b"
+    rf"|\bstatus\s*[=:]\s*(?P<st>{_HTTP_STATUS_CODES})\b"
+    rf"|\b(?P<aio>{_HTTP_STATUS_CODES})\s*,\s*"
+    rf"(?:message\s*=.*?,\s*)?url\s*=)",
+    re.IGNORECASE,
+)
 _TIMEOUT_MARKERS = ("timed out", "timeout", "readtimeout", "connecttimeout")
 _CONN_MARKERS = (
     "connectionerror",
@@ -334,13 +376,29 @@ _CONN_MARKERS = (
 )
 
 
+def _http_error_status(text: str) -> int | None:
+    """HTTP status only when the number is adjacent to error evidence."""
+    if not text:
+        return None
+    m = _HTTP_ADJACENT_RE.search(text)
+    if m:
+        return int(m.group("pre") or m.group("post"))
+    m = _HTTP_EXPLICIT_RE.search(text)
+    if m:
+        for key in ("http", "st", "aio"):
+            val = m.group(key)
+            if val:
+                return int(val)
+    return None
+
+
 def _looks_like_bare_exit(text: str) -> bool:
     """True when the only useful token is a subprocess exit code."""
     if not re.search(r"\bexit\s+\d+\b", text) and "非零退出" not in text:
         return False
     low = text.lower()
     return not (
-        _HTTP_CODE_RE.search(text)
+        _http_error_status(text) is not None
         or any(m in low for m in _TIMEOUT_MARKERS)
         or any(m in low for m in _CONN_MARKERS)
     )
@@ -351,9 +409,8 @@ def _humanize_scan_error(reason: str) -> str:
     text = (reason or "").strip()
     if not text:
         return ""
-    m = _HTTP_CODE_RE.search(text)
-    if m:
-        code = int(m.group(1))
+    code = _http_error_status(text)
+    if code is not None:
         try:
             phrase = HTTPStatus(code).phrase
         except ValueError:
@@ -376,16 +433,8 @@ def _humanize_scan_error(reason: str) -> str:
     return cleaned[:160]
 
 
-def _last_scan_error_line(log_path: str | None = None) -> str:
-    """Best-effort: most recent monitor page-fetch / transport error from the log.
-
-    The systemd unit appends both the bot and the spawned monitor to the same
-    log file, so when a scheduled scan exits non-zero the underlying reason
-    (e.g. a Civitai API 503) is in the tail. Prefers structured page-fetch
-    lines; otherwise the most informative HTTP/timeout/connection line.
-    Returns an empty string when nothing useful is found — callers must not fall back
-    to a bare exit code as the only alert content.
-    """
+def _log_tail_candidates(log_path: str | None = None):
+    """Yield decoded log-tail lines from the first readable candidate files."""
     candidates: list[Path] = []
     if log_path:
         candidates.append(Path(log_path))
@@ -406,38 +455,116 @@ def _last_scan_error_line(log_path: str | None = None) -> str:
                 size = f.tell()
                 f.seek(max(0, size - 65536))
                 tail = f.read().decode("utf-8", "replace")
-            lines = tail.splitlines()
-            hits = [
-                line for line in lines
-                if any(m in line for m in _SCAN_ERROR_MARKERS)
-            ]
-            if not hits:
-                hits = [
-                    line for line in lines
-                    if any(m in line for m in _SCAN_ERROR_FALLBACK_MARKERS)
-                    and not any(n in line for n in _BARE_EXIT_NOISE)
-                ]
-            if not hits:
-                hits = [
-                    line for line in lines
-                    if (
-                        "[ERROR]" in line
-                        or "[WARNING]" in line
-                        or " Error" in line
-                        or line.endswith("Error")
-                    )
-                    and not any(n in line for n in _BARE_EXIT_NOISE)
-                    and "Scheduled scan starting" not in line
-                ]
-            if hits:
-                reason = hits[-1]
-                for sep in ("civitai-monitor: ", "civitai-bot: "):
-                    if sep in reason:
-                        reason = reason.split(sep, 1)[-1]
-                return reason.strip()[:200]
+            yield tail.splitlines()
         except OSError:
             continue
+
+
+def _strip_log_prefix(reason: str) -> str:
+    for sep in ("civitai-monitor: ", "civitai-bot: "):
+        if sep in reason:
+            reason = reason.split(sep, 1)[-1]
+    return reason.strip()[:200]
+
+
+def _pick_error_line(lines: list[str]) -> str:
+    """Most informative page-fetch / transport error from a log-line window."""
+    hits = [line for line in lines if any(m in line for m in _SCAN_ERROR_MARKERS)]
+    if not hits:
+        hits = [
+            line for line in lines
+            if any(m in line for m in _SCAN_ERROR_FALLBACK_MARKERS)
+            and not any(n in line for n in _BARE_EXIT_NOISE)
+        ]
+    if not hits:
+        hits = [
+            line for line in lines
+            if (
+                "[ERROR]" in line
+                or "[WARNING]" in line
+                or " Error" in line
+                or line.endswith("Error")
+            )
+            and not any(n in line for n in _BARE_EXIT_NOISE)
+            and "Scheduled scan starting" not in line
+        ]
+    if not hits:
+        return ""
+    return _strip_log_prefix(hits[-1])
+
+
+_RECON_START_MARKER = "Daily deep reconciliation starting"
+_RECON_END_MARKERS = (
+    "Daily reconciliation finished with code",
+    "Daily reconciliation error:",
+    "Daily deep reconciliation completed successfully",
+)
+
+
+def _recon_window_lines(lines: list[str]) -> list[str]:
+    """Latest reconcile-subprocess slice; never a preceding/following scan run."""
+    start_idx = None
+    for i, line in enumerate(lines):
+        if _RECON_START_MARKER in line:
+            start_idx = i
+    if start_idx is None:
+        return [ln for ln in lines if "[RECONCILE]" in ln]
+    end_idx = len(lines)
+    for i in range(start_idx + 1, len(lines)):
+        if any(m in lines[i] for m in _RECON_END_MARKERS):
+            end_idx = i + 1
+            break
+    return lines[start_idx:end_idx]
+
+
+def _last_scan_error_line(log_path: str | None = None) -> str:
+    """Best-effort: most recent monitor page-fetch / transport error from the log.
+
+    The systemd unit appends both the bot and the spawned monitor to the same
+    log file, so when a scheduled scan exits non-zero the underlying reason
+    (e.g. a Civitai API 503) is in the tail. Prefers structured page-fetch
+    lines; otherwise the most informative HTTP/timeout/connection line.
+    Returns an empty string when nothing useful is found — callers must not fall back
+    to a bare exit code as the only alert content.
+    """
+    for lines in _log_tail_candidates(log_path):
+        reason = _pick_error_line(lines)
+        if reason:
+            return reason
     return ""
+
+
+def _last_recon_error_line(log_path: str | None = None) -> str:
+    """Most recent error from the latest [RECONCILE] / recon-run log window.
+
+    Scan-only lines outside that window are ignored so a site-wide 503 that
+    also fails reconcile can still be titled from recon's own logs, without
+    borrowing a later or earlier scheduled-scan error.
+    """
+    for lines in _log_tail_candidates(log_path):
+        reason = _pick_error_line(_recon_window_lines(lines))
+        if reason:
+            return reason
+    return ""
+
+
+def _cron_failure_headline(
+    job: str, detail: str = "", *, log_path: str | None = None
+) -> str:
+    """Title fragment for a failing cron job; recon never borrows scan logs."""
+    if job == "reconciliation":
+        raw = _last_recon_error_line(log_path)
+        return (
+            _humanize_scan_error(raw)
+            or _humanize_scan_error(detail)
+            or "未能提取失败原因"
+        )
+    raw = _last_scan_error_line(log_path)
+    return (
+        _humanize_scan_error(raw)
+        or _humanize_scan_error(detail)
+        or "未能从日志提取失败原因"
+    )
 
 
 async def _report_cron_outcome(job: str, *, failing: bool, detail: str = "") -> None:
@@ -446,7 +573,8 @@ async def _report_cron_outcome(job: str, *, failing: bool, detail: str = "") -> 
     Never raises: a failing send (or any other error here) must never take
     down the cron loop. Sends one message per admin chat in _ADMIN_CHAT_IDS.
     Failure titles name the HTTP/timeout/connection error; they never consist
-    of a bare exit code alone.
+    of a bare exit code alone. Reconciliation titles use the recon log window
+    (or the job's own detail) and never borrow a scan log line.
     """
     try:
         kind = _cron_alert_gate(job, failing=failing)
@@ -456,10 +584,7 @@ async def _report_cron_outcome(job: str, *, failing: bool, detail: str = "") -> 
         if kind == "recover":
             text = f"✅ {label}已恢复正常"
         else:
-            raw = _last_scan_error_line()
-            headline = _humanize_scan_error(raw) or _humanize_scan_error(detail)
-            if not headline:
-                headline = "未能从日志提取失败原因"
+            headline = _cron_failure_headline(job, detail)
             if kind == "fail":
                 head = f"❌ {label}已连续 24 小时失败：{headline}"
             else:
