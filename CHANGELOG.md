@@ -2,6 +2,14 @@
 
 This file follows the [Keep a Changelog](https://keepachangelog.com/) format, and version numbers follow [SemVer](https://semver.org/).
 
+## [1.6.0] - 2026-09-15
+
+### Changed
+- **/backfill interactive list is newest-first**: the `/backfill` button
+  panel (initial `_show_backfill_list` and `bf_pg` pagination) now shows
+  newly added subscriptions before older ones. `get_users`, `config.yaml`
+  storage order, `/list`, and `/remove` are unchanged.
+
 ## [1.5.2] - 2026-09-14
 
 ### Fixed

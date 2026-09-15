@@ -903,3 +903,160 @@ class TestScheduledReconciliationCron:
             proc.terminate.assert_called_once()
         finally:
             civitai_bot._current_recon_proc = None
+
+# ---------------------------------------------------------------------------
+# /backfill button list: newest subscription first
+# ---------------------------------------------------------------------------
+
+
+def _backfill_button_usernames(markup) -> list[str]:
+    """Usernames from ⏳ row buttons, excluding nav/close."""
+    names: list[str] = []
+    for row in markup.inline_keyboard:
+        for btn in row:
+            data = btn.callback_data or ""
+            if (
+                data.startswith("bf:")
+                and not data.startswith("bf_pg:")
+                and data != "bf_cl"
+            ):
+                names.append(data.split(":", 1)[1])
+    return names
+
+
+class TestBackfillListNewestFirst:
+    """Interactive /backfill list renders newest-added users first.
+
+    Storage order (get_users / config.yaml) stays oldest-first; only the
+    backfill keyboard reverses. Covers the command-entry renderer and the
+    bf_pg pagination callback.
+    """
+
+    UID = 424242
+    STORED = ("oldA", "midB", "newC")
+    DISPLAY = ("newC", "midB", "oldA")
+
+    @pytest.fixture
+    def cfg(self):
+        return MonitorConfig(
+            telegram={"bot_token": "t", "chat_id": "c"},
+            subscriptions={
+                str(self.UID): [{"name": u} for u in self.STORED],
+            },
+            authorized_users=[],
+        )
+
+    def test_get_users_keeps_storage_order(self, cfg):
+        # Anchor: we did not change get_users / storage order.
+        assert get_users(cfg, telegram_user_id=self.UID) == list(self.STORED)
+
+    @pytest.mark.asyncio
+    async def test_show_backfill_list_page0_newest_first(self, monkeypatch, cfg):
+        monkeypatch.setattr(civitai_bot, "read_config", lambda: cfg)
+        received: dict = {}
+        real_kb = civitai_bot.paginated_user_keyboard
+
+        def _spy(users, page, **kwargs):
+            received["users"] = list(users)
+            received["page"] = page
+            return real_kb(users, page, **kwargs)
+
+        monkeypatch.setattr(civitai_bot, "paginated_user_keyboard", _spy)
+
+        message = MagicMock()
+        message.reply_text = AsyncMock()
+        await civitai_bot._show_backfill_list(message, self.UID, page=0)
+
+        assert received["users"] == list(self.DISPLAY)
+        assert received["page"] == 0
+        message.reply_text.assert_awaited()
+        markup = message.reply_text.await_args.kwargs["reply_markup"]
+        assert _backfill_button_usernames(markup) == list(self.DISPLAY)
+        texts = [
+            row[0].text
+            for row in markup.inline_keyboard
+            if row[0].callback_data.startswith("bf:")
+        ]
+        assert texts == [f"⏳ @{u}" for u in self.DISPLAY]
+
+    @pytest.mark.asyncio
+    async def test_bf_pg_callback_page0_newest_first(self, monkeypatch, cfg):
+        monkeypatch.setattr(civitai_bot, "read_config", lambda: cfg)
+        monkeypatch.setattr(civitai_bot, "_check_auth", AsyncMock(return_value=True))
+        monkeypatch.setattr(civitai_bot, "_user_last_call", {})
+
+        received: dict = {}
+        real_kb = civitai_bot.paginated_user_keyboard
+
+        def _spy(users, page, **kwargs):
+            received["users"] = list(users)
+            received["page"] = page
+            return real_kb(users, page, **kwargs)
+
+        monkeypatch.setattr(civitai_bot, "paginated_user_keyboard", _spy)
+
+        query = MagicMock()
+        query.answer = AsyncMock()
+        query.data = "bf_pg:0"
+        query.from_user.id = self.UID
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        update.effective_user = MagicMock(id=self.UID)
+        update.effective_message = MagicMock()
+        update.message = None
+
+        await civitai_bot.cmd_backfill_callback(update, None)
+
+        assert received["users"] == list(self.DISPLAY)
+        assert received["page"] == 0
+        query.edit_message_text.assert_awaited()
+        markup = query.edit_message_text.await_args.kwargs["reply_markup"]
+        assert _backfill_button_usernames(markup) == list(self.DISPLAY)
+        texts = [
+            row[0].text
+            for row in markup.inline_keyboard
+            if row[0].callback_data.startswith("bf:")
+        ]
+        assert texts == [f"⏳ @{u}" for u in self.DISPLAY]
+
+    @pytest.mark.asyncio
+    async def test_show_backfill_list_page1_shows_oldest(self, monkeypatch):
+        """9 users, per_page=8: page 1 renders the oldest (reversed index 8)."""
+        stored = ["oldest", "u1", "u2", "u3", "u4", "u5", "u6", "u7", "newest"]
+        display = list(reversed(stored))
+        cfg = MonitorConfig(
+            telegram={"bot_token": "t", "chat_id": "c"},
+            subscriptions={
+                str(self.UID): [{"name": u} for u in stored],
+            },
+            authorized_users=[],
+        )
+        monkeypatch.setattr(civitai_bot, "read_config", lambda: cfg)
+        received: dict = {}
+        real_kb = civitai_bot.paginated_user_keyboard
+
+        def _spy(users, page, **kwargs):
+            received["users"] = list(users)
+            received["page"] = page
+            return real_kb(users, page, **kwargs)
+
+        monkeypatch.setattr(civitai_bot, "paginated_user_keyboard", _spy)
+
+        message = MagicMock()
+        message.reply_text = AsyncMock()
+        await civitai_bot._show_backfill_list(message, self.UID, page=1)
+
+        assert received["users"] == display
+        assert received["page"] == 1
+        assert display[8] == "oldest"
+        message.reply_text.assert_awaited()
+        markup = message.reply_text.await_args.kwargs["reply_markup"]
+        assert _backfill_button_usernames(markup) == ["oldest"]
+        texts = [
+            row[0].text
+            for row in markup.inline_keyboard
+            if row[0].callback_data.startswith("bf:")
+        ]
+        assert texts == ["⏳ @oldest"]

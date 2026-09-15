@@ -1611,7 +1611,7 @@ async def cmd_backfill(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def _show_backfill_list(message, telegram_user_id: int, page: int = 0) -> None:
     """Display paginated user list with backfill buttons."""
     cfg = read_config()
-    users = get_users(cfg, telegram_user_id)
+    users = list(reversed(get_users(cfg, telegram_user_id)))
     if not users:
         await message.reply_text("📭 监控列表是空的，先 `/add` 加几个吧", parse_mode="Markdown")
         return
@@ -1649,7 +1649,7 @@ async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE)
         if data.startswith("bf_pg:"):
             page = int(data.split(":", 1)[1])
             cfg = read_config()
-            users = get_users(cfg, uid)
+            users = list(reversed(get_users(cfg, uid)))
             await _render_backfill_page(query, users, page)
             return
 
