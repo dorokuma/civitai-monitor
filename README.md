@@ -84,6 +84,7 @@ subscriptions:                      seen_ids/
 git clone https://github.com/dorokuma/civitai-monitor.git
 cd civitai-monitor
 pip install -r requirements.txt
+# video compression needs ffmpeg/ffprobe on PATH (e.g. apt-get install -y ffmpeg)
 ```
 
 ### 2. Configure
@@ -240,6 +241,7 @@ See [`config.yaml.example`](config.yaml.example) for the full schema. Key sectio
 | `nsfw` | `sfw_only`, `nsfw_only`, or `both` (default) |
 | `video_enabled` | Enable/disable video detection and download |
 | `max_video_size_mb` | Skip videos larger than this (default: 1024) |
+| `compress` | Lossless-first compression of oversized photos/videos before upload |
 | `api` | API base URL, page size |
 | `download` | Output directory, URL size-suffix replacements, cache retention |
 | `http` | User-Agent, Referer, extra headers, **cookies_file** |

@@ -54,7 +54,7 @@ def _scan(tmp_path, monkeypatch, pushed_ids, items, detailed_result):
     """
     calls: list[tuple[str, list]] = []
 
-    def fake_detailed(bot_token, chat_id, text, file_paths):
+    def fake_detailed(bot_token, chat_id, text, file_paths, _compress=None):
         calls.append((text, [str(p) for p in (file_paths or [])]))
         return detailed_result
 

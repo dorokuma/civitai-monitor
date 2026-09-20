@@ -247,7 +247,7 @@ class _ClosedHandle:
 class TestRewindUploadFilesValueErrorSurface:
     def test_rewind_maps_valueerror_to_oserror(self):
         with pytest.raises(OSError, match="cannot rewind"):
-            telegram_media._rewind_upload_files({"document": _ClosedHandle()})
+            telegram_media._rewind_upload_files({"video": _ClosedHandle()})
 
     def test_rewind_maps_valueerror_in_tuple_form(self):
         with pytest.raises(OSError, match="cannot rewind"):
@@ -257,10 +257,73 @@ class TestRewindUploadFilesValueErrorSurface:
 
     def test_telegram_post_wraps_rewind_failure_in_request_exception(self):
         fake_token = "123" + ":" + "A" * 10  # fake fixture token, split parts
-        url = f"https://api.telegram.org/bot{fake_token}/sendDocument"
+        url = f"https://api.telegram.org/bot{fake_token}/sendVideo"
         api = MagicMock()
         with patch.object(telegram_media.requests, "post", api), pytest.raises(
             requests.RequestException, match="upload file rewind failed"
         ):
-            telegram_media._telegram_post(url, timeout=1.0, files={"document": _ClosedHandle()})
+            telegram_media._telegram_post(url, timeout=1.0, files={"video": _ClosedHandle()})
         api.post.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# t6 — the document-send branch is gone for good
+# ---------------------------------------------------------------------------
+
+
+# Assembled at runtime so this test file itself never contains the endpoint
+# name as a literal (the guard below scans every file, including this one).
+_DOC_ENDPOINT = "send" + "Document"
+
+
+class TestDocumentSendBranchRemoved:
+    """Oversized media is compressed; the Telegram document path is gone.
+
+    The guard scans every shipped source/deployment file (Python, workflows,
+    YAML, systemd units, docs) for the endpoint name — the changelog is the
+    single exemption, because release history legitimately records that older
+    versions used it.
+    """
+
+    _SCANNED_SUFFIXES = (".py", ".yml", ".yaml", ".service", ".md")
+    _SCANNED_SKIP_NAMES = ("CHANGELOG.md",)
+
+    @staticmethod
+    def _scan(root: Path) -> list[str]:
+        offenders = []
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            if path.suffix not in TestDocumentSendBranchRemoved._SCANNED_SUFFIXES:
+                continue
+            if path.name in TestDocumentSendBranchRemoved._SCANNED_SKIP_NAMES:
+                continue
+            if path.name.endswith(".bak"):
+                continue
+            if any(part in {".venv", ".git", "__pycache__", "downloads"} for part in path.parts):
+                continue
+            if _DOC_ENDPOINT in path.read_text(encoding="utf-8", errors="replace"):
+                offenders.append(str(path.relative_to(root)))
+        return offenders
+
+    def test_no_shipped_file_references_the_document_endpoint(self):
+        root = Path(__file__).parent.parent
+        offenders = self._scan(root)
+        assert offenders == [], f"document-send endpoint still referenced by: {offenders}"
+
+    def test_guard_actually_detects_the_endpoint(self, tmp_path):
+        # Guard the guard: an offending file must be found, not silently ignored.
+        (tmp_path / "bad.py").write_text(
+            f"url = 'send?' + '{_DOC_ENDPOINT}'", encoding="utf-8",
+        )
+        assert self._scan(tmp_path) == ["bad.py"]
+
+    def test_document_limit_constant_is_gone(self):
+        removed_constant = "TELEGRAM_" + "DOCUMENT_MAX_BYTES"
+        assert not hasattr(telegram_media, removed_constant)
+
+    def test_oversized_media_uses_the_compression_settings(self):
+        # The photo limit constant is now genuinely used by the send path.
+        settings = telegram_media.media_compress.CompressSettings()
+        assert settings.photo_target_bytes == telegram_media.TELEGRAM_PHOTO_MAX_BYTES
+        assert settings.video_target_bytes == telegram_media.TELEGRAM_VIDEO_MAX_MB * 1024 * 1024

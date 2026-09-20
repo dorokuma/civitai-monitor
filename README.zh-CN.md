@@ -81,6 +81,7 @@ subscriptions:                      seen_ids/
 git clone https://github.com/dorokuma/civitai-monitor.git
 cd civitai-monitor
 pip install -r requirements.txt
+# 视频压缩需要 PATH 上有 ffmpeg/ffprobe（如 apt-get install -y ffmpeg）
 ```
 
 ### 2. 配置
@@ -230,6 +231,7 @@ image.civitai.com/xxx.mp4  ──301──►  B2 /default（仅封面图 JPEG �
 | `nsfw` | `sfw_only`（仅非敏感）、`nsfw_only`（仅敏感）、`both`（全部） |
 | `video_enabled` | 启用/禁用视频检测和下载 |
 | `max_video_size_mb` | 跳过大于此值的视频（默认 1024MB） |
+| `compress` | 超限图片/视频上传前的无损优先压缩配置 |
 | `api` | API 地址、每页数量 |
 | `download` | 下载目录、URL 尺寸后缀、**缓存保留策略**（`keep_days` + `max_total_gb`） |
 | `http` | User-Agent、Referer、自定义请求头、**cookies_file** |

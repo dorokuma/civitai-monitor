@@ -33,6 +33,25 @@ video_enabled: true
 max_video_size_mb: 1024
 
 # ---------------------------------------------------------------------------
+# Media compression (oversized uploads)
+# ---------------------------------------------------------------------------
+# Photos above 10 MiB and videos above the local Bot API server limit (2 GiB)
+# are compressed before upload, lossless first: metadata stripping / stream
+# copy, then a near-lossless re-encode, and only then a small downscale.
+# The original download is kept on disk (download.keep_days / max_total_gb).
+compress:
+  enabled: true             # false = never compress; oversized media degrades to a text notice
+  image_quality_min: 92     # lowest JPEG quality tried (ceiling is 95)
+  image_allow_scale: true   # allow a small downscale as the last resort
+  image_min_scale: 0.8      # smallest image downscale factor tried
+  video_crf: 18             # libx264 CRF (lower = better quality / bigger file)
+  video_preset: slow        # libx264 preset
+  video_audio_bitrate: 128k # AAC audio bitrate
+  video_allow_scale: true   # allow a small downscale as the last resort
+  video_min_scale: 0.8      # smallest video downscale factor tried
+  timeout_seconds: 300      # hard ffmpeg/ffprobe timeout; a timeout fails the compression
+
+# ---------------------------------------------------------------------------
 # Civitai API settings
 # ---------------------------------------------------------------------------
 api:

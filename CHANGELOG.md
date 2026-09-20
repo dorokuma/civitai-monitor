@@ -2,6 +2,54 @@
 
 This file follows the [Keep a Changelog](https://keepachangelog.com/) format, and version numbers follow [SemVer](https://semver.org/).
 
+## [1.7.0] - 2026-09-20
+
+### Added
+- **Oversized media is compressed before upload (lossless first)**: new
+  `media_compress.py` shrinks photos above 10 MiB and videos above the
+  2 GiB local Bot API limit. The image ladder is (1) a metadata-only JPEG
+  rewrite — XMP/EXIF/ICC/IPTC/COM segments dropped, entropy-coded data
+  copied verbatim — or a lossless PNG re-deflate, (2) a JPEG quality
+  bisection between 95 and the configured floor (default 92), and (3) an
+  optional downscale from 0.95 down to `image_min_scale` (default 0.8);
+  RGBA/LA/`P` alpha is flattened onto white when a JPEG is required and a
+  PNG that can only be shrunk lossily is converted to high-quality JPEG
+  with a log line. The video ladder is (1) a stream-copy remux into a
+  faststart MP4, (2) `libx264 -crf 18 -preset slow` + AAC (`128k`) capped
+  by `-maxrate/-bufsize`, and (3) a bitrate-targeted encode
+  (`target_bytes * 8 * 0.9 / duration`), optionally downscaled to
+  `video_min_scale` (default 0.8). Every ffmpeg/ffprobe call runs through
+  `subprocess` with a hard `timeout_seconds` cap (default 300); a timeout
+  kills the child and fails the compression, and half-written candidates
+  are always removed.
+- **`compress:` config section** (`config.yaml`, documented in
+  `config.yaml.example`): `enabled` (default true), `image_quality_min`
+  (92), `image_allow_scale` (true), `image_min_scale` (0.8), `video_crf`
+  (18), `video_preset` (slow), `video_audio_bitrate` (128k),
+  `video_allow_scale` (true), `video_min_scale` (0.8),
+  `timeout_seconds` (300). Every field is optional, so a `config.yaml`
+  without the section (or with only some keys) still loads on defaults.
+
+### Changed
+- **Telegram media path compresses instead of rerouting**: the video path
+  uses `sendVideo` only; an oversized video is compressed first and falls
+  back to the plain-text notice (existing `media_failed=True` semantics)
+  only when no usable artifact fits the limit. Photos are size-checked
+  before the media group is assembled and compressed individually;
+  a photo that cannot be shrunk enough degrades to the text notice as
+  well instead of being silently dropped. Compressed artifacts are
+  deleted after the upload; the original download stays on disk for
+  `cleanup_old_caches` (keep_days / max_total_gb). `Pillow` is now a
+  requirement and `ffmpeg`/`ffprobe` are required at runtime for video
+  compression.
+
+### Removed
+- **The document-upload branch for oversized videos** (endpoint,
+  `TELEGRAM_DOCUMENT_MAX_BYTES`, its `monitor.py` import and the tests that
+  depended on it) — it is replaced by compression. A regression test scans
+  the shipped sources, workflows, systemd units and docs to keep it from
+  coming back.
+
 ## [1.6.0] - 2026-09-15
 
 ### Changed

@@ -31,6 +31,7 @@ import signal
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -75,6 +76,7 @@ from config_io import (
     VALID_NSFW,  # noqa: F401
     ApiConfig,  # noqa: F401
     BackfillConfig,  # noqa: F401
+    CompressConfig,  # noqa: F401
     DataConfig,  # noqa: F401
     DownloadConfig,  # noqa: F401
     HttpConfig,  # noqa: F401
@@ -86,6 +88,7 @@ from config_io import (
     redact_config_for_disk,  # noqa: F401
     write_config,  # noqa: F401
 )
+from media_compress import CompressSettings
 from state_store import (
     PENDING_CONFIRM_SECONDS,
     PENDING_MAX_RETRIES,
@@ -111,9 +114,8 @@ from state_store import (
     update_push_timestamps,  # noqa: F401
 )
 from telegram_media import (
-    TELEGRAM_DOCUMENT_MAX_BYTES,  # noqa: F401
-    TELEGRAM_PHOTO_MAX_BYTES,  # noqa: F401
-    TELEGRAM_VIDEO_MAX_MB,  # noqa: F401
+    TELEGRAM_PHOTO_MAX_BYTES,
+    TELEGRAM_VIDEO_MAX_MB,
     _send_telegram_media_group,  # noqa: F401
     _send_telegram_text,  # noqa: F401
     _send_telegram_video,  # noqa: F401
@@ -131,6 +133,7 @@ def _tm_send_detailed(
     chat_id: str,
     text: str,
     file_paths: list[Path] | None,
+    compress: CompressSettings | None = None,
 ) -> tuple[bool, bool]:
     """Call telegram_media.send_to_telegram_detailed (hardened contract).
 
@@ -147,7 +150,7 @@ def _tm_send_detailed(
             "telegram_media.send_to_telegram_detailed is missing; update "
             "telegram_media.py to the hardened contract"
         )
-    return fn(bot_token, chat_id, text, file_paths)
+    return fn(bot_token, chat_id, text, file_paths, compress)
 
 
 def send_to_telegram_detailed(
@@ -155,6 +158,7 @@ def send_to_telegram_detailed(
     chat_id: str,
     text: str,
     file_paths: list[Path] | None,
+    compress: CompressSettings | None = None,
 ) -> tuple[bool, bool]:
     """Detailed send contract consumed by _send (implemented in telegram_media).
 
@@ -165,6 +169,11 @@ def send_to_telegram_detailed(
         the media upload ultimately failed, so the media still has to be
         (re)sent even when delivered is True.
 
+    ``compress`` carries the ``compress:`` config section (built by
+    :meth:`media_compress.CompressSettings.from_config`); oversized media is
+    compressed before upload instead of being sent through the removed
+    document endpoint.
+
     Compatibility seam: existing tests monkeypatch the legacy bool
     ``send_to_telegram`` symbol on this module; when that seam has been
     replaced, route through it and report no media failure so the old
@@ -173,7 +182,7 @@ def send_to_telegram_detailed(
     """
     if send_to_telegram is not _ORIGINAL_SEND_TO_TELEGRAM:
         return send_to_telegram(bot_token, chat_id, text, file_paths), False
-    return _tm_send_detailed(bot_token, chat_id, text, file_paths)
+    return _tm_send_detailed(bot_token, chat_id, text, file_paths, compress)
 
 # Re-export for callers that still read monitor._tg_api_base-style names.
 # Prefer set_tg_api_base() / get_tg_api_base().
@@ -682,6 +691,7 @@ def process_and_push(
     chat_id: str,
     video_enabled: bool,
     max_video_size_mb: int,
+    compress: CompressSettings | None = None,
     pushed_ids: set[int] | None = None,
     pushed_dir: Path | None = None,
     tg_id: str | None = None,
@@ -731,7 +741,9 @@ def process_and_push(
                     "crash-recovery guard",
                     item_id, username,
                 )
-        delivered, media_failed = send_to_telegram_detailed(bot_token, chat_id, text, files)
+        delivered, media_failed = send_to_telegram_detailed(
+            bot_token, chat_id, text, files, compress,
+        )
         try:
             if delivered and media_failed:
                 # The text fallback reached the user, but the locally
@@ -933,6 +945,7 @@ def _fetch_and_process_page(
     max_video_size_mb: int,
     pushed_dir: Path,
     tg_id: str,
+    compress: CompressSettings | None = None,
 ) -> tuple[list[dict], set[int], str]:
     """Fetch one page (by cursor), find new items, process and push them.
 
@@ -1124,6 +1137,7 @@ def _fetch_and_process_page(
                     chat_id=chat_id,
                     video_enabled=video_enabled,
                     max_video_size_mb=max_video_size_mb,
+                    compress=compress,
                     pushed_ids=pushed_ids,
                     pushed_dir=pushed_dir,
                     tg_id=tg_id,
@@ -1161,6 +1175,7 @@ def run_incremental(
     limit: int,
     video_enabled: bool,
     max_video_size_mb: int,
+    compress: CompressSettings | None = None,
     max_pages: int = 50,
     hole_window_items: int = 500,
     shutdown_flag: Callable[[], bool] = lambda: False,
@@ -1193,7 +1208,7 @@ def run_incremental(
                 size_suffixes=size_suffixes, output_dir=output_dir,
                 bot_token=bot_token, chat_id=chat_id,
                 video_enabled=video_enabled, max_video_size_mb=max_video_size_mb,
-                pushed_dir=seen_dir, tg_id=tg_id,
+                pushed_dir=seen_dir, tg_id=tg_id, compress=compress,
             )
             last_new_count = len(new_on_page)
 
@@ -1296,6 +1311,7 @@ def run_full(
     limit: int,
     video_enabled: bool,
     max_video_size_mb: int,
+    compress: CompressSettings | None = None,
     seen_dir: Path,
     shutdown_flag: Callable[[], bool] = lambda: False,
 ) -> set[int]:
@@ -1329,7 +1345,7 @@ def run_full(
                 size_suffixes=size_suffixes, output_dir=output_dir,
                 bot_token=bot_token, chat_id=chat_id,
                 video_enabled=video_enabled, max_video_size_mb=max_video_size_mb,
-                pushed_dir=seen_dir, tg_id=tg_id,
+                pushed_dir=seen_dir, tg_id=tg_id, compress=compress,
             )
 
             # Cursor-loop guard: remember every cursor we walked; if the API
@@ -1403,6 +1419,7 @@ def run_reconciliation(
     limit: int,
     video_enabled: bool,
     max_video_size_mb: int,
+    compress: CompressSettings | None = None,
     max_pages_per_track: int = 200,
     max_consecutive_no_new_pages: int = 3,
     shutdown_flag: Callable[[], bool] = lambda: False,
@@ -1451,7 +1468,7 @@ def run_reconciliation(
                 size_suffixes=size_suffixes, output_dir=output_dir,
                 bot_token=bot_token, chat_id=chat_id,
                 video_enabled=video_enabled, max_video_size_mb=max_video_size_mb,
-                pushed_dir=seen_dir, tg_id=tg_id,
+                pushed_dir=seen_dir, tg_id=tg_id, compress=compress,
             )
 
             # Cursor loop guard
@@ -1731,6 +1748,7 @@ def _process_single_creator(
     page_limit: int,
     video_enabled: bool,
     max_video_size_mb: int,
+    compress: CompressSettings | None = None,
     incremental_max_pages: int,
     hole_window_items: int = 500,
     reconcile_max_pages: int = 200,
@@ -1759,6 +1777,7 @@ def _process_single_creator(
         "limit": page_limit,
         "video_enabled": video_enabled,
         "max_video_size_mb": max_video_size_mb,
+        "compress": compress,
     }
     try:
         if mode == "full":
@@ -1823,6 +1842,23 @@ def _process_creator_queue(
     but still reported via ``had_fetch_error`` so main can preserve the
     historical exit code 2.
     """
+    # Telegram limits live in telegram_media (the module that owns them); the
+    # compressor's targets are pinned to those constants here so the two
+    # cannot drift, while every tuning knob comes from the ``compress:``
+    # config section (defaults apply when the section is absent).
+    compress_settings = replace(
+        CompressSettings.from_config(getattr(cfg, "compress", None)),
+        photo_target_bytes=TELEGRAM_PHOTO_MAX_BYTES,
+        video_target_bytes=TELEGRAM_VIDEO_MAX_MB * 1024 * 1024,
+    )
+    log.info(
+        "Compression: enabled=%s | photo<=%d MB | video<=%d MB | timeout=%ds",
+        compress_settings.enabled,
+        compress_settings.photo_target_bytes // 1048576,
+        compress_settings.video_target_bytes // 1048576,
+        compress_settings.timeout_seconds,
+    )
+
     total_creators = sum(len(v) for v in subs.values())
     pushed_count = 0
     creator_idx = 0
@@ -1863,6 +1899,7 @@ def _process_creator_queue(
                     hole_window_items=getattr(cfg.incremental, "hole_window_items", 500),
                     reconcile_max_pages=cfg.reconciliation.max_pages_per_track,
                     reconcile_consecutive_no_new=cfg.reconciliation.max_consecutive_no_new_pages,
+                    compress=compress_settings,
                 )
             except FetchPageError as e:
                 had_fetch_error = True

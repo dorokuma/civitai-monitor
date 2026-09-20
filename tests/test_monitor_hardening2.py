@@ -57,7 +57,7 @@ def _run_push(
     """
     captured: dict = {}
 
-    def fake_detailed(bot_token, chat_id, text, file_paths):
+    def fake_detailed(bot_token, chat_id, text, file_paths, _compress=None):
         captured["text"] = text
         captured["files"] = file_paths
         return detailed_result

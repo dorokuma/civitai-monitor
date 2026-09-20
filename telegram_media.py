@@ -11,15 +11,18 @@ from pathlib import Path
 
 import requests
 
+import media_compress
+
 log = logging.getLogger("civitai-monitor")
 
 # Telegram send limits
-TELEGRAM_PHOTO_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
-TELEGRAM_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024  # 50 MB; larger is rejected
+TELEGRAM_PHOTO_MAX_BYTES = 10 * 1024 * 1024  # 10 MiB; larger photos are compressed first
 # 本地 telegram-bot-api 服务器（127.0.0.1:8081）的文件上限是 2GB（2000MB），
 # sendVideo 在本地服务器下同样放宽到 2GB，所以这里的 2048MB 阈值是匹配的，不是 bug。
 # 不要把它改成 50——那是官方云 API api.telegram.org 的 sendVideo 上限。
 # 本项目永远使用自建本地服务器（不会切回官方 API），此值保持 2048。
+# 超过此值的视频不再改走文档上传（该分支已整体移除）：先按 media_compress 的
+# 无损优先阶梯压缩，压完仍超限才降级为纯文本通知。
 TELEGRAM_VIDEO_MAX_MB = 2048
 
 _tg_api_base = "https://api.telegram.org"
@@ -173,6 +176,7 @@ def send_to_telegram_detailed(
     chat_id: str,
     text: str,
     file_paths: list[Path] | None = None,
+    compress: media_compress.CompressSettings | None = None,
 ) -> tuple[bool, bool]:
     """Send a Telegram message and report the media outcome separately.
 
@@ -189,6 +193,10 @@ def send_to_telegram_detailed(
     (False, True). The caller must not mark the item pushed; the monitor
     re-sends the whole item on a later scan, which can duplicate an
     already-delivered media — accepted over silently dropping it.
+
+    ``compress`` carries the ``compress:`` config section (see
+    :mod:`media_compress`); oversized media is compressed before the upload
+    instead of being routed through the document endpoint, which no longer exists.
     """
     api_base = f"{_tg_api_base}/bot{bot_token}"
 
@@ -198,9 +206,13 @@ def send_to_telegram_detailed(
             is_video = any(fp.suffix.lower() in (".mp4", ".webm", ".mov") for fp in valid_files)
 
             if is_video:
-                ok, media_failed = _send_telegram_video_with_status(api_base, chat_id, text, valid_files[0])
+                ok, media_failed = _send_telegram_video_with_status(
+                    api_base, chat_id, text, valid_files[0], compress,
+                )
             else:
-                ok, media_failed = _send_telegram_media_group_with_status(api_base, chat_id, text, valid_files)
+                ok, media_failed = _send_telegram_media_group_with_status(
+                    api_base, chat_id, text, valid_files, compress,
+                )
             return ok is True, media_failed
 
     return _send_telegram_text(api_base, chat_id, text), False
@@ -211,6 +223,7 @@ def send_to_telegram(
     chat_id: str,
     text: str,
     file_paths: list[Path] | None = None,
+    compress: media_compress.CompressSettings | None = None,
 ) -> bool:
     """Send a Telegram message (thin legacy wrapper).
 
@@ -219,12 +232,54 @@ def send_to_telegram(
     "uncertain" marker is folded into False). See
     :func:`send_to_telegram_detailed` for the separate media outcome.
     """
-    ok, _ = send_to_telegram_detailed(bot_token, chat_id, text, file_paths)
+    ok, _ = send_to_telegram_detailed(bot_token, chat_id, text, file_paths, compress)
     return ok
 
 
+def _safe_compress(
+    compressor, source: Path, target_bytes: int,
+    settings: media_compress.CompressSettings,
+) -> media_compress.CompressResult:
+    """Call a media_compress entry point, turning any crash into a failure value.
+
+    The compressor reports failures as ``CompressResult`` and never raises by
+    contract; this belt-and-braces wrapper keeps an unexpected bug (or OOM)
+    from escaping the send path, where it would skip the text notice and park
+    the item without ever telling the user.
+    """
+    try:
+        return compressor(source, target_bytes=target_bytes, settings=settings)
+    except (OSError, ValueError, RuntimeError, MemoryError) as e:
+        log.warning(
+            "Compression crashed for %s (%s); falling back to the degraded path",
+            source.name, e,
+        )
+        return media_compress.CompressResult(
+            ok=False, path=None, original_bytes=source.stat().st_size,
+            target_bytes=target_bytes,
+            reason=f"compressor crash: {type(e).__name__}: {e}",
+        )
+
+
+def _cleanup_compressed_artifact(path: Path | None) -> None:
+    """Best-effort removal of a compressed artifact and its ``.tmp`` sibling.
+
+    The compressed file is a send-time derivative of the original download,
+    which stays on disk and is reclaimed later by
+    ``monitor.cleanup_old_caches`` (keep_days / max_total_gb).
+    """
+    if path is None:
+        return
+    for candidate in (path, path.with_name(path.name + ".tmp")):
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError as e:
+            log.debug("Cannot remove compressed artifact %s: %s", candidate, e)
+
+
 def _send_telegram_video_with_status(
-    api_base: str, chat_id: str, text: str, video_path: Path
+    api_base: str, chat_id: str, text: str, video_path: Path,
+    compress: media_compress.CompressSettings | None = None,
 ) -> tuple[bool | None, bool]:
     """Send a video, reporting (ok, media_failed) for send_to_telegram_detailed.
 
@@ -239,26 +294,51 @@ def _send_telegram_video_with_status(
     ``media_failed`` is True whenever the media upload did not succeed
     (HTTP error, transport error, or uncertain timeout).
 
+    Oversized videos (``> compress.video_target_bytes``) are compressed first
+    with :func:`media_compress.compress_video` (lossless-first ladder); the
+    document-upload escape hatch no longer exists. A video that is still over
+    the limit after the compression attempt — or whose compression failed — is
+    degraded to the text notice instead of being uploaded.
+
     Caller view: send_to_telegram_detailed folds ``ok`` via ``ok is True``,
     so a timeout surfaces to the monitor as (False, True) — not pushed, and
     the whole item is re-sent on a later scan. A video that was in fact
     delivered before the timeout may therefore be pushed twice; that
     trade-off is accepted over silently losing the media.
     """
-    size_mb = video_path.stat().st_size / 1048576
+    settings = compress or media_compress.CompressSettings()
+    limit_bytes = settings.video_target_bytes
+    upload_path = video_path
+    artifact: Path | None = None
+    size_bytes = video_path.stat().st_size
+    if size_bytes > limit_bytes and settings.enabled:
+        result = _safe_compress(
+            media_compress.compress_video, video_path, limit_bytes, settings,
+        )
+        log.info("Video compression for %s: %s", video_path.name, result.describe())
+        if result.path is not None:
+            upload_path = result.path
+            artifact = result.path
+            size_bytes = result.output_bytes
     try:
-        if size_mb <= TELEGRAM_VIDEO_MAX_MB:
-            endpoint = f"{api_base}/sendVideo"
-            field_name = "video"
-        else:
-            endpoint = f"{api_base}/sendDocument"
-            field_name = "document"
-            log.info("Video %.1f MB > %d MB, sending as document (2 GB limit)", size_mb, TELEGRAM_VIDEO_MAX_MB)
-        with open(video_path, "rb") as f:
+        if size_bytes > limit_bytes:
+            # No usable artifact: uploading anyway would only be rejected, and
+            # a 2 GB+ upload that times out parks the item as "uncertain"
+            # without a text notice. Degrade to the text notice — the existing
+            # (delivered=True, media_failed=True) semantics — and let the
+            # pending retry cap bound how often this is attempted.
+            log.warning(
+                "Video %s is %.1f MB > %d MB limit with no usable compressed "
+                "artifact (compress.enabled=%s); degrading to text notice",
+                video_path.name, size_bytes / 1048576,
+                limit_bytes // 1048576, settings.enabled,
+            )
+            return _send_telegram_text(api_base, chat_id, text), True
+        with open(upload_path, "rb") as f:
             resp = _telegram_post(
-                endpoint,
+                f"{api_base}/sendVideo",
                 data={"chat_id": chat_id, "caption": text, "parse_mode": "Markdown"},
-                files={field_name: (video_path.name, f, "video/mp4")},
+                files={"video": (upload_path.name, f, "video/mp4")},
                 timeout=300,
             )
         if resp.ok:
@@ -274,18 +354,31 @@ def _send_telegram_video_with_status(
     except requests.RequestException as e:
         log.warning("Video send error (will retry later, no text fallback): %s", _sanitize_exc(e))
         return False, True
+    finally:
+        # The compressed derivative is only needed for this upload; the
+        # original download is deliberately left untouched on disk.
+        _cleanup_compressed_artifact(artifact)
 
 
-def _send_telegram_video(api_base: str, chat_id: str, text: str, video_path: Path) -> bool | None:
+def _send_telegram_video(
+    api_base: str, chat_id: str, text: str, video_path: Path,
+    compress: media_compress.CompressSettings | None = None,
+) -> bool | None:
     """Legacy thin wrapper: video send outcome only (see *_with_status)."""
-    ok, _ = _send_telegram_video_with_status(api_base, chat_id, text, video_path)
+    ok, _ = _send_telegram_video_with_status(api_base, chat_id, text, video_path, compress)
     return ok
 
 
 def _send_telegram_media_group_with_status(
-    api_base: str, chat_id: str, text: str, file_paths: list[Path]
+    api_base: str, chat_id: str, text: str, file_paths: list[Path],
+    compress: media_compress.CompressSettings | None = None,
 ) -> tuple[bool | None, bool]:
     """Send images as a media group, reporting (ok, media_failed).
+
+    Oversized photos (``> compress.photo_target_bytes``) are compressed first
+    with :func:`media_compress.compress_image` (lossless-first ladder); a photo
+    that is still oversized afterwards degrades the whole send to the text
+    notice rather than silently dropping it.
 
     ``ok`` keeps the legacy three-state meaning of
     ``_send_telegram_media_group``. Same timeout policy as
@@ -296,21 +389,50 @@ def _send_telegram_media_group_with_status(
     was in fact delivered before the timeout may be pushed twice (accepted
     over silently losing the media).
     """
+    settings = compress or media_compress.CompressSettings()
     media = []
     files: dict[str, tuple] = {}
     open_handles: list = []
+    artifacts: list[Path] = []
     try:
         for i, fp in enumerate(file_paths[:10]):  # Telegram limit: 10 per group
-            if fp.exists():
-                media.append({
-                    "type": "photo",
-                    "media": f"attach://img{i}",
-                    "caption": text if i == 0 else "",
-                    "parse_mode": "Markdown",
-                })
-                fh = open(fp, "rb")  # noqa: SIM115
-                open_handles.append(fh)
-                files[f"img{i}"] = (fp.name, fh, "image/jpeg")
+            if not fp.exists():
+                continue
+            try:
+                size_bytes = fp.stat().st_size
+            except OSError:  # vanished between listing and stat: skip like before
+                continue
+            upload_path = fp
+            if size_bytes > settings.photo_target_bytes and settings.enabled:
+                result = _safe_compress(
+                    media_compress.compress_image, fp,
+                    settings.photo_target_bytes, settings,
+                )
+                log.info("Photo compression for %s: %s", fp.name, result.describe())
+                if result.path is not None:
+                    upload_path = result.path
+                    artifacts.append(result.path)
+                    size_bytes = result.output_bytes
+            if size_bytes > settings.photo_target_bytes:
+                # Never silently drop an image: fall back to the text notice
+                # (delivered=True, media_failed=True) and let the pending retry
+                # cap bound the re-attempts.
+                log.warning(
+                    "Photo %s is %.1f MB > %d MB limit with no usable compressed "
+                    "artifact (compress.enabled=%s); degrading to text notice",
+                    fp.name, size_bytes / 1048576,
+                    settings.photo_target_bytes // 1048576, settings.enabled,
+                )
+                return _send_telegram_text(api_base, chat_id, text), True
+            media.append({
+                "type": "photo",
+                "media": f"attach://img{i}",
+                "caption": text if i == 0 else "",
+                "parse_mode": "Markdown",
+            })
+            fh = open(upload_path, "rb")  # noqa: SIM115
+            open_handles.append(fh)
+            files[f"img{i}"] = (upload_path.name, fh, "image/jpeg")
 
         if not media:
             return False, True
@@ -337,11 +459,16 @@ def _send_telegram_media_group_with_status(
     finally:
         for fh in open_handles:
             fh.close()
+        for artifact in artifacts:
+            _cleanup_compressed_artifact(artifact)
 
 
-def _send_telegram_media_group(api_base: str, chat_id: str, text: str, file_paths: list[Path]) -> bool | None:
+def _send_telegram_media_group(
+    api_base: str, chat_id: str, text: str, file_paths: list[Path],
+    compress: media_compress.CompressSettings | None = None,
+) -> bool | None:
     """Legacy thin wrapper: media group outcome only (see *_with_status)."""
-    ok, _ = _send_telegram_media_group_with_status(api_base, chat_id, text, file_paths)
+    ok, _ = _send_telegram_media_group_with_status(api_base, chat_id, text, file_paths, compress)
     return ok
 
 

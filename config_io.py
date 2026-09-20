@@ -91,6 +91,50 @@ class ReconciliationConfig(BaseModel):
     )
 
 
+class CompressConfig(BaseModel):
+    """Media compression settings for oversized Telegram uploads.
+
+    Every field has a default, so a ``config.yaml`` without a ``compress:``
+    section (or with only some of its keys) still loads unchanged and the
+    built-in lossless-first ladder applies; the monitor config normally never
+    carries the Telegram byte budgets themselves.
+    """
+    enabled: bool = Field(
+        default=True,
+        description="Compress media that exceeds the Telegram size limits before upload",
+    )
+    image_quality_min: int = Field(
+        default=92,
+        description="Lowest JPEG quality tried by the image quality bisection (<= 95)",
+    )
+    image_allow_scale: bool = Field(
+        default=True,
+        description="Allow a small downscale when quality alone cannot reach the limit",
+    )
+    image_min_scale: float = Field(
+        default=0.8,
+        description="Smallest image downscale factor tried (1.0 = no downscale)",
+    )
+    video_crf: int = Field(
+        default=18,
+        description="libx264 CRF used by the near-lossless video encode (lower = better)",
+    )
+    video_preset: str = Field(default="slow", description="libx264 preset for video encodes")
+    video_audio_bitrate: str = Field(default="128k", description="AAC audio bitrate for videos")
+    video_allow_scale: bool = Field(
+        default=True,
+        description="Allow a small downscale when re-encoding alone cannot reach the limit",
+    )
+    video_min_scale: float = Field(
+        default=0.8,
+        description="Smallest video downscale factor tried (1.0 = no downscale)",
+    )
+    timeout_seconds: int = Field(
+        default=300,
+        description="Hard per-command timeout for ffmpeg/ffprobe (a timeout fails the compression)",
+    )
+
+
 class MonitorConfig(BaseModel):
     users: list = Field(default_factory=list)
     subscriptions: dict[str, list] = Field(default_factory=dict)
@@ -107,6 +151,7 @@ class MonitorConfig(BaseModel):
     reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
     video_enabled: bool = True
     max_video_size_mb: int = 1024
+    compress: CompressConfig = Field(default_factory=CompressConfig)
 
 
 # ---------------------------------------------------------------------------
