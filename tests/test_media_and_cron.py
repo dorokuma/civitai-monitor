@@ -116,7 +116,10 @@ class TestSendToTelegramDetailed:
         img.write_bytes(b"\x89PNG" + b"0" * 64)
         return img
 
-    def test_media_429_exhausted_falls_back_text(self, tmp_path):
+    def test_media_429_exhausted_no_text_fallback(self, tmp_path):
+        """A 429 that survives the bounded retries maps to
+        DEFINITELY_NOT_SENT — NO text fallback is allowed (a text notice
+        now would double-notify after the retry succeeds later)."""
         img = self._image(tmp_path)
         api = _FakeTelegramAPI()
         api.media_responses = [
@@ -125,10 +128,107 @@ class TestSendToTelegramDetailed:
         ]
         with patch.object(telegram_media.requests, "post", api), \
              patch.object(telegram_media.time, "sleep", lambda *_a, **_k: None):
-            assert telegram_media.send_to_telegram_detailed(
+            outcome = telegram_media.send_media_to_telegram_outcome(
                 FAKE_TOKEN, "42", "new art", [img]
-            ) == (True, True)
-        assert api.text_calls == 1
+            )
+        assert outcome is telegram_media.SendOutcome.DEFINITELY_NOT_SENT
+        assert api.text_calls == 0
+
+    def test_media_429_retry_after_over_cap_returns_immediately(self, tmp_path):
+        """Retry-After > _TG_MAX_RETRY_AFTER never sleeps — the 429 response
+        is returned untouched and classified DEFINITELY_NOT_SENT."""
+        img = self._image(tmp_path)
+        api = _FakeTelegramAPI()
+        api.media_responses = [
+            _api_response(429, False, headers={"Retry-After": "120"})
+        ]
+        sleeps: list[float] = []
+        with patch.object(telegram_media.requests, "post", api), \
+             patch.object(telegram_media.time, "sleep", lambda s: sleeps.append(s)):
+            outcome = telegram_media.send_media_to_telegram_outcome(
+                FAKE_TOKEN, "42", "new art", [img]
+            )
+        assert outcome is telegram_media.SendOutcome.DEFINITELY_NOT_SENT
+        assert sleeps == []  # no wait honored beyond the cap
+        assert api.text_calls == 0
+
+    def test_media_5xx_uncertain_no_retry_no_text_fallback(self, tmp_path):
+        """HTTP 5xx: single POST, no retry, no text fallback, uncertain."""
+        img = self._image(tmp_path)
+        api = _FakeTelegramAPI()
+        api.media_responses = [_api_response(502, False, text="Bad Gateway")]
+        posts = {"n": 0}
+        orig = api.__call__
+
+        def counting(url, timeout=None, **kwargs):
+            posts["n"] += 1
+            return orig(url, timeout=timeout, **kwargs)
+
+        with patch.object(telegram_media.requests, "post", counting), \
+             patch.object(telegram_media.time, "sleep", lambda *_a, **_k: None):
+            outcome = telegram_media.send_media_to_telegram_outcome(
+                FAKE_TOKEN, "42", "new art", [img]
+            )
+        assert outcome is telegram_media.SendOutcome.UNCERTAIN_NO_ROLLBACK
+        assert posts["n"] == 1  # exactly one POST, never retried
+        assert api.text_calls == 0
+
+    def test_media_remote_disconnected_uncertain(self, tmp_path):
+        """Post-connect transport failure (RemoteDisconnected) is uncertain:
+        the payload may be in flight, so never retry or fall back."""
+        img = self._image(tmp_path)
+        api = _FakeTelegramAPI()
+        api.media_exception = requests.ConnectionError(
+            "Connection aborted. RemoteDisconnected('Remote end closed "
+            "connection without response')"
+        )
+        with patch.object(telegram_media.requests, "post", api), \
+             patch.object(telegram_media.time, "sleep", lambda *_a, **_k: None):
+            outcome = telegram_media.send_media_to_telegram_outcome(
+                FAKE_TOKEN, "42", "new art", [img]
+            )
+        assert outcome is telegram_media.SendOutcome.UNCERTAIN_NO_ROLLBACK
+        assert api.text_calls == 0
+
+    def test_media_connect_timeout_definitely_not_sent(self, tmp_path):
+        """A ConnectTimeout happens before any byte is sent: safe retry."""
+        img = self._image(tmp_path)
+        api = _FakeTelegramAPI()
+        api.media_exception = requests.ConnectTimeout("connect timed out")
+        with patch.object(telegram_media.requests, "post", api), \
+             patch.object(telegram_media.time, "sleep", lambda *_a, **_k: None):
+            outcome = telegram_media.send_media_to_telegram_outcome(
+                FAKE_TOKEN, "42", "new art", [img]
+            )
+        assert outcome is telegram_media.SendOutcome.DEFINITELY_NOT_SENT
+        assert api.text_calls == 0
+
+    def test_text_outcome_classification(self):
+        """_send_telegram_text_outcome maps all four outcome classes."""
+        api = _FakeTelegramAPI()
+        api.text_response = _api_response(200, True)
+        with patch.object(telegram_media.requests, "post", api):
+            assert telegram_media._send_telegram_text_outcome(
+                "http://api/bot" + FAKE_TOKEN, "42", "hi"
+            ) is telegram_media.SendOutcome.DELIVERED_OK
+
+        api.text_response = _api_response(429, False, headers={"Retry-After": "90"})
+        with patch.object(telegram_media.requests, "post", api):
+            assert telegram_media._send_telegram_text_outcome(
+                "http://api/bot" + FAKE_TOKEN, "42", "hi"
+            ) is telegram_media.SendOutcome.DEFINITELY_NOT_SENT
+
+        api.text_response = _api_response(500, False)
+        with patch.object(telegram_media.requests, "post", api):
+            assert telegram_media._send_telegram_text_outcome(
+                "http://api/bot" + FAKE_TOKEN, "42", "hi"
+            ) is telegram_media.SendOutcome.UNCERTAIN_NO_ROLLBACK
+
+        api.text_response = _api_response(403, False)
+        with patch.object(telegram_media.requests, "post", api):
+            assert telegram_media._send_telegram_text_outcome(
+                "http://api/bot" + FAKE_TOKEN, "42", "hi"
+            ) is telegram_media.SendOutcome.REJECTED_PERMANENT
 
     def test_media_success(self, tmp_path):
         img = self._image(tmp_path)
@@ -164,15 +264,22 @@ class TestSendToTelegramDetailed:
         video = tmp_path / "clip.mp4"
         video.write_bytes(b"VID" * 32)
         api = _FakeTelegramAPI()
-        api.media_responses = [_api_response(400, False, text="Bad Request: wrong file")]
+        api.media_responses = [
+            _api_response(400, False, text="Bad Request: wrong file")
+            for _ in range(2)
+        ]
         with patch.object(telegram_media.requests, "post", api), \
              patch.object(telegram_media.time, "sleep", lambda *_a, **_k: None):
             assert telegram_media.send_to_telegram_detailed(
                 FAKE_TOKEN, "42", "caption", [video]
             ) == (True, True)
+            assert telegram_media.send_media_to_telegram_outcome(
+                FAKE_TOKEN, "42", "caption", [video]
+            ) is telegram_media.SendOutcome.REJECTED_PERMANENT
 
     def test_video_timeout_uncertain_no_text_fallback(self, tmp_path):
-        """Legacy shim keeps returning None; detailed reports (False, True)."""
+        """Legacy shim keeps returning None; detailed reports (False, True);
+        the strict outcome is UNCERTAIN_NO_ROLLBACK."""
         video = tmp_path / "clip.mp4"
         video.write_bytes(b"VID" * 32)
         api = _FakeTelegramAPI()

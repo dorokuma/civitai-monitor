@@ -412,46 +412,15 @@ class TestPushLifecycleState:
 
     def test_adopt_stale_inflight_preserves_existing_retries(self, tmp_path):
         """adopt_stale_inflight must NOT reset retries to 0 for an id that
-        already has a pending entry. This prevents an infinite retry loop:
-        outcome=None → mark_pending(retries=N) → clear_inflight; but if a
-        crash leaves inflight set, adopt_stale_inflight would re-adopt with
-        retries=0, bypassing PENDING_MAX_RETRIES."""
-        # Simulate the crash window: mark_pending wrote pending (retries=1),
-        # but the process crashed before clear_inflight.
+        already has a pending entry (kept for legacy compatibility)."""
         mark_pending(tmp_path, "tg1", "alice", 50, ts=1000.0, retries=1)
         mark_inflight(tmp_path, "tg1", "alice", 50)  # leftover inflight
-        # Also add a genuinely-new inflight id with no prior pending
         mark_inflight(tmp_path, "tg1", "alice", 51)
 
         pending = adopt_stale_inflight(tmp_path, "tg1", "alice")
-        assert 50 in pending
-        assert 51 in pending
-        # id=50 already had pending → retries preserved (not reset to 0)
         assert pending[50][1] == 1
-        # id=51 is genuinely new → retries=0 (normal crash-mid-send recovery)
         assert pending[51][1] == 0
-        # inflight must be cleared after adoption
         assert load_push_timestamps(tmp_path, "inflight", "tg1", "alice") == {}
-
-    def test_adopt_stale_inflight_no_infinite_retry_via_retries_reset(self, tmp_path):
-        """Guard against the infinite retry loop described by the reviewer:
-        if adopt_stale_inflight reset retries to 0, the same id would be
-        re-adopted on every scan with retries=0, always below
-        PENDING_MAX_RETRIES, causing _fetch_and_process_page to increment
-        and retry forever. This test proves the retries survive adoption."""
-        from state_store import PENDING_MAX_RETRIES as MR
-
-        # Park as pending with retries at the cap (simulating one retry cycle)
-        mark_pending(tmp_path, "tg1", "alice", 42, ts=1.0, retries=MR)
-        # Simulate the crash window: inflight still set
-        mark_inflight(tmp_path, "tg1", "alice", 42)
-
-        pending = adopt_stale_inflight(tmp_path, "tg1", "alice")
-        # After adoption, retries must still be at the cap (not reset to 0)
-        assert pending[42][1] == MR
-        # The _fetch_and_process_page check (retries >= PENDING_MAX_RETRIES)
-        # would now promote without re-send, breaking the infinite loop.
-        assert pending[42][1] >= MR
 
     def test_update_pending_merge_and_remove(self, tmp_path):
         update_pending_map(tmp_path, "tg1", "bob", add={1: (10.0, 0), 2: (20.0, 1)})
@@ -467,10 +436,13 @@ class TestPushLifecycleState:
         assert data == {42: (1000.5, 0, 0)}
 
     def test_pending_confirm_window_constant(self):
+        # Strict at-most-once: no automatic pending re-sends.
         assert PENDING_CONFIRM_SECONDS == 30 * 60
-        assert PENDING_MAX_RETRIES == 1
+        assert PENDING_MAX_RETRIES == 0
 
-    def test_finalize_uncertain_parks_pending(self, tmp_path):
+    def test_finalize_uncertain_keeps_claim(self, tmp_path):
+        """outcome=None (uncertain) keeps the claim: the id lands in
+        pushed_ids so it is never re-sent."""
         import monitor as m
 
         pushed: set[int] = set()
@@ -479,14 +451,11 @@ class TestPushLifecycleState:
             pushed_ids=pushed, pushed_dir=tmp_path, tg_id="tg1",
         )
         assert ok is False
-        assert 99 not in pushed
-        assert 99 in load_pending_map(tmp_path, "tg1", "alice")
+        assert 99 in pushed
 
-    def test_finalize_ok_records_pushed_and_clears_pending(self, tmp_path):
+    def test_finalize_ok_records_pushed(self, tmp_path):
         import monitor as m
 
-        mark_pending(tmp_path, "tg1", "alice", 99, ts=1.0, retries=1)
-        mark_inflight(tmp_path, "tg1", "alice", 99)
         pushed: set[int] = set()
         ok = m._finalize_send_outcome(
             True, 99, "alice",
@@ -494,25 +463,26 @@ class TestPushLifecycleState:
         )
         assert ok is True
         assert pushed == {99}
-        assert load_pending_map(tmp_path, "tg1", "alice") == {}
-        assert load_push_timestamps(tmp_path, "inflight", "tg1", "alice") == {}
 
-    def test_finalize_fail_clears_pending(self, tmp_path):
+    def test_finalize_fail_rolls_back_claim(self, tmp_path):
+        """outcome=False releases the claim slot so a retry can re-claim."""
         import monitor as m
+        from state_store import claim_push_slot, load_chat_pushed_ids
 
-        mark_pending(tmp_path, "tg1", "alice", 5, ts=1.0, retries=1)
+        assert claim_push_slot(tmp_path, "chat", "tg1", "alice", 5)
+        assert 5 in load_chat_pushed_ids(tmp_path, "chat")
         ok = m._finalize_send_outcome(
             False, 5, "alice",
-            pushed_ids=set(), pushed_dir=tmp_path, tg_id="tg1",
+            pushed_ids=set(), pushed_dir=tmp_path, tg_id="tg1", chat_id="chat",
         )
         assert ok is False
-        assert load_pending_map(tmp_path, "tg1", "alice") == {}
+        assert 5 not in load_chat_pushed_ids(tmp_path, "chat")
+        assert load_pushed_ids(tmp_path, "tg1", "alice") == set()
 
 
 class TestStateWriteFailure:
-    """When state persistence fails (FileLock timeout), the item must NOT be
-    treated as pushed and inflight must NOT be cleared — the inflight/pending
-    recovery mechanism handles it on the next scan."""
+    """Fail-closed state errors: the item must NOT be treated as pushed and
+    the send must not happen (0 POSTs)."""
 
     def test_save_pushed_ids_raises_state_write_error(self, tmp_path):
         """save_pushed_ids must raise StateWriteError when the lock times out."""
@@ -525,47 +495,40 @@ class TestStateWriteFailure:
             with pytest.raises(StateWriteError):
                 save_pushed_ids(tmp_path, "tg1", "alice", {1, 2})
 
-    def test_record_push_success_rollback_on_write_failure(self, tmp_path, monkeypatch):
-        """If save_pushed_ids fails, pushed_ids is rolled back and inflight stays."""
-        import monitor as m
-        from state_store import StateWriteError
+    def test_claim_push_slot_lock_timeout_raises(self, tmp_path):
+        """claim_push_slot surfaces a lock timeout as StateWriteError."""
+        from filelock import Timeout
 
-        mark_inflight(tmp_path, "tg1", "alice", 42)
-        pushed: set[int] = set()
+        from state_store import StateWriteError, claim_push_slot
 
-        def boom(*_a, **_k):
-            raise StateWriteError("simulated lock timeout")
-
-        monkeypatch.setattr(m, "save_pushed_ids", boom)
-        with pytest.raises(StateWriteError):
-            m._record_push_success(
-                42, "alice",
-                pushed_ids=pushed, pushed_dir=tmp_path, tg_id="tg1",
-            )
-        # pushed_ids must be rolled back
-        assert 42 not in pushed
-        # inflight must NOT be cleared (left for next-scan recovery)
-        assert 42 in load_push_timestamps(tmp_path, "inflight", "tg1", "alice")
+        with patch("state_store.FileLock") as mock_lock:
+            mock_lock.side_effect = Timeout(str(tmp_path / ".pushed.lock"))
+            with pytest.raises(StateWriteError):
+                claim_push_slot(tmp_path, "chat", "tg1", "alice", 1)
 
     def test_process_and_push_state_write_failure_skips_item(self, tmp_path, monkeypatch):
-        """process_and_push must catch StateWriteError, log it, and return False
-        without marking the item as pushed."""
+        """A StateWriteError from the claim aborts the item with NO send."""
         import monitor as m
         from state_store import StateWriteError
 
-        mark_inflight(tmp_path, "tg1", "alice", 77)
         pushed: set[int] = set()
+        send_calls: list = []
 
-        # Mock send_to_telegram to succeed (outcome=True triggers _record_push_success)
-        monkeypatch.setattr(m, "send_to_telegram", lambda *a, **k: True)
-        # Mock save_pushed_ids to fail
-        def boom(*a, **k):
+        monkeypatch.setattr(
+            m, "send_to_telegram",
+            lambda *a, **k: send_calls.append(1) or True,
+        )
+
+        def boom(*_a, **_k):
             raise StateWriteError("lock timeout")
-        monkeypatch.setattr(m, "save_pushed_ids", boom)
-        # Mock download_image to succeed so we reach the send path
-        monkeypatch.setattr(m, "download_image", lambda *a, **k: m.DownloadResult(True))
 
-        item = {"id": 77, "url": "https://x.com/width=1024/f.jpeg", "createdAt": "2025-01-01T00:00:00Z"}
+        monkeypatch.setattr(m, "claim_push_slot", boom)
+        monkeypatch.setattr(
+            m, "download_image", lambda *a, **k: m.DownloadResult(True),
+        )
+
+        item = {"id": 77, "url": "https://x.com/width=1024/f.jpeg",
+                "createdAt": "2025-01-01T00:00:00Z"}
         result = m.process_and_push(
             item, "alice",
             size_suffixes=[], output_dir=tmp_path, bot_token="t", chat_id="c",
@@ -573,90 +536,9 @@ class TestStateWriteFailure:
             pushed_ids=pushed, pushed_dir=tmp_path, tg_id="tg1",
         )
         assert result is False
-        # Item must NOT be in pushed_ids
         assert 77 not in pushed
-        # Inflight must still be set (not cleared) for next-scan recovery
-        assert 77 in load_push_timestamps(tmp_path, "inflight", "tg1", "alice")
-
-
-class TestClearInflightOrdering:
-    """State must be persisted BEFORE clear_inflight runs.
-    Regression: _finalize_send_outcome used to clear_inflight unconditionally
-    at the top, before _record_push_success (which calls save_pushed_ids).
-    If the process crashed between the two, the inflight guard was gone and
-    the item would be re-pushed. Both outcome=True (save_pushed_ids → clear)
-    and outcome=None (mark_pending → clear) now follow the same invariant."""
-
-    def test_finalize_success_clears_inflight_after_save(self, tmp_path):
-        """On success, inflight is cleared by _record_push_success (after save)."""
-        import monitor as m
-
-        mark_inflight(tmp_path, "tg1", "alice", 55)
-        pushed: set[int] = set()
-        ok = m._finalize_send_outcome(
-            True, 55, "alice",
-            pushed_ids=pushed, pushed_dir=tmp_path, tg_id="tg1",
-        )
-        assert ok is True
-        assert pushed == {55}
-        # inflight is cleared (by _record_push_success, after save succeeded)
-        assert load_push_timestamps(tmp_path, "inflight", "tg1", "alice") == {}
-
-    def test_finalize_uncertain_clears_inflight_after_pending(self, tmp_path):
-        """On uncertain (None) outcome, inflight is cleared AFTER mark_pending
-        succeeds — isomorphic to the outcome=True path (save → clear).
-
-        Regression: the old code left inflight set on outcome=None, causing
-        adopt_stale_inflight to re-adopt the id with retries=0 on every scan,
-        bypassing PENDING_MAX_RETRIES and creating an infinite retry loop."""
-        import monitor as m
-
-        mark_inflight(tmp_path, "tg1", "alice", 66)
-        pushed: set[int] = set()
-        ok = m._finalize_send_outcome(
-            None, 66, "alice",
-            pushed_ids=pushed, pushed_dir=tmp_path, tg_id="tg1",
-        )
-        assert ok is False
-        # pending must be written (the "state" that replaces inflight)
-        assert 66 in load_pending_map(tmp_path, "tg1", "alice")
-        # inflight is cleared only after mark_pending succeeds
-        assert 66 not in load_push_timestamps(tmp_path, "inflight", "tg1", "alice")
-
-    def test_finalize_uncertain_mark_pending_failure_keeps_inflight(self, tmp_path, monkeypatch):
-        """If mark_pending fails (StateWriteError) on outcome=None, inflight
-        must NOT be cleared — same invariant as the outcome=True path where
-        save_pushed_ids failure leaves inflight set for next-scan recovery."""
-        import monitor as m
-        from state_store import StateWriteError
-
-        mark_inflight(tmp_path, "tg1", "alice", 66)
-        pushed: set[int] = set()
-
-        def boom(*_a, **_k):
-            raise StateWriteError("simulated lock timeout")
-
-        monkeypatch.setattr(m, "mark_pending", boom)
-        with pytest.raises(StateWriteError):
-            m._finalize_send_outcome(
-                None, 66, "alice",
-                pushed_ids=pushed, pushed_dir=tmp_path, tg_id="tg1",
-            )
-        # inflight must NOT be cleared (left for next-scan recovery)
-        assert 66 in load_push_timestamps(tmp_path, "inflight", "tg1", "alice")
-
-    def test_finalize_failure_clears_inflight(self, tmp_path):
-        """On definitive failure (False), inflight IS cleared — the send is done."""
-        import monitor as m
-
-        mark_inflight(tmp_path, "tg1", "alice", 88)
-        ok = m._finalize_send_outcome(
-            False, 88, "alice",
-            pushed_ids=set(), pushed_dir=tmp_path, tg_id="tg1",
-        )
-        assert ok is False
-        # inflight is cleared on definitive failure
-        assert 88 not in load_push_timestamps(tmp_path, "inflight", "tg1", "alice")
+        # Fail-closed: zero Telegram posts.
+        assert send_calls == []
 
 
 class TestTransientDownloadFailure:
@@ -694,7 +576,8 @@ class TestTransientDownloadFailure:
 
     def test_process_and_push_transient_failure_not_pushed(self, tmp_path, monkeypatch):
         """On a transient download failure, process_and_push must NOT add the
-        item to pushed_ids; it is parked as pending for the next scan."""
+        item to pushed_ids and must NOT send anything to Telegram — the item
+        is silently retried by the next scan."""
         import monitor as m
 
         pushed: set[int] = set()
@@ -712,8 +595,9 @@ class TestTransientDownloadFailure:
         )
         assert result is False
         assert 100 not in pushed
-        # Item should be parked as pending (for retry with cap)
-        assert 100 in load_pending_map(tmp_path, "tg1", "alice")
+        # Zero Telegram posts for a transient download failure.
+        assert sent_texts == []
+        assert 100 not in load_pending_map(tmp_path, "tg1", "alice")
 
     def test_process_and_push_permanent_failure_marks_pushed(self, tmp_path, monkeypatch):
         """On a permanent download failure (404), process_and_push marks the
@@ -735,18 +619,10 @@ class TestTransientDownloadFailure:
         assert result is True
         assert 200 in pushed
 
-    def test_transient_failure_retry_capped_by_pending_max_retries(self, tmp_path):
-        """The pending mechanism caps retries at PENDING_MAX_RETRIES.
-        After that, the item is promoted to pushed without further re-send."""
+    def test_pending_max_retries_is_zero(self):
+        """Strict at-most-once: no automatic pending re-sends at all."""
         from state_store import PENDING_MAX_RETRIES as MR
-
-        # Mark an item as pending with retries already at the cap
-        mark_pending(tmp_path, "tg1", "alice", 300, ts=1.0, retries=MR)
-        pending = load_pending_map(tmp_path, "tg1", "alice")
-        assert pending[300][1] == MR
-        # The _fetch_and_process_page logic checks retries >= PENDING_MAX_RETRIES
-        # and promotes without re-send — so the cap is enforced.
-        assert MR == 1  # current value
+        assert MR == 0
 
 
 class TestDownloadTmpCleanup:
@@ -983,14 +859,17 @@ class TestCorruptIdFiles:
         assert ids == set()
         assert any("Corrupt seen" in r.message for r in caplog.records)
 
-    def test_load_pushed_ids_corrupt_returns_empty(self, tmp_path, caplog):
+    def test_load_pushed_ids_corrupt_fails_closed(self, tmp_path):
+        """A corrupt pushed ledger raises StateReadError and is left
+        untouched on disk — never silently treated as empty."""
+        from state_store import StateReadError
+
         path = pushed_file_for_user(tmp_path, "tg1", "alice")
         path.write_text("[]broken")
-        import logging
-        with caplog.at_level(logging.WARNING):
-            ids = load_pushed_ids(tmp_path, "tg1", "alice")
-        assert ids == set()
-        assert any("Corrupt pushed" in r.message for r in caplog.records)
+        with pytest.raises(StateReadError):
+            load_pushed_ids(tmp_path, "tg1", "alice")
+        # The corrupt original must not be overwritten.
+        assert path.read_text() == "[]broken"
 
 
 # ---------------------------------------------------------------------------

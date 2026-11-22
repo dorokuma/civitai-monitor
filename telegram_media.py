@@ -1,4 +1,33 @@
-"""Telegram media/text send helpers with Markdown escape and 429 retry."""
+"""Telegram media/text send helpers — strict at-most-once delivery contract.
+
+Every send entry point returns a ``SendOutcome`` so the scheduler can apply
+exactly one of four policies:
+
+  DELIVERED_OK           — Telegram confirmed the push (HTTP 2xx). Keep the
+                           claim; the item must never be sent again.
+  DEFINITELY_NOT_SENT    — the request provably never left / was refused
+                           before payload delivery (first-attempt connect
+                           failure, or a 429 that survived the bounded
+                           Retry-After wait with NO text notice sent). Safe
+                           to roll the claim back; the item may retry later.
+  REJECTED_PERMANENT     — Telegram answered a definitive 4xx, or the media
+                           can never be uploaded locally (still oversized
+                           after compression). At most ONE plain-text notice
+                           may be attempted; whatever its result, the claim
+                           is KEPT — retrying this item can only duplicate
+                           or loop forever.
+  UNCERTAIN_NO_ROLLBACK  — the request was sent but the outcome is unknown
+                           (ReadTimeout, 5xx, RemoteDisconnected,
+                           ConnectionResetError, ProtocolError, file-rewind
+                           failure, ...). The media may already be in the
+                           chat: NEVER send a text fallback and NEVER roll
+                           the claim back.
+
+Nothing in this module retries after the request has been sent:
+_telegram_post retries only pre-flight 429s (bounded by
+_TG_MAX_RETRY_AFTER) — everything else is returned/raised to the caller so
+a "maybe delivered" message is never sent twice.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +36,7 @@ import logging
 import random
 import re
 import time
+from enum import Enum
 from pathlib import Path
 
 import requests
@@ -27,9 +57,18 @@ TELEGRAM_VIDEO_MAX_MB = 2048
 
 _tg_api_base = "https://api.telegram.org"
 
-# Limited retries for transient Telegram API pressure (429 etc.)
+# Pre-flight 429 handling only: honor Retry-After but cap the total wait.
+# A 429 whose Retry-After exceeds this returns immediately with its claim
+# eligible for rollback (no payload was sent, so retrying is safe).
 _TG_MAX_RETRIES = 4
-_TG_SHORT_RETRY_BASE = 1.0
+_TG_MAX_RETRY_AFTER = 60  # seconds — never sleep longer than this per wait
+
+# Per-endpoint (connect, read) timeouts. The connect half is short so a dead
+# endpoint fails fast into DEFINITELY_NOT_SENT; the read half is generous
+# because the local bot-api can take minutes to finish a large upload.
+_TG_TIMEOUT_MEDIA_GROUP = (10.0, 180.0)
+_TG_TIMEOUT_VIDEO = (10.0, 600.0)
+_TG_TIMEOUT_MESSAGE = (10.0, 60.0)
 
 # requests.RequestException strings embed the full request URL
 # (https://api.telegram.org/bot<token>/...), so logging an exception verbatim
@@ -46,6 +85,15 @@ def _sanitize_text(text: str) -> str:
 def _sanitize_exc(exc: BaseException) -> str:
     """Stringify an exception for logging with any bot token masked out."""
     return _sanitize_text(str(exc))
+
+
+class SendOutcome(Enum):
+    """Terminal classification of a single Telegram send attempt."""
+
+    DELIVERED_OK = "delivered_ok"
+    DEFINITELY_NOT_SENT = "definitely_not_sent"
+    REJECTED_PERMANENT = "rejected_permanent"
+    UNCERTAIN_NO_ROLLBACK = "uncertain_no_rollback"
 
 
 def set_tg_api_base(url: str) -> None:
@@ -77,8 +125,7 @@ def _rewind_upload_files(files: dict | None) -> None:
 
     Values may be bare file objects or ``(name, fileobj, mime)`` tuples.
     Retry attempts must re-read the payload from the start: an already
-    consumed handle uploads 0 bytes, Telegram answers 400, and the media
-    would be permanently lost to the text-only fallback.
+    consumed handle uploads 0 bytes and Telegram answers 400.
     """
     if not files:
         return
@@ -91,84 +138,159 @@ def _rewind_upload_files(files: dict | None) -> None:
                     obj.seek(0)
                 except ValueError as e:
                     # A closed handle raises ValueError ("seek of closed
-                    # file"), not OSError. Left bare it would escape the retry
-                    # loop in _telegram_post and hit the per-item catch;
-                    # mapping it onto OSError funnels it into the existing
-                    # rewind guard there, which converts it to
-                    # requests.RequestException like any other rewind failure.
+                    # file"), not OSError. Mapping it onto OSError funnels it
+                    # into the rewind guard in _telegram_post, which converts
+                    # it to requests.RequestException like any other rewind
+                    # failure.
                     raise OSError(f"cannot rewind file handle: {e}") from e
 
 
 def _telegram_post(
     url: str,
     *,
-    timeout: float,
+    timeout: float | tuple[float, float],
     max_retries: int = _TG_MAX_RETRIES,
     **kwargs,
 ) -> requests.Response:
-    """POST to Telegram with limited retries for 429 Retry-After + short backoff.
+    """POST to Telegram — retries ONLY bounded pre-flight HTTP 429s.
 
-    Timeouts are re-raised immediately (caller treats them as uncertain delivery).
-    File objects in ``files`` are rewound (seek(0)) before every attempt so a
-    retry re-uploads the full payload instead of 0 bytes.
+    Whitelist rationale: a 429 is returned before Telegram accepts the
+    payload, so re-sending cannot duplicate the message. Every other
+    non-2xx response, and every transport-level failure, is surfaced to the
+    caller untouched — after the payload may have left the client, ANY
+    automatic re-send is a potential duplicate.
+
+    A 429 whose Retry-After exceeds ``_TG_MAX_RETRY_AFTER`` is returned
+    immediately (no sleep): the caller classifies it DEFINITELY_NOT_SENT and
+    rolls the claim back. File objects in ``files`` are rewound (seek(0))
+    before every attempt.
     """
-    last_resp: requests.Response | None = None
-    last_exc: Exception | None = None
     for attempt in range(max_retries):
-        # Rewind upload handles before every attempt: requests consumes the
-        # file objects in `files`, so an un-rewound retry would upload 0 bytes
-        # and Telegram would answer 400 (media lost to the text fallback).
         try:
             _rewind_upload_files(kwargs.get("files"))
         except OSError as e:
             log.warning("Telegram upload aborted: cannot rewind file handle: %s", e)
             raise requests.RequestException(f"upload file rewind failed: {e}") from e
-        try:
-            resp = requests.post(url, timeout=timeout, **kwargs)
-            last_resp = resp
-            if resp.status_code == 429:
-                retry_after_raw = resp.headers.get("Retry-After", "3")
-                try:
-                    retry_after = int(float(retry_after_raw))
-                except (TypeError, ValueError, OverflowError):
-                    retry_after = 3
-                wait = max(1, retry_after) + random.uniform(0, 1)
+        resp = requests.post(url, timeout=timeout, **kwargs)
+        if resp.status_code == 429 and attempt < max_retries - 1:
+            retry_after_raw = resp.headers.get("Retry-After", "3")
+            try:
+                retry_after = int(float(retry_after_raw))
+            except (TypeError, ValueError, OverflowError):
+                retry_after = 3
+            if retry_after > _TG_MAX_RETRY_AFTER:
+                # Wait too long: give up without sleeping. Nothing was sent,
+                # so the claim may be rolled back safely.
                 log.warning(
-                    "Telegram 429 Retry-After=%ss, sleeping %.1fs (attempt %d/%d)",
-                    retry_after, wait, attempt + 1, max_retries,
+                    "Telegram 429 Retry-After=%ss exceeds %ss cap; not retrying",
+                    retry_after, _TG_MAX_RETRY_AFTER,
                 )
-                if attempt < max_retries - 1:
-                    time.sleep(wait)
-                    continue
                 return resp
-            # Short retry on 5xx
-            if 500 <= resp.status_code < 600 and attempt < max_retries - 1:
-                wait = _TG_SHORT_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5)
-                log.warning(
-                    "Telegram %d, short retry in %.1fs (attempt %d/%d)",
-                    resp.status_code, wait, attempt + 1, max_retries,
-                )
-                time.sleep(wait)
-                continue
-            return resp
-        except requests.Timeout:
-            raise
-        except requests.RequestException as e:
-            last_exc = e
-            if attempt < max_retries - 1:
-                wait = _TG_SHORT_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5)
-                log.warning(
-                    "Telegram transport error, short retry in %.1fs (attempt %d/%d): %s",
-                    wait, attempt + 1, max_retries, _sanitize_exc(e),
-                )
-                time.sleep(wait)
-                continue
-            raise
-    if last_resp is not None:
-        return last_resp
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError("telegram post: exhausted retries without response")
+            wait = max(1, retry_after) + random.uniform(0, 1)
+            log.warning(
+                "Telegram 429 Retry-After=%ss, sleeping %.1fs (attempt %d/%d)",
+                retry_after, wait, attempt + 1, max_retries,
+            )
+            time.sleep(wait)
+            continue
+        return resp
+
+
+def _request_definitely_not_sent(exc: requests.RequestException) -> bool:
+    """True when ``exc`` proves the request never reached Telegram.
+
+    First-attempt connect failures only: ConnectTimeout, and a ConnectionError
+    whose underlying cause is urllib3's NewConnectionError (connection
+    refused / DNS / no route — before any byte was sent). Everything after a
+    socket was established is uncertain: the payload may be in flight.
+    """
+    if isinstance(exc, requests.ConnectTimeout):
+        return True
+    if not isinstance(exc, requests.ConnectionError):
+        return False
+    try:
+        from urllib3.exceptions import NewConnectionError
+    except ImportError:  # pragma: no cover - urllib3 is a requests dep
+        NewConnectionError = ()  # type: ignore[assignment]
+    for cause in (exc.__cause__, exc.__context__):
+        if isinstance(cause, NewConnectionError):
+            return True
+    # urllib3 wraps low-level errors inside MaxRetryError on the pool level.
+    return bool(re.search(r"NewConnectionError|Failed to establish a new connection",
+                          str(exc)))
+
+
+def send_media_to_telegram_outcome(
+    bot_token: str,
+    chat_id: str,
+    text: str,
+    file_paths: list[Path] | None = None,
+    compress: media_compress.CompressSettings | None = None,
+    *,
+    prepared: PreparedMedia | None = None,
+) -> SendOutcome:
+    """Send one item to Telegram and classify the terminal outcome.
+
+    Exactly one network attempt is made for the media (bounded pre-flight
+    429s aside); a permanent rejection may be followed by at most one
+    plain-text notice. Nothing else ever triggers a second request.
+
+    ``prepared`` lets the caller run compression BEFORE claiming the push
+    slot (see :func:`prepare_media_for_upload`); when omitted it is
+    computed here from ``file_paths`` so direct callers keep working.
+    """
+    api_base = f"{_tg_api_base}/bot{bot_token}"
+
+    if prepared is None and file_paths:
+        prepared = prepare_media_for_upload(file_paths, compress)
+    if prepared is not None:
+        try:
+            if prepared.degrades_to_text:
+                return _degrade_to_text_notice(api_base, chat_id, text)
+            if not prepared.files:
+                return SendOutcome.REJECTED_PERMANENT
+            if prepared.is_video:
+                return _send_telegram_video_outcome(api_base, chat_id, text, prepared)
+            return _send_telegram_media_group_outcome(api_base, chat_id, text, prepared)
+        finally:
+            for artifact in prepared.artifacts:
+                _cleanup_compressed_artifact(artifact)
+
+    return _send_telegram_text_outcome(api_base, chat_id, text)
+
+
+def _send_telegram_text_outcome(api_base: str, chat_id: str, text: str) -> SendOutcome:
+    """Plain-text send with the same four-way outcome contract."""
+    try:
+        resp = _telegram_post(
+            f"{api_base}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            timeout=_TG_TIMEOUT_MESSAGE,
+        )
+    except requests.RequestException as e:
+        if _request_definitely_not_sent(e):
+            log.warning(
+                "Message never reached Telegram (connect failure): %s",
+                _sanitize_exc(e),
+            )
+            return SendOutcome.DEFINITELY_NOT_SENT
+        log.warning(
+            "Message send outcome uncertain (post-connect failure): %s",
+            _sanitize_exc(e),
+        )
+        return SendOutcome.UNCERTAIN_NO_ROLLBACK
+    if resp.ok:
+        return SendOutcome.DELIVERED_OK
+    if resp.status_code == 429:
+        # Retry-After exceeded the cap or retries exhausted — nothing sent.
+        return SendOutcome.DEFINITELY_NOT_SENT
+    if 500 <= resp.status_code < 600:
+        # Server received (and possibly processed) the message — uncertain.
+        return SendOutcome.UNCERTAIN_NO_ROLLBACK
+    # Definitive 4xx: the message was rejected and will never be delivered.
+    log.warning("Message permanently rejected (HTTP %d): %s",
+                resp.status_code, resp.text[:200])
+    return SendOutcome.REJECTED_PERMANENT
 
 
 def send_to_telegram_detailed(
@@ -178,44 +300,25 @@ def send_to_telegram_detailed(
     file_paths: list[Path] | None = None,
     compress: media_compress.CompressSettings | None = None,
 ) -> tuple[bool, bool]:
-    """Send a Telegram message and report the media outcome separately.
+    """Legacy (delivered, media_failed) wrapper over the SendOutcome contract.
 
-    Returns (delivered, media_failed):
-      delivered    — the user-visible push is confirmed: media delivered, or
-                     media failed but the text fallback was delivered.
-      media_failed — True only when ``file_paths`` were provided with existing
-                     files and the media upload ultimately failed (0-byte
-                     upload, HTTP 400, 429 exhausted, transport error, or an
-                     uncertain timeout). A pure-text send never sets it.
+    kept for backward compatibility with callers written against the old
+    tuple API; new code should use :func:`send_media_to_telegram_outcome`.
 
-    Timeout policy: after an uncertain transport timeout the text fallback
-    is NOT sent (the media may already be in the chat) and the outcome is
-    (False, True). The caller must not mark the item pushed; the monitor
-    re-sends the whole item on a later scan, which can duplicate an
-    already-delivered media — accepted over silently dropping it.
-
-    ``compress`` carries the ``compress:`` config section (see
-    :mod:`media_compress`); oversized media is compressed before the upload
-    instead of being routed through the document endpoint, which no longer exists.
+    Mapping:
+      DELIVERED_OK           -> (True, False)
+      DEFINITELY_NOT_SENT    -> (False, True)   retryable — media still owed
+      UNCERTAIN_NO_ROLLBACK  -> (False, True)   uncertain — media still owed
+      REJECTED_PERMANENT     -> (True, True)    user notified via text notice
     """
-    api_base = f"{_tg_api_base}/bot{bot_token}"
-
-    if file_paths:
-        valid_files = [fp for fp in file_paths if fp.exists()]
-        if valid_files:
-            is_video = any(fp.suffix.lower() in (".mp4", ".webm", ".mov") for fp in valid_files)
-
-            if is_video:
-                ok, media_failed = _send_telegram_video_with_status(
-                    api_base, chat_id, text, valid_files[0], compress,
-                )
-            else:
-                ok, media_failed = _send_telegram_media_group_with_status(
-                    api_base, chat_id, text, valid_files, compress,
-                )
-            return ok is True, media_failed
-
-    return _send_telegram_text(api_base, chat_id, text), False
+    outcome = send_media_to_telegram_outcome(
+        bot_token, chat_id, text, file_paths, compress,
+    )
+    if outcome is SendOutcome.DELIVERED_OK:
+        return True, False
+    if outcome is SendOutcome.REJECTED_PERMANENT:
+        return True, True
+    return False, True
 
 
 def send_to_telegram(
@@ -227,10 +330,7 @@ def send_to_telegram(
 ) -> bool:
     """Send a Telegram message (thin legacy wrapper).
 
-    Returns True when the user-visible push is confirmed, False otherwise
-    (confirmed failure, or uncertain timeout delivery — the historical None
-    "uncertain" marker is folded into False). See
-    :func:`send_to_telegram_detailed` for the separate media outcome.
+    Returns True when the user-visible push is confirmed, False otherwise.
     """
     ok, _ = send_to_telegram_detailed(bot_token, chat_id, text, file_paths, compress)
     return ok
@@ -277,153 +377,194 @@ def _cleanup_compressed_artifact(path: Path | None) -> None:
             log.debug("Cannot remove compressed artifact %s: %s", candidate, e)
 
 
-def _send_telegram_video_with_status(
-    api_base: str, chat_id: str, text: str, video_path: Path,
-    compress: media_compress.CompressSettings | None = None,
-) -> tuple[bool | None, bool]:
-    """Send a video, reporting (ok, media_failed) for send_to_telegram_detailed.
+def _degrade_to_text_notice(api_base: str, chat_id: str, text: str) -> SendOutcome:
+    """REJECTED_PERMANENT degrade path: at most one plain-text notice.
 
-    ``ok`` keeps the legacy three-state meaning of ``_send_telegram_video``:
-      * HTTP success → True
-      * Clear HTTP error → text-only fallback result (media was rejected; safe
-        to notify) — True when the fallback text was delivered
-      * Timeout after the request left the client → None (uncertain; no text
-        fallback — the video may already be in the chat)
-      * Other transport errors → False without text (retry media next scan)
-
-    ``media_failed`` is True whenever the media upload did not succeed
-    (HTTP error, transport error, or uncertain timeout).
-
-    Oversized videos (``> compress.video_target_bytes``) are compressed first
-    with :func:`media_compress.compress_video` (lossless-first ladder); the
-    document-upload escape hatch no longer exists. A video that is still over
-    the limit after the compression attempt — or whose compression failed — is
-    degraded to the text notice instead of being uploaded.
-
-    Caller view: send_to_telegram_detailed folds ``ok`` via ``ok is True``,
-    so a timeout surfaces to the monitor as (False, True) — not pushed, and
-    the whole item is re-sent on a later scan. A video that was in fact
-    delivered before the timeout may therefore be pushed twice; that
-    trade-off is accepted over silently losing the media.
+    Whatever the notice's own outcome is, the outer item stays
+    REJECTED_PERMANENT — the media can never be uploaded, so the claim is
+    kept and the item never retried.
     """
-    settings = compress or media_compress.CompressSettings()
-    limit_bytes = settings.video_target_bytes
-    upload_path = video_path
-    artifact: Path | None = None
-    size_bytes = video_path.stat().st_size
-    if size_bytes > limit_bytes and settings.enabled:
-        result = _safe_compress(
-            media_compress.compress_video, video_path, limit_bytes, settings,
+    delivered = _send_telegram_text(api_base, chat_id, text)
+    if not delivered:
+        log.warning(
+            "Degraded text notice also failed; the item stays "
+            "REJECTED_PERMANENT (media can never upload — check manually)",
         )
-        log.info("Video compression for %s: %s", video_path.name, result.describe())
-        if result.path is not None:
-            upload_path = result.path
-            artifact = result.path
-            size_bytes = result.output_bytes
-    try:
+    return SendOutcome.REJECTED_PERMANENT
+
+
+def _classify_media_response(resp: requests.Response, api_base: str,
+                             chat_id: str, text: str, kind: str) -> SendOutcome:
+    """Map a media-endpoint HTTP response onto the strict outcome enum."""
+    if resp.ok:
+        return SendOutcome.DELIVERED_OK
+    if resp.status_code == 429:
+        # Pre-flight refusal surviving the bounded wait: nothing was sent
+        # and NO text fallback is allowed (429 is transient pressure, not a
+        # rejection — a text notice now would double-notify after the retry).
+        log.warning("%s send hit persistent 429; not sent, no text fallback", kind)
+        return SendOutcome.DEFINITELY_NOT_SENT
+    if 500 <= resp.status_code < 600:
+        # The server may have accepted the upload internally — uncertain.
+        log.warning(
+            "%s send got HTTP %d; outcome uncertain, no text fallback",
+            kind, resp.status_code,
+        )
+        return SendOutcome.UNCERTAIN_NO_ROLLBACK
+    # Other 4xx: a definitive rejection — the media will never be accepted;
+    # the user gets at most one plain-text notice.
+    log.warning("%s send rejected (HTTP %d): %s", kind, resp.status_code, resp.text[:200])
+    return _degrade_to_text_notice(api_base, chat_id, text)
+
+
+class PreparedMedia:
+    """Upload-ready media plan produced BEFORE the push slot is claimed.
+
+    Running compression and the oversize gate outside the claim critical
+    section keeps the .pushed.lock hold time to microseconds — only the
+    ledger check + write stays inside.
+    """
+
+    __slots__ = ("artifacts", "degrades_to_text", "files", "is_video")
+
+    def __init__(
+        self,
+        files: list[Path],
+        is_video: bool,
+        degrades_to_text: bool,
+        artifacts: list[Path],
+    ) -> None:
+        self.files = files
+        self.is_video = is_video
+        self.degrades_to_text = degrades_to_text
+        self.artifacts = artifacts
+
+
+def prepare_media_for_upload(
+    file_paths: list[Path],
+    compress: media_compress.CompressSettings | None = None,
+) -> PreparedMedia | None:
+    """Compress/validate ``file_paths`` into an upload-ready plan.
+
+    Returns ``None`` when no existing file remains (caller should send a
+    plain text message). A plan with ``degrades_to_text=True`` means the
+    media can never be uploaded (still over the limit after compression):
+    the send path issues at most one text notice and resolves
+    REJECTED_PERMANENT. Compressed artifacts are cleaned up by the send
+    path — do not delete ``plan.artifacts`` here.
+    """
+    valid_files = [fp for fp in file_paths if fp.exists()]
+    if not valid_files:
+        return None
+
+    is_video = any(
+        fp.suffix.lower() in (".mp4", ".webm", ".mov") for fp in valid_files
+    )
+    settings = compress or media_compress.CompressSettings()
+    artifacts: list[Path] = []
+
+    if is_video:
+        video_path = valid_files[0]
+        limit_bytes = settings.video_target_bytes
+        upload_path = video_path
+        size_bytes = video_path.stat().st_size
+        if size_bytes > limit_bytes and settings.enabled:
+            result = _safe_compress(
+                media_compress.compress_video, video_path, limit_bytes, settings,
+            )
+            log.info("Video compression for %s: %s", video_path.name, result.describe())
+            if result.path is not None:
+                upload_path = result.path
+                artifacts.append(result.path)
+                size_bytes = result.output_bytes
         if size_bytes > limit_bytes:
-            # No usable artifact: uploading anyway would only be rejected, and
-            # a 2 GB+ upload that times out parks the item as "uncertain"
-            # without a text notice. Degrade to the text notice — the existing
-            # (delivered=True, media_failed=True) semantics — and let the
-            # pending retry cap bound how often this is attempted.
             log.warning(
                 "Video %s is %.1f MB > %d MB limit with no usable compressed "
                 "artifact (compress.enabled=%s); degrading to text notice",
                 video_path.name, size_bytes / 1048576,
                 limit_bytes // 1048576, settings.enabled,
             )
-            return _send_telegram_text(api_base, chat_id, text), True
+            return PreparedMedia([upload_path], True, True, artifacts)
+        return PreparedMedia([upload_path], True, False, artifacts)
+
+    # Photo group: at most 10 per sendMediaGroup.
+    out_files: list[Path] = []
+    for fp in valid_files[:10]:
+        try:
+            size_bytes = fp.stat().st_size
+        except OSError:  # vanished between listing and stat: skip
+            continue
+        upload_path = fp
+        if size_bytes > settings.photo_target_bytes and settings.enabled:
+            result = _safe_compress(
+                media_compress.compress_image, fp,
+                settings.photo_target_bytes, settings,
+            )
+            log.info("Photo compression for %s: %s", fp.name, result.describe())
+            if result.path is not None:
+                upload_path = result.path
+                artifacts.append(result.path)
+                size_bytes = result.output_bytes
+        if size_bytes > settings.photo_target_bytes:
+            log.warning(
+                "Photo %s is %.1f MB > %d MB limit with no usable compressed "
+                "artifact (compress.enabled=%s); degrading to text notice",
+                fp.name, size_bytes / 1048576,
+                settings.photo_target_bytes // 1048576, settings.enabled,
+            )
+            return PreparedMedia(out_files, False, True, artifacts)
+        out_files.append(upload_path)
+    return PreparedMedia(out_files, False, False, artifacts)
+
+
+def _send_telegram_text(api_base: str, chat_id: str, text: str) -> bool:
+    """Legacy bool seam for the plain-text send (monkeypatch target).
+
+    Returns True only when the text notice is confirmed delivered.
+    """
+    return (
+        _send_telegram_text_outcome(api_base, chat_id, text)
+        is SendOutcome.DELIVERED_OK
+    )
+
+
+def _send_telegram_video_outcome(
+    api_base: str, chat_id: str, text: str, prepared: PreparedMedia,
+) -> SendOutcome:
+    """Upload a prepared video through sendVideo — one attempt, classified."""
+    upload_path = prepared.files[0]
+    try:
         with open(upload_path, "rb") as f:
             resp = _telegram_post(
                 f"{api_base}/sendVideo",
                 data={"chat_id": chat_id, "caption": text, "parse_mode": "Markdown"},
                 files={"video": (upload_path.name, f, "video/mp4")},
-                timeout=300,
+                timeout=_TG_TIMEOUT_VIDEO,
             )
-        if resp.ok:
-            return True, False
-        log.warning("Video send failed: %s", resp.text[:200])
-        return _send_telegram_text(api_base, chat_id, text), True
-    except requests.Timeout as e:
-        log.warning(
-            "Video send timeout (may already be delivered); marking uncertain, no text fallback: %s",
-            _sanitize_exc(e),
-        )
-        return None, True
     except requests.RequestException as e:
-        log.warning("Video send error (will retry later, no text fallback): %s", _sanitize_exc(e))
-        return False, True
-    finally:
-        # The compressed derivative is only needed for this upload; the
-        # original download is deliberately left untouched on disk.
-        _cleanup_compressed_artifact(artifact)
+        if _request_definitely_not_sent(e):
+            log.warning(
+                "Video send never reached Telegram (connect failure); "
+                "safe to retry later: %s", _sanitize_exc(e),
+            )
+            return SendOutcome.DEFINITELY_NOT_SENT
+        log.warning(
+            "Video send outcome uncertain (post-connect failure); "
+            "claim kept, NO text fallback: %s", _sanitize_exc(e),
+        )
+        return SendOutcome.UNCERTAIN_NO_ROLLBACK
+    return _classify_media_response(resp, api_base, chat_id, text, "Video")
 
 
-def _send_telegram_video(
-    api_base: str, chat_id: str, text: str, video_path: Path,
-    compress: media_compress.CompressSettings | None = None,
-) -> bool | None:
-    """Legacy thin wrapper: video send outcome only (see *_with_status)."""
-    ok, _ = _send_telegram_video_with_status(api_base, chat_id, text, video_path, compress)
-    return ok
-
-
-def _send_telegram_media_group_with_status(
-    api_base: str, chat_id: str, text: str, file_paths: list[Path],
-    compress: media_compress.CompressSettings | None = None,
-) -> tuple[bool | None, bool]:
-    """Send images as a media group, reporting (ok, media_failed).
-
-    Oversized photos (``> compress.photo_target_bytes``) are compressed first
-    with :func:`media_compress.compress_image` (lossless-first ladder); a photo
-    that is still oversized afterwards degrades the whole send to the text
-    notice rather than silently dropping it.
-
-    ``ok`` keeps the legacy three-state meaning of
-    ``_send_telegram_media_group``. Same timeout policy as
-    ``_send_telegram_video_with_status``: never append a text message after a
-    transport timeout (the photo may already be in the chat); that outcome is
-    (None, True) here and folds to (False, True) in send_to_telegram_detailed
-    — the monitor re-sends the whole item on a later scan, so a group that
-    was in fact delivered before the timeout may be pushed twice (accepted
-    over silently losing the media).
-    """
-    settings = compress or media_compress.CompressSettings()
+def _send_telegram_media_group_outcome(
+    api_base: str, chat_id: str, text: str, prepared: PreparedMedia,
+) -> SendOutcome:
+    """Upload a prepared photo set via sendMediaGroup — one attempt, classified."""
     media = []
     files: dict[str, tuple] = {}
     open_handles: list = []
-    artifacts: list[Path] = []
     try:
-        for i, fp in enumerate(file_paths[:10]):  # Telegram limit: 10 per group
-            if not fp.exists():
-                continue
-            try:
-                size_bytes = fp.stat().st_size
-            except OSError:  # vanished between listing and stat: skip like before
-                continue
-            upload_path = fp
-            if size_bytes > settings.photo_target_bytes and settings.enabled:
-                result = _safe_compress(
-                    media_compress.compress_image, fp,
-                    settings.photo_target_bytes, settings,
-                )
-                log.info("Photo compression for %s: %s", fp.name, result.describe())
-                if result.path is not None:
-                    upload_path = result.path
-                    artifacts.append(result.path)
-                    size_bytes = result.output_bytes
-            if size_bytes > settings.photo_target_bytes:
-                # Never silently drop an image: fall back to the text notice
-                # (delivered=True, media_failed=True) and let the pending retry
-                # cap bound the re-attempts.
-                log.warning(
-                    "Photo %s is %.1f MB > %d MB limit with no usable compressed "
-                    "artifact (compress.enabled=%s); degrading to text notice",
-                    fp.name, size_bytes / 1048576,
-                    settings.photo_target_bytes // 1048576, settings.enabled,
-                )
-                return _send_telegram_text(api_base, chat_id, text), True
+        for i, upload_path in enumerate(prepared.files):
             media.append({
                 "type": "photo",
                 "media": f"attach://img{i}",
@@ -435,51 +576,83 @@ def _send_telegram_media_group_with_status(
             files[f"img{i}"] = (upload_path.name, fh, "image/jpeg")
 
         if not media:
-            return False, True
+            return SendOutcome.REJECTED_PERMANENT
 
-        resp = _telegram_post(
-            f"{api_base}/sendMediaGroup",
-            data={"chat_id": chat_id, "media": json.dumps(media)},
-            files=files,
-            timeout=60,
-        )
-        if resp.ok:
-            return True, False
-        log.warning("Media group send failed: %s", resp.text[:200])
-        return _send_telegram_text(api_base, chat_id, text), True
-    except requests.Timeout as e:
-        log.warning(
-            "Media group timeout (may already be delivered); marking uncertain, no text fallback: %s",
-            _sanitize_exc(e),
-        )
-        return None, True
-    except requests.RequestException as e:
-        log.warning("Media group error (will retry later, no text fallback): %s", _sanitize_exc(e))
-        return False, True
+        try:
+            resp = _telegram_post(
+                f"{api_base}/sendMediaGroup",
+                data={"chat_id": chat_id, "media": json.dumps(media)},
+                files=files,
+                timeout=_TG_TIMEOUT_MEDIA_GROUP,
+            )
+        except requests.RequestException as e:
+            if _request_definitely_not_sent(e):
+                log.warning(
+                    "Media group send never reached Telegram (connect failure); "
+                    "safe to retry later: %s", _sanitize_exc(e),
+                )
+                return SendOutcome.DEFINITELY_NOT_SENT
+            log.warning(
+                "Media group outcome uncertain (post-connect failure); "
+                "claim kept, NO text fallback: %s", _sanitize_exc(e),
+            )
+            return SendOutcome.UNCERTAIN_NO_ROLLBACK
+        return _classify_media_response(resp, api_base, chat_id, text, "Media group")
     finally:
         for fh in open_handles:
             fh.close()
-        for artifact in artifacts:
+
+
+# ---------------------------------------------------------------------------
+# Legacy three-state wrappers (bool | None), kept for monitor re-exports and
+# older callers: True = confirmed delivered, False = definitely not sent,
+# None = uncertain (must never be retried blindly).
+# ---------------------------------------------------------------------------
+
+
+def _send_telegram_video(
+    api_base: str, chat_id: str, text: str, video_path: Path,
+    compress: media_compress.CompressSettings | None = None,
+) -> bool | None:
+    """Legacy thin wrapper: video send outcome only."""
+    prepared = prepare_media_for_upload([video_path], compress)
+    if prepared is None:
+        return False
+    try:
+        if prepared.degrades_to_text:
+            outcome = _degrade_to_text_notice(api_base, chat_id, text)
+        else:
+            outcome = _send_telegram_video_outcome(api_base, chat_id, text, prepared)
+    finally:
+        for artifact in prepared.artifacts:
             _cleanup_compressed_artifact(artifact)
+    return _outcome_to_legacy_bool(outcome)
 
 
 def _send_telegram_media_group(
     api_base: str, chat_id: str, text: str, file_paths: list[Path],
     compress: media_compress.CompressSettings | None = None,
 ) -> bool | None:
-    """Legacy thin wrapper: media group outcome only (see *_with_status)."""
-    ok, _ = _send_telegram_media_group_with_status(api_base, chat_id, text, file_paths, compress)
-    return ok
-
-
-def _send_telegram_text(api_base: str, chat_id: str, text: str) -> bool:
-    try:
-        resp = _telegram_post(
-            f"{api_base}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
-            timeout=15,
-        )
-        return resp.ok
-    except requests.RequestException as e:
-        log.error("Message send failed: %s", _sanitize_exc(e))
+    """Legacy thin wrapper: media group outcome only."""
+    prepared = prepare_media_for_upload(file_paths, compress)
+    if prepared is None or not prepared.files:
         return False
+    try:
+        if prepared.degrades_to_text:
+            outcome = _degrade_to_text_notice(api_base, chat_id, text)
+        else:
+            outcome = _send_telegram_media_group_outcome(api_base, chat_id, text, prepared)
+    finally:
+        for artifact in prepared.artifacts:
+            _cleanup_compressed_artifact(artifact)
+    return _outcome_to_legacy_bool(outcome)
+
+
+def _outcome_to_legacy_bool(outcome: SendOutcome) -> bool | None:
+    if outcome is SendOutcome.DELIVERED_OK:
+        return True
+    if outcome is SendOutcome.UNCERTAIN_NO_ROLLBACK:
+        return None
+    # REJECTED_PERMANENT attempted its single text notice — terminal either
+    # way (True); DEFINITELY_NOT_SENT means safe to retry (False).
+    return outcome is SendOutcome.REJECTED_PERMANENT

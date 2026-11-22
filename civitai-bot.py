@@ -1126,11 +1126,12 @@ async def cmd_add(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await verifying_msg.edit_text(msg)
 
-    # 检查是否已监控
+    # 检查是否已监控（大小写不敏感：同名大小写变体指向同一画师，
+    # 复订阅会经 chat 账本去重拦截，但订阅列表本身不应重复）
     cfg = read_config()
     uid = update.effective_user.id
     users = get_users(cfg, uid)
-    if username in users:
+    if any(u.casefold() == username.casefold() for u in users):
         await update.message.reply_text(f"👤 @{username} 已经在监控列表中了")
         return
 

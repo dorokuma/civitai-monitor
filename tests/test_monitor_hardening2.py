@@ -28,9 +28,6 @@ import pytest
 import monitor as m
 from state_store import (
     load_pending_map,
-    load_push_timestamps,
-    mark_inflight,
-    mark_pending,
 )
 
 
@@ -100,47 +97,31 @@ def _run_push(
 
 
 class TestMediaUploadFailureNotPushed:
-    def test_delivered_and_media_failed_parks_pending(self, tmp_path, monkeypatch):
-        """(True, True): the text fallback reached the user but the locally
-        downloaded media did not. The item must be parked as pending
-        (retry capped by PENDING_MAX_RETRIES), never marked pushed, and the
-        inflight guard cleared only after the pending state is persisted."""
-        mark_inflight(tmp_path, "tg1", "alice", 42)
+    def test_delivered_and_media_failed_keeps_claim(self, tmp_path, monkeypatch):
+        """(True, True) → REJECTED_PERMANENT via the compat seam: the text
+        notice reached the user but the media did not upload. The claim is
+        KEPT (never re-sent), the id lands in pushed_ids."""
         result, pushed, captured = _run_push(tmp_path, monkeypatch, (True, True))
         assert result is False
-        assert 42 not in pushed
-        assert 42 in load_pending_map(tmp_path, "tg1", "alice")
-        assert 42 not in load_push_timestamps(tmp_path, "inflight", "tg1", "alice")
+        assert 42 in pushed  # claim kept — never re-sent
         # The media upload was still attempted with the downloaded file.
         assert captured["files"] == [tmp_path / "42.jpeg"]
-
-    def test_media_failed_preserves_pending_retries_counter(self, tmp_path, monkeypatch):
-        """Parking after a media upload failure must not reset the retries
-        counter, so PENDING_MAX_RETRIES keeps capping the retries."""
-        mark_pending(tmp_path, "tg1", "alice", 42, ts=1.0, retries=1)
-        mark_inflight(tmp_path, "tg1", "alice", 42)
-        result, _pushed, _ = _run_push(tmp_path, monkeypatch, (True, True))
-        assert result is False
-        assert load_pending_map(tmp_path, "tg1", "alice")[42][1] == 1
 
     def test_delivered_without_media_failure_pushes_normally(self, tmp_path, monkeypatch):
         """(True, False): media went out with the text — pushed as before."""
         result, pushed, _ = _run_push(tmp_path, monkeypatch, (True, False))
         assert result is True
         assert pushed == {42}
-        assert load_pending_map(tmp_path, "tg1", "alice") == {}
-        assert load_push_timestamps(tmp_path, "inflight", "tg1", "alice") == {}
 
-    @pytest.mark.parametrize("media_failed", [False, True])
-    def test_not_delivered_keeps_retry_semantics(self, tmp_path, monkeypatch, media_failed):
-        """(False, *): the pre-existing not-delivered semantics hold — not
-        pushed, definitive failure bookkeeping (inflight + pending cleared),
-        item retried by the next scan because it never entered pushed_ids."""
-        mark_inflight(tmp_path, "tg1", "alice", 42)
-        result, pushed, _ = _run_push(tmp_path, monkeypatch, (False, media_failed))
+    def test_not_delivered_rolls_back_claim(self, tmp_path, monkeypatch):
+        """(False, *) → DEFINITELY_NOT_SENT: the claim is rolled back so the
+        item is retried by a later scan."""
+        result, pushed, _ = _run_push(tmp_path, monkeypatch, (False, False))
         assert result is False
         assert 42 not in pushed
-        assert 42 not in load_push_timestamps(tmp_path, "inflight", "tg1", "alice")
+        # The claim was released from both ledgers.
+        from state_store import load_chat_pushed_ids
+        assert 42 not in load_chat_pushed_ids(tmp_path, "chat")
         assert 42 not in load_pending_map(tmp_path, "tg1", "alice")
 
 

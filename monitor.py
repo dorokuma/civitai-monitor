@@ -90,24 +90,28 @@ from config_io import (
 )
 from media_compress import CompressSettings
 from state_store import (
-    PENDING_CONFIRM_SECONDS,
-    PENDING_MAX_RETRIES,
+    PENDING_CONFIRM_SECONDS,  # noqa: F401
+    PENDING_MAX_RETRIES,  # noqa: F401
     PendingMap,  # noqa: F401
+    StateReadError,
     StateWriteError,
-    adopt_stale_inflight,
+    absorb_legacy_push_states,
+    adopt_stale_inflight,  # noqa: F401
     claim_backlog_truncation_alert,
-    clear_inflight,
-    clear_pending,
-    load_pending_map,
+    claim_push_slot,
+    clear_inflight,  # noqa: F401
+    clear_pending,  # noqa: F401
+    load_pending_map,  # noqa: F401
     load_push_timestamps,  # noqa: F401
     load_pushed_ids,
     load_seen_ids,
-    mark_inflight,
-    mark_pending,
+    mark_inflight,  # noqa: F401
+    mark_pending,  # noqa: F401
     pushed_file_for_user,  # noqa: F401
     record_push_history,
     rollback_backlog_truncation_alert,
-    save_pushed_ids,
+    rollback_push_slot,
+    save_pushed_ids,  # noqa: F401
     save_seen_ids,
     seen_file_for_user,  # noqa: F401
     update_pending_map,  # noqa: F401
@@ -116,11 +120,15 @@ from state_store import (
 from telegram_media import (
     TELEGRAM_PHOTO_MAX_BYTES,
     TELEGRAM_VIDEO_MAX_MB,
+    SendOutcome,
+    _cleanup_compressed_artifact,
     _send_telegram_media_group,  # noqa: F401
     _send_telegram_text,  # noqa: F401
     _send_telegram_video,  # noqa: F401
     escape_markdown,
     get_tg_api_base,  # noqa: F401
+    prepare_media_for_upload,
+    send_media_to_telegram_outcome,
     send_to_telegram,
     set_tg_api_base,
 )
@@ -160,29 +168,59 @@ def send_to_telegram_detailed(
     file_paths: list[Path] | None,
     compress: CompressSettings | None = None,
 ) -> tuple[bool, bool]:
-    """Detailed send contract consumed by _send (implemented in telegram_media).
-
-    Returns ``(delivered, media_failed)``:
-      * delivered — the user-visible push succeeded (the text-only fallback
-        counts as delivered when the media upload failed);
-      * media_failed — file_paths was given and the files exist locally but
-        the media upload ultimately failed, so the media still has to be
-        (re)sent even when delivered is True.
-
-    ``compress`` carries the ``compress:`` config section (built by
-    :meth:`media_compress.CompressSettings.from_config`); oversized media is
-    compressed before upload instead of being sent through the removed
-    document endpoint.
+    """Legacy (delivered, media_failed) contract — kept for older callers.
 
     Compatibility seam: existing tests monkeypatch the legacy bool
     ``send_to_telegram`` symbol on this module; when that seam has been
     replaced, route through it and report no media failure so the old
-    bool-API tests keep their semantics. Production always takes the
-    detailed path below.
+    bool-API tests keep their semantics. Production code uses
+    :func:`send_media_outcome` below, which exposes the strict SendOutcome
+    four-way classification.
     """
     if send_to_telegram is not _ORIGINAL_SEND_TO_TELEGRAM:
         return send_to_telegram(bot_token, chat_id, text, file_paths), False
     return _tm_send_detailed(bot_token, chat_id, text, file_paths, compress)
+
+
+_ORIGINAL_DETAILED_WRAPPER = send_to_telegram_detailed
+
+
+def send_media_outcome(
+    bot_token: str,
+    chat_id: str,
+    text: str,
+    file_paths: list[Path] | None,
+    compress: CompressSettings | None = None,
+    *,
+    prepared=None,
+) -> SendOutcome:
+    """Single-send entry point returning the strict SendOutcome classification.
+
+    Backward-compat seams (in precedence order) so existing tests keep
+    working when they monkeypatch a module-level send symbol:
+      * a replaced ``send_to_telegram`` → True/False maps to
+        DELIVERED_OK / DEFINITELY_NOT_SENT;
+      * a replaced ``send_to_telegram_detailed`` → (delivered, media_failed)
+        maps to DELIVERED_OK / DEFINITELY_NOT_SENT / REJECTED_PERMANENT;
+      * otherwise the production path delegates to
+        ``telegram_media.send_media_to_telegram_outcome``.
+    """
+    if send_to_telegram is not _ORIGINAL_SEND_TO_TELEGRAM:
+        delivered = send_to_telegram(bot_token, chat_id, text, file_paths)
+        return SendOutcome.DELIVERED_OK if delivered else SendOutcome.DEFINITELY_NOT_SENT
+    if send_to_telegram_detailed is not _ORIGINAL_DETAILED_WRAPPER:
+        delivered, media_failed = send_to_telegram_detailed(
+            bot_token, chat_id, text, file_paths, compress,
+        )
+        if delivered:
+            return (
+                SendOutcome.REJECTED_PERMANENT
+                if media_failed else SendOutcome.DELIVERED_OK
+            )
+        return SendOutcome.DEFINITELY_NOT_SENT
+    return send_media_to_telegram_outcome(
+        bot_token, chat_id, text, file_paths, compress, prepared=prepared,
+    )
 
 # Re-export for callers that still read monitor._tg_api_base-style names.
 # Prefer set_tg_api_base() / get_tg_api_base().
@@ -601,26 +639,16 @@ def _record_push_success(
     pushed_dir: Path | None,
     tg_id: str | None,
 ) -> None:
-    """Mark ``item_id`` as pushed and flush to disk immediately.
+    """Bookkeep a confirmed DELIVERED_OK push under the claim-slot contract.
 
-    Raises ``StateWriteError`` if the disk write fails — the caller must NOT
-    treat the item as pushed in that case (inflight/pending recovery handles
-    it on the next scan). On failure ``pushed_ids`` is rolled back so the
-    in-memory set stays consistent with the missing on-disk entry.
+    The claim primitive already wrote ``item_id`` to both ledgers before the
+    send; on delivery the claim is kept. This function therefore only needs
+    to sync the caller's in-memory set and record the durable push history
+    for the weekly report — a confirmed delivery is never re-saved.
     """
     if pushed_ids is None or pushed_dir is None or tg_id is None:
         return
     pushed_ids.add(item_id)
-    try:
-        save_pushed_ids(pushed_dir, tg_id, username, pushed_ids)
-    except StateWriteError:
-        # Rollback: the id was not persisted. Remove from the in-memory set
-        # so it is NOT treated as pushed. inflight stays set so the next
-        # scan's adopt_stale_inflight will convert it to pending.
-        pushed_ids.discard(item_id)
-        raise
-    clear_pending(pushed_dir, tg_id, username, item_id)
-    clear_inflight(pushed_dir, tg_id, username, item_id)
     # Durable per-push history for the bot's weekly activity report.
     # Best-effort: a history write failure must never fail a confirmed push —
     # the report merely under-counts until the next successful push.
@@ -638,46 +666,45 @@ def _finalize_send_outcome(
     pushed_ids: set[int] | None,
     pushed_dir: Path | None,
     tg_id: str | None,
+    chat_id: str | None = None,
 ) -> bool:
-    """Apply lifecycle bookkeeping for a send outcome. Returns confirmed-success bool."""
+    """Apply strict at-most-once bookkeeping for a legacy bool|None outcome.
+
+    True → DELIVERED_OK semantics (claim kept, history recorded). False →
+    DEFINITELY_NOT_SENT (claim rolled back if the caller holds one). None →
+    UNCERTAIN_NO_ROLLBACK (claim kept, no history, warn for manual review).
+    Callers without state persistence (``pushed_dir``/``tg_id`` None) keep
+    the legacy no-op behavior.
+    """
     if outcome is True:
         _record_push_success(
             item_id, username,
             pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
         )
         return True
-    if outcome is None:
-        # Uncertain delivery (e.g. Telegram timeout). Park as pending so the
-        # next scan can retry — but ONLY after the pending state is persisted.
-        # Order: mark_pending (write state) → on success → clear_inflight.
-        # This is isomorphic to the outcome=True path (save_pushed_ids → clear).
-        # If mark_pending raises StateWriteError, inflight stays set so the
-        # next scan's adopt_stale_inflight handles it. Without clearing
-        # inflight here, adopt_stale_inflight would re-adopt the id with
-        # retries=0 on every scan, bypassing PENDING_MAX_RETRIES.
+    if outcome is False:
+        # Definitely not sent: release the claim via delta-write rollback.
         if pushed_dir is not None and tg_id is not None:
-            existing = load_pending_map(pushed_dir, tg_id, username)
-            prev = existing.get(item_id)
-            prev_retries = prev[1] if prev else 0
-            retries = max(prev_retries, 0)
-            # mf is sticky (OR-preserved): a prior known-not-delivered record
-            # must not be downgraded to "uncertain" by a later outcome.
-            prev_mf = bool(prev[2]) if prev else False
-            mark_pending(
-                pushed_dir, tg_id, username, item_id,
-                retries=retries, media_failed=prev_mf,
-            )
-            clear_inflight(pushed_dir, tg_id, username, item_id)
-            log.info(
-                "Parked id=%d for @%s as pending (uncertain delivery, retries=%d, "
-                "media_failed=%d)",
-                item_id, username, retries, int(prev_mf),
-            )
+            try:
+                rollback_push_slot(
+                    pushed_dir, chat_id or "", tg_id, username, item_id,
+                )
+            except StateWriteError as e:
+                log.warning(
+                    "Could not roll back push slot for id=%d @%s: %s",
+                    item_id, username, e,
+                )
+        if pushed_ids is not None:
+            pushed_ids.discard(item_id)
         return False
-    # outcome is False: send definitively failed.
-    if pushed_dir is not None and tg_id is not None:
-        clear_inflight(pushed_dir, tg_id, username, item_id)
-        clear_pending(pushed_dir, tg_id, username, item_id)
+    # outcome is None: uncertain — keep the claim, never resend.
+    if pushed_ids is not None:
+        pushed_ids.add(item_id)
+    log.warning(
+        "id=%d for @%s ended UNCERTAIN (timeout/5xx/disconnect); claim kept, "
+        "no resend — manual check recommended",
+        item_id, username,
+    )
     return False
 
 
@@ -695,8 +722,15 @@ def process_and_push(
     pushed_ids: set[int] | None = None,
     pushed_dir: Path | None = None,
     tg_id: str | None = None,
+    shutdown_flag: Callable[[], bool] = lambda: False,
 ) -> bool:
-    """Download a single item (image or video) and push to Telegram."""
+    """Download a single item (image or video) and push to Telegram — strict
+    at-most-once: at most ONE Telegram POST per (item, chat) ever.
+
+    Pipeline: download → drop 0-byte → claim push slot → send once →
+    classify the outcome. Uncertain and permanent outcomes KEEP the claim;
+    only a provable no-send (connect failure, pre-flight 429) releases it.
+    """
     # Path safety: the id builds on-disk filenames — reject anything that is
     # not an int so tampered payloads never reach path construction.
     raw_id = item.get("id")
@@ -721,6 +755,8 @@ def process_and_push(
         )
     )
 
+    stateful = pushed_dir is not None and tg_id is not None
+
     def _send(text: str, files: list[Path] | None) -> bool:
         # 0-byte media can never upload (Telegram answers 400 and the send
         # path would fall back to text with the media silently lost). Drop
@@ -732,97 +768,106 @@ def process_and_push(
         # and plain messages at 4096 — clip below both so a forged createdAt
         # can never push a send into guaranteed-400 territory.
         text = _clip(text, TELEGRAM_CAPTION_BUDGET if files else TELEGRAM_TEXT_BUDGET)
-        if pushed_dir is not None and tg_id is not None:
+        # Should-1: run compression + the oversize gate BEFORE claiming the
+        # push slot — the .pushed.lock critical section then covers only the
+        # ledger check + write, not a potentially multi-minute ffmpeg run.
+        prepared = None
+        if files:
             try:
-                mark_inflight(pushed_dir, tg_id, username, item_id)
-            except StateWriteError:
-                log.error(
-                    "Failed to mark inflight for id=%d @%s, proceeding without "
-                    "crash-recovery guard",
+                prepared = prepare_media_for_upload(files, compress)
+            except Exception:
+                # Preparation crashed before any claim was taken — the item
+                # is simply retried on the next scan, nothing to roll back.
+                log.exception(
+                    "Media preparation crashed for id=%d @%s; skipping item "
+                    "this scan (no claim taken)",
                     item_id, username,
                 )
-        delivered, media_failed = send_to_telegram_detailed(
-            bot_token, chat_id, text, files, compress,
-        )
-        try:
-            if delivered and media_failed:
-                # The text fallback reached the user, but the locally
-                # downloaded media did NOT leave this machine. The item must
-                # NOT be marked pushed: park it as pending (preserving the
-                # retries counter) so the next scan retries the media upload,
-                # capped by PENDING_MAX_RETRIES in _fetch_and_process_page.
-                if pushed_dir is not None and tg_id is not None:
-                    existing = load_pending_map(pushed_dir, tg_id, username)
-                    prev_retries = existing[item_id][1] if item_id in existing else 0
-                    retries = max(prev_retries, 0)
-                    # mf=1: the locally downloaded media did NOT leave this
-                    # machine, so the next scan must RE-send it — the record
-                    # must never be fresh-promoted like an uncertain one.
-                    mark_pending(
-                        pushed_dir, tg_id, username, item_id,
-                        retries=retries, media_failed=True,
-                    )
-                    clear_inflight(pushed_dir, tg_id, username, item_id)
-                    log.info(
-                        "Parked id=%d for @%s as pending (media upload failed after "
-                        "text fallback, retries=%d, media_failed=1)",
-                        item_id, username, retries,
-                    )
                 return False
-            return _finalize_send_outcome(
-                delivered, item_id, username,
+        claimed = False
+        if stateful:
+            # In-loop re-check against the in-memory set (cheap) plus the
+            # on-disk claim (authoritative, covers other tracks/subscribers).
+            if pushed_ids is not None and item_id in pushed_ids:
+                return False
+            try:
+                claimed = claim_push_slot(pushed_dir, chat_id, tg_id, username, item_id)
+            except (StateReadError, StateWriteError) as e:
+                # Fail closed: an unreadable ledger means we cannot prove the
+                # item was not already pushed — abort with ZERO posts.
+                log.error(
+                    "Cannot claim push slot for id=%d @%s (%s); skipping "
+                    "with NO send (fail-closed)",
+                    item_id, username, e,
+                )
+                return False
+            if not claimed:
+                # Already pushed by an earlier scan, track or subscriber.
+                if pushed_ids is not None:
+                    pushed_ids.add(item_id)
+                log.info(
+                    "id=%d for @%s already claimed for chat %s; skipping send",
+                    item_id, username, chat_id,
+                )
+                return False
+        if shutdown_flag():
+            # Claimed but shutdown requested before the POST left: release
+            # the slot so the next run can retry cleanly.
+            if claimed:
+                try:
+                    rollback_push_slot(pushed_dir, chat_id, tg_id, username, item_id)
+                except StateWriteError as e:
+                    log.error(
+                        "Could not release push slot for id=%d @%s on shutdown: %s",
+                        item_id, username, e,
+                    )
+            return False
+
+        try:
+            outcome = send_media_outcome(
+                bot_token, chat_id, text, files, compress, prepared=prepared,
+            )
+        finally:
+            # Idempotent: the production path already cleaned its artifacts;
+            # this covers the monkeypatched-compat path and any early raise.
+            if prepared is not None:
+                for artifact in prepared.artifacts:
+                    _cleanup_compressed_artifact(artifact)
+
+        if outcome is SendOutcome.DELIVERED_OK:
+            _record_push_success(
+                item_id, username,
                 pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
             )
-        except StateWriteError:
-            # save_pushed_ids (outcome=True) or mark_pending (outcome=None)
-            # failed: the item state was NOT persisted. inflight stays set
-            # (not cleared) so adopt_stale_inflight will convert it to pending
-            # on the next scan. Skip this item and continue processing the rest.
-            log.error(
-                "State write failed for id=%d @%s; inflight left for next scan recovery",
+            return True
+        if outcome is SendOutcome.DEFINITELY_NOT_SENT:
+            # Provably nothing reached Telegram — release the claim so a
+            # later scan retries; keep memory/disk consistent (delta write).
+            if claimed:
+                try:
+                    rollback_push_slot(pushed_dir, chat_id, tg_id, username, item_id)
+                except StateWriteError as e:
+                    log.error(
+                        "Rollback of push slot failed for id=%d @%s: %s",
+                        item_id, username, e,
+                    )
+            if pushed_ids is not None:
+                pushed_ids.discard(item_id)
+            log.warning(
+                "id=%d for @%s definitively not sent (connect/429); "
+                "claim released, will retry next scan",
                 item_id, username,
             )
             return False
-
-    def _send_transient_download_failure(text: str) -> bool:
-        """Send a text-only notice for a transient download failure.
-
-        The item is parked as pending (reusing the existing retries counter,
-        media_failed=1: no media left this machine) so the next scan that
-        finds the item on a page retries the full download+push
-        unconditionally (not gated by PENDING_CONFIRM_SECONDS). It is NOT
-        marked as pushed — the user should get another chance to receive the
-        media. The retry count is capped by PENDING_MAX_RETRIES via the
-        existing pending mechanism in _fetch_and_process_page.
-        """
-        if pushed_dir is not None and tg_id is not None:
-            try:
-                mark_inflight(pushed_dir, tg_id, username, item_id)
-            except StateWriteError:
-                log.error(
-                    "Failed to mark inflight for id=%d @%s, proceeding without "
-                    "crash-recovery guard",
-                    item_id, username,
-                )
-        # Text-only notice — the 4096 text limit applies here too.
-        send_to_telegram(bot_token, chat_id, _clip(text, TELEGRAM_TEXT_BUDGET), None)
-        if pushed_dir is not None and tg_id is not None:
-            existing = load_pending_map(pushed_dir, tg_id, username)
-            prev_retries = existing[item_id][1] if item_id in existing else 0
-            try:
-                # mf=1: the download failed before any upload, so the next
-                # on-page scan must perform a real re-send.
-                mark_pending(
-                    pushed_dir, tg_id, username, item_id,
-                    retries=prev_retries, media_failed=True,
-                )
-                clear_inflight(pushed_dir, tg_id, username, item_id)
-            except StateWriteError:
-                log.error(
-                    "State write failed for id=%d @%s; pending/inflight "
-                    "may be inconsistent",
-                    item_id, username,
-                )
+        # REJECTED_PERMANENT or UNCERTAIN_NO_ROLLBACK: keep the claim — the
+        # item must never be sent again. Sync memory; no success history.
+        if pushed_ids is not None:
+            pushed_ids.add(item_id)
+        log.warning(
+            "id=%d for @%s terminal outcome %s to chat %s — claim kept, "
+            "NO rollback and NO resend. Manual check recommended.",
+            item_id, username, outcome.value, chat_id,
+        )
         return False
 
     if is_video:
@@ -857,13 +902,14 @@ def process_and_push(
             )
             pushed = _send(text, None)
         else:
-            # Transient failure: notify but do NOT mark pushed — retry next scan.
-            text = (
-                f"🎥 *New video by @{safe_user}* ⚠️（视频暂不可用，将在下次扫描重试）\n"
-                f"🔗 [View on Civitai]({civitai_url})\n"
-                f"🕐 {created_at}"
+            # Transient failure: log only — NO Telegram, NO pushed entry.
+            # The item stays un-pushed so the next scan silently retries.
+            log.warning(
+                "Transient video download failure for id=%d @%s; skipping "
+                "Telegram notice, will retry next scan",
+                item_id, username,
             )
-            pushed = _send_transient_download_failure(text)
+            return False
         log.info(
             "Pushed video %s to @%s | id=%d file=%s success=%s push=%s",
             "✅" if pushed else "❌", username, item_id,
@@ -907,13 +953,13 @@ def process_and_push(
         )
         pushed = _send(text, None)
     else:
-        # Transient failure: notify but do NOT mark pushed — retry next scan.
-        text = (
-            f"🖼 *New artwork by @{safe_user}* ⚠️（图片暂不可用，将在下次扫描重试）\n"
-            f"🔗 [View on Civitai]({civitai_url})\n"
-            f"🕐 {created_at}"
+        # Transient failure: log only — NO Telegram, NO pushed entry.
+        log.warning(
+            "Transient image download failure for id=%d @%s; skipping "
+            "Telegram notice, will retry next scan",
+            item_id, username,
         )
-        pushed = _send_transient_download_failure(text)
+        return False
     log.info(
         "Pushed image %s to @%s | id=%d file=%s success=%s push=%s",
         "✅" if pushed else "❌", username, item_id,
@@ -946,10 +992,14 @@ def _fetch_and_process_page(
     pushed_dir: Path,
     tg_id: str,
     compress: CompressSettings | None = None,
+    shutdown_flag: Callable[[], bool] = lambda: False,
 ) -> tuple[list[dict], set[int], str]:
     """Fetch one page (by cursor), find new items, process and push them.
 
-    Propagates ``FetchPageError`` from ``fetch_page`` (network/HTTP hard fail).
+    Strict at-most-once: legacy inflight/pending files are absorbed into the
+    pushed ledgers (zero-resend upgrade) and every send goes through the
+    claim → send-once → outcome pipeline in ``process_and_push``. Propagates
+    ``FetchPageError`` from ``fetch_page`` (network/HTTP hard fail).
     """
     items, next_cursor = fetch_page(
         username, base_url=base_url, limit=limit, cursor=cursor, nsfw=nsfw_flag, sort=sort,
@@ -976,64 +1026,16 @@ def _fetch_and_process_page(
         page_ids.add(item_id)
         valid_items.append(img)
 
-    pending = adopt_stale_inflight(pushed_dir, tg_id, username)
-    now = time.time()
+    # Zero-resend upgrade: fold any leftover inflight/pending IDs from the
+    # pre-strict design into the pushed ledgers. An unreadable/corrupt
+    # pushed ledger fails the whole page fail-closed (0 sends).
+    absorb_legacy_push_states(pushed_dir, chat_id, tg_id, username)
+
     new_on_page = [img for img in valid_items if img["id"] not in pushed_ids]
     did_push_attempt = False
 
-    for item_id, (ts, retries, media_failed) in list(pending.items()):
-        if item_id in page_ids:
-            continue
-        age = now - float(ts)
-        if media_failed and retries < PENDING_MAX_RETRIES:
-            # mf=1: the media is KNOWN not to have reached Telegram. The item
-            # is not on this page, so it cannot be re-sent this scan — and the
-            # fresh promotion below is only sound for *uncertain* (mf=0)
-            # records, whose purpose is avoiding a duplicate push. Promoting
-            # a mf=1 record here silently dropped the media whenever another
-            # track (e.g. SFW) scanned first and the item's own track had
-            # not. Keep it pending; the on-page branch performs the real
-            # re-send when the item reappears on a page.
-            log.info(
-                "Pending id=%d for @%s is off-page with media_failed=1 "
-                "(age=%.0fs, retries=%d); keeping pending for a real re-send",
-                item_id, username, age, retries,
-            )
-            continue
-        if age < PENDING_CONFIRM_SECONDS:
-            # Fresh: mf=0 records may already be delivered (re-sending could
-            # duplicate — the original anti-duplicate promotion), and mf=1
-            # records reaching this point have retries at the cap, i.e. they
-            # are terminal. Promote without re-send.
-            try:
-                _record_push_success(
-                    item_id, username,
-                    pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
-                )
-            except StateWriteError as e:
-                log.warning(
-                    "Could not promote fresh pending id=%d for @%s: %s",
-                    item_id, username, e,
-                )
-            continue
-        log.info(
-            "Pending id=%d for @%s is off-window and expired (%.0fs, retries=%d); "
-            "promoting without re-send",
-            item_id, username, age, retries,
-        )
-        try:
-            _record_push_success(
-                item_id, username,
-                pushed_ids=pushed_ids, pushed_dir=pushed_dir, tg_id=tg_id,
-            )
-        except StateWriteError as e:
-            log.warning(
-                "Could not promote expired pending id=%d for @%s: %s",
-                item_id, username, e,
-            )
-            continue
-
     if new_on_page:
+        processed_this_page: set[int] = set()
         for img in reversed(new_on_page):
             item_id = img["id"]
             # Defensive re-check: ids were coerced above, but never let a
@@ -1044,90 +1046,22 @@ def _fetch_and_process_page(
                     item_id, username,
                 )
                 continue
+            # Same-page duplicates: an id appearing twice in one page must
+            # only be processed once, even before any ledger round-trip.
+            if item_id in processed_this_page or item_id in pushed_ids:
+                continue
+            if shutdown_flag():
+                log.info(
+                    "Shutdown requested; stopping item loop for @%s at id=%d",
+                    username, item_id,
+                )
+                break
+            processed_this_page.add(item_id)
 
             # Per-item isolation: a single bad item (malformed payload, send
             # crash, unexpected state error) must not abort the rest of this
             # page or the whole creator scan.
             try:
-                if item_id in pushed_ids:
-                    continue
-
-                if item_id in pending:
-                    ts, retries, media_failed = pending[item_id]
-                    age = now - float(ts)
-                    if media_failed and retries >= PENDING_MAX_RETRIES:
-                        # Terminal: the re-send cap is reached — existing
-                        # capping semantics, surfaced as a warning because a
-                        # mf=1 promote means the media is definitively lost.
-                        log.warning(
-                            "Pending id=%d for @%s still media_failed=1 with "
-                            "retries=%d (cap %d); promoting to pushed without "
-                            "further re-send",
-                            item_id, username, retries, PENDING_MAX_RETRIES,
-                        )
-                        _record_push_success(
-                            item_id, username,
-                            pushed_ids=pushed_ids, pushed_dir=pushed_dir,
-                            tg_id=tg_id,
-                        )
-                        continue
-                    if media_failed:
-                        # mf=1: the media is KNOWN not to have been delivered
-                        # (upload failed after the text fallback, or a
-                        # transient download failure). A fresh pending ts is
-                        # NOT evidence of delivery, so the
-                        # PENDING_CONFIRM_SECONDS gate must not apply —
-                        # gating here silently promoted every media-failed
-                        # item on the next 600s scan (the production bug
-                        # this fixes). Reserve the retry, then re-send below.
-                        log.info(
-                            "Pending id=%d for @%s media_failed=1 (age=%.0fs, "
-                            "retries=%d); re-sending media without the "
-                            "fresh-confirm gate",
-                            item_id, username, age, retries,
-                        )
-                        mark_pending(
-                            pushed_dir, tg_id, username, item_id,
-                            ts=now, retries=retries + 1, media_failed=True,
-                        )
-                        pending[item_id] = (now, retries + 1, 1)
-                    elif age < PENDING_CONFIRM_SECONDS:
-                        log.info(
-                            "Pending id=%d for @%s is fresh (%.0fs < %ds); "
-                            "promoting to pushed without re-send",
-                            item_id, username, age, PENDING_CONFIRM_SECONDS,
-                        )
-                        _record_push_success(
-                            item_id, username,
-                            pushed_ids=pushed_ids, pushed_dir=pushed_dir,
-                            tg_id=tg_id,
-                        )
-                        continue
-                    elif retries >= PENDING_MAX_RETRIES:
-                        log.info(
-                            "Pending id=%d for @%s expired with retries=%d; "
-                            "promoting without further re-send",
-                            item_id, username, retries,
-                        )
-                        _record_push_success(
-                            item_id, username,
-                            pushed_ids=pushed_ids, pushed_dir=pushed_dir,
-                            tg_id=tg_id,
-                        )
-                        continue
-                    else:
-                        log.info(
-                            "Pending id=%d for @%s expired (%.0fs, retries=%d); "
-                            "one retry push",
-                            item_id, username, age, retries,
-                        )
-                        mark_pending(
-                            pushed_dir, tg_id, username, item_id,
-                            ts=now, retries=retries + 1,
-                            media_failed=bool(media_failed),
-                        )
-                        pending[item_id] = (now, retries + 1, int(bool(media_failed)))
-
                 did_push_attempt = True
                 process_and_push(
                     img, username,
@@ -1141,6 +1075,7 @@ def _fetch_and_process_page(
                     pushed_ids=pushed_ids,
                     pushed_dir=pushed_dir,
                     tg_id=tg_id,
+                    shutdown_flag=shutdown_flag,
                 )
                 time.sleep(2.0 + random.random() * 1.0)
             except Exception:
@@ -1209,6 +1144,7 @@ def run_incremental(
                 bot_token=bot_token, chat_id=chat_id,
                 video_enabled=video_enabled, max_video_size_mb=max_video_size_mb,
                 pushed_dir=seen_dir, tg_id=tg_id, compress=compress,
+                shutdown_flag=shutdown_flag,
             )
             last_new_count = len(new_on_page)
 
@@ -1346,6 +1282,7 @@ def run_full(
                 bot_token=bot_token, chat_id=chat_id,
                 video_enabled=video_enabled, max_video_size_mb=max_video_size_mb,
                 pushed_dir=seen_dir, tg_id=tg_id, compress=compress,
+                shutdown_flag=shutdown_flag,
             )
 
             # Cursor-loop guard: remember every cursor we walked; if the API
@@ -1469,6 +1406,7 @@ def run_reconciliation(
                 bot_token=bot_token, chat_id=chat_id,
                 video_enabled=video_enabled, max_video_size_mb=max_video_size_mb,
                 pushed_dir=seen_dir, tg_id=tg_id, compress=compress,
+                shutdown_flag=shutdown_flag,
             )
 
             # Cursor loop guard
