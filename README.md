@@ -1,409 +1,264 @@
-# Civitai Monitor
+<div align="center">
 
-<p align="center">
-  <a href="README.md">English</a> | <a href="README.zh-CN.md">Chinese</a>
-</p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.svg">
+  <img alt="civitai-monitor logo" src="assets/logo-light.svg" width="64" height="64">
+</picture>
 
-[中文文档](README.zh-CN.md)
+# civitai-monitor
 
-![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
+**Follow Civitai creators in Telegram — automatically downloads full-resolution originals &amp; HD videos, compresses oversized media without losing posts, and runs smoothly on 1 GB VPS.**
 
-Monitor specified Civitai users for new image & video uploads — automatically
-download full-resolution originals and push them to a Telegram channel via the Bot API.
+![Python](https://img.shields.io/badge/Python-3.10%2B-18181b?style=flat-square&logo=python&logoColor=white)
+![Telegram Bot](https://img.shields.io/badge/Telegram-Bot-18181b?style=flat-square&logo=telegram&logoColor=white)
+![1 GB VPS](https://img.shields.io/badge/1%20GB-VPS%20Friendly-18181b?style=flat-square&logo=linux&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-18181b?style=flat-square&logo=opensourceinitiative&logoColor=white)
 
----
+[Quick Start](#quick-start) · [Highlights](#highlights) · [Bot Commands](#bot-commands) · [Configuration](#more-details)
 
-## Features
+**English** · [简体中文](README.zh-CN.md)
 
-- 🔍 Polls Civitai public REST API (no API key required for images)
-- 👥 **Multi-user monitoring** — watch any number of creators
-- 🖼 **Full-resolution originals** — auto-replaces `width=*` with `width=original`
-- 🎥 **Video support** — downloads full-HD videos via Backblaze B2 CDN (requires browser cookies — see guide below)
-- 🤖 **Telegram Admin Bot** — full management via chat commands with interactive buttons
-- 🔀 **Two scan modes**: `incremental` (cron-friendly) or `full` (backfill)
-- 🚦 **NSFW filter**: `sfw_only`, `nsfw_only`, or `both`
-- 👤 **Per-user isolation** — each Telegram user has their own subscription list and independent download progress (`seen_ids_{tg_id}_{username}.json`)
-- 🔐 **Multi-user auth** — `authorized_users` list supports multiple Telegram IDs
-- 🧠 **Smart username parsing** — accepts plain usernames, `@username`, and Civitai profile URLs (`civitai.com/user/xxx`, `civitai.red/user/xxx`) — non-Civitai domains rejected
-- ✅ **User existence validation** — calls Civitai API to confirm the user has public works before adding
-- 💾 **Deduplication** — dual-layer save (track-end + final) prevents cron race conditions
-- 📋 **Push audit log** — every push is logged with ID, file, download status, and push result
-- 🧹 **Auto-cleanup** — removes cached files older than `keep_days`
-- 🗂 **Interactive remove & backfill** — button-based user selection with pagination
+</div>
 
----
-
-## Architecture
-
-```
-                   ┌──────────────────────┐
-                   │   Telegram Bot        │
-                   │   (civitai-bot.py)    │
-                   │   - /add /remove      │
-                   │   - /list /status     │
-                   │   - /backfill /scan   │
-                   └──────┬───────────────┘
-                          │ commands
-                          ▼
-  ┌─────────────────────────────────────────────┐
-  │  Cron: monitor.py (every 10 min)             │
-  │                                              │
-  │  1. Load subscriptions per Telegram user     │
-  │  2. Fetch latest images via Civitai API      │
-  │  3. Compare against per-user seen_ids        │
-  │  4. Download new originals (img + video)     │
-  │  5. Push to Telegram via Bot API             │
-  │  6. Save per-user progress immediately       │
-  └─────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    A["Civitai Creators"] --> B["Built-in Scheduler / Bot Commands"]
+    B --> C["Full-Res Original &amp; HD Video Downloader"]
+    C --> D["Smart Lossless-First Compressor<br/>(>10 MiB img / >2 GiB vid)"]
+    D --> E["Telegram Channel"]
 ```
 
-**Per-user isolation design:**
-```
-config.yaml                        Disk
-──────────────────────────────────────────────
-subscriptions:                      seen_ids/
-  YOUR_TELEGRAM_USER_ID: [Username] ├ seen_ids_YOUR_TG_ID_Username.json
-  ANOTHER_USER_ID: [Username2]      └ seen_ids_ANOTHER_ID_Username2.json
-```
+<a id="highlights"></a>
 
-**Important operational notes (v1.1.3+):**
+## Highlights
 
-- **Multi-user subscribe vs single push target**: each authorized Telegram user can maintain their own *subscription list*, but media is pushed to the **single** `telegram.chat_id` channel/chat configured in yaml — not one private chat per subscriber.
-- **Global `/mode` and `/nsfw`**: these settings apply to the whole scanner (all subscribers), not only the admin who ran the command.
-- **`seen_ids` vs `pushed_ids`**: dedupe for “already delivered” is based on **`pushed_ids`**. `seen_ids` tracks scan progress / page cursor safety and may diverge after a failed send.
-- **Token dual-track**: prefer env `CIVITAI_BOT_TOKEN` (via `load_env.py` and/or systemd `EnvironmentFile`). Do not store a real token in yaml — `write_config` strips `bot_token` on save.
+| | |
+|---|---|
+| 📸 **Lossless originals &amp; HD video** | Auto-rewrites URLs to fetch full-resolution images and real HD video from the Backblaze B2 CDN — not just cover thumbnails. |
+| 🤖 **Telegram bot with buttons** | Subscribe / unsubscribe / backfill / manual scan / set interval, all via paged interactive buttons. Each Telegram user keeps an isolated subscription list. |
+| 🗜 **Smart compression, no dropped posts** | Images over 10 MiB and videos over 2 GiB go through a lossless-first compression ladder with a final fallback — posts always reach the channel. |
+| 🪶 **1 GB VPS friendly** | Static memory bounds via systemd (e.g. `MemoryMax`), streaming/lightweight processing, OOM-safe resumable backfill, and `fcntl` file locks that prevent duplicate pushes. |
 
----
+<a id="quick-start"></a>
 
 ## Quick Start
 
-### 1. Prepare
+### 1. Install
 
 ```bash
 git clone https://github.com/dorokuma/civitai-monitor.git
 cd civitai-monitor
-pip install -r requirements.txt
-# video compression needs ffmpeg/ffprobe on PATH (e.g. apt-get install -y ffmpeg)
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+# Video compression needs ffmpeg/ffprobe on PATH, e.g.:
+sudo apt-get install -y ffmpeg
 ```
 
-### 2. Configure
+### 2. Configure `.env`
 
 ```bash
 cp config.yaml.example config.yaml
-# Edit config.yaml — fill in bot token, chat ID, and subscriptions
+
+mkdir -p ~/.civitai-monitor
+cat > ~/.civitai-monitor/.env <<'ENV'   # loaded automatically by load_env.py
+CIVITAI_BOT_TOKEN=<your-bot-token>
+ENV
+chmod 600 ~/.civitai-monitor/.env
+
+# edit config.yaml → fill in chat_id, authorized_users, subscriptions
 ```
 
 Minimal `config.yaml`:
 
 ```yaml
 telegram:
-  bot_token: "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
-  chat_id: "-1001234567890"
+  chat_id: "<your-telegram-chat-id>"
 
 authorized_users:
-  - 123456789
+  - <your-telegram-user-id>
 
 subscriptions:
-  '123456789':
-    - name: "YourTargetUser"
+  '<your-telegram-user-id>':
+    - name: "<target-civitai-username>"
 ```
 
-### 2b. CLI Options
+> [!NOTE]
+> `subscriptions` are keyed by **Telegram user ID**, not the Civitai username.
+> Message @userinfobot on Telegram to find your numeric user ID.
+
+### 3. Start Bot &amp; Built-in Scheduler
 
 ```bash
-python3 monitor.py                          # uses config.yaml (auto-search)
-python3 monitor.py --config /path/to.yaml   # use a custom config file
-python3 monitor.py --mode full              # override mode (incremental/full)
-python3 monitor.py --user username          # process only one username
-python3 monitor.py --mode full --user xxx   # backfill one user's full gallery
+.venv/bin/python3 civitai-bot.py
 ```
 
-The `--mode` and `--user` flags override config.yaml values for that run.
-This is especially useful when the Admin Bot triggers a backfill — it runs
-`monitor.py --mode full --user xxx` without modifying config.yaml.
+> [!NOTE]
+> The bot's **built-in scheduler** replaces the old cron job — it runs
+> `monitor.py` incremental scans on a configurable interval (default 10 min,
+> change it with `/interval`). No crontab setup is needed.
 
-### 3. Run (incremental mode — default)
+<a id="bot-commands"></a>
 
-```bash
-python3 monitor.py
-```
+## Bot Commands
 
-Only latest images are checked. Subsequent runs only pick up new uploads.
+| Command | What it does |
+|---------|--------------|
+| `/add <name\|url\|@name>` | Watch a creator — accepts plain names, `@name`, or `civitai.com/user/…` links, and validates the user exists first |
+| `/remove` | Paged button list to stop watching a user |
+| `/list` | Show your watch list |
+| `/status` | Monitor status: disk usage, seen count, config |
+| `/scan` | Trigger an incremental scan right now |
+| `/backfill` | Paged button list to backfill a creator's full gallery |
+| `/interval <min>` | Set the scan interval in minutes (default 10, range 1–1440) |
+| `/mode <incremental\|full>` | Switch scan mode (applies globally) |
+| `/nsfw <sfw_only\|nsfw_only\|both>` | Switch the NSFW filter (applies globally) |
+| `/cleanup [days]` | Prune cached files older than N days |
+| `/stop` | Terminate the current scheduled scan and release `.monitor.lock` (e.g. to start a backfill right away) |
+| `/help` | Show all commands |
 
-### 4. Run (full backfill — initial catch-up)
+Each authorized Telegram user sees and manages **their own** subscriptions;
+media is always pushed to the single `telegram.chat_id` channel.
 
-```yaml
-# Set in config.yaml:
-mode: "full"
-```
+## Minimum Requirements
 
-```bash
-python3 monitor.py
-```
+| Item | Requirement |
+|------|-------------|
+| **RAM (min)** | 1 GB — a full backfill can peak near 1.7 GB, so 1 GB works but watch for OOM |
+| **RAM (recommended)** | 2 GB or more |
+| **Memory bound** | No in-process memory cap — constrain with systemd (e.g. `MemoryMax`) when needed; low-RAM operation relies on streaming/lightweight processing |
+| **Disk** | Depends on subscription count and cache policy (`keep_days` + `max_total_gb`); 10 GB+ recommended |
+| **Python** | 3.10+ |
+| **External tools** | `ffmpeg`/`ffprobe` for video compression |
 
-Walks every page of the user's gallery. Use once to catch up, then switch
-back to `incremental` mode for cron.
+> [!TIP]
+> OOM during a full backfill is not fatal — the resumable backfill mechanism
+> automatically picks up where the process was killed.
 
-### 5. Run the Admin Bot (optional — 24/7 management)
+<a id="more-details"></a>
 
-```bash
-python3 civitai-bot.py
-```
+## More Details
 
-Or via systemd:
+<details>
+<summary><b>Environment Variables Reference</b></summary>
 
-```bash
-sudo tee /etc/systemd/system/civitai-bot.service <<'SVC'
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `CIVITAI_BOT_TOKEN` | ✅ | Telegram bot token. Preferred over `config.yaml` — `write_config` strips `bot_token` when saving yaml. |
+| `telegram.chat_id` (yaml) | ✅ | Channel/group/user chat ID that receives pushed media. Single push target for all subscribers. |
+| `authorized_users` (yaml) | ✅ | Telegram user IDs allowed to send the bot commands. |
+| `subscriptions` (yaml) | ✅ | Per-Telegram-user watch lists, keyed by Telegram user ID. |
+| `mode` (yaml) | | `incremental` (default) or `full` backfill. |
+| `nsfw` (yaml) | | `sfw_only` / `nsfw_only` / `both` (default). |
+| `video_enabled` / `max_video_size_mb` (yaml) | | Toggle video downloads; skip videos larger than N MiB (default 1024). |
+| `compress` (yaml) | | Lossless-first compression ladder for oversized media (enabled by default; disabling degrades oversized media to a text notice). |
+| `http.cookies_file` (yaml) | video only | Netscape-format cookies.txt exported from a logged-in Civitai browser session — required for real video downloads. |
+| `download.keep_days` / `download.max_total_gb` (yaml) | | Cache retention: prune files older than N days or the oldest files once total size exceeds the cap (default 10 GB). |
+| `data.data_dir` (yaml) | | Where per-user `seen_ids/` progress JSON lives (empty = repo dir). |
+| `incremental.*` / `reconciliation.*` (yaml) | | Page-window and daily 03:30 reconciliation tuning — see `config.yaml.example`. |
+| `interval.json` | | Runtime scan interval written by `/interval` (`{"seconds": 600}`). |
+
+See [`config.yaml.example`](config.yaml.example) for the full annotated schema.
+`.env` is auto-loaded from `~/.civitai-monitor/.env` (see `load_env.py`).
+
+**Video cookies:** the CDN needs an authenticated session for real video files.
+Export `cookies.txt` with a browser extension (e.g. *Get cookies.txt*), point
+`http.cookies_file` at it, and re-export when it expires — without it, video
+downloads fall back to cover images or text links.
+
+</details>
+
+<details>
+<summary><b>systemd Deployment &amp; Generic Backup Guide</b></summary>
+
+Install at `<install-dir>` (e.g. `/opt/civitai-monitor`) and run as `<your-user>`:
+
+```ini
+# /etc/systemd/system/civitai-bot.service
 [Unit]
-Description=Civitai Monitor Admin Bot
+Description=Civitai Monitor Bot
 After=network.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/root/civitai-monitor
-ExecStart=/usr/bin/python3 /root/civitai-monitor/civitai-bot.py
+User=<your-user>
+WorkingDirectory=<install-dir>
+ExecStart=<install-dir>/.venv/bin/python3 <install-dir>/civitai-bot.py
 Restart=always
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-SVC
+```
 
+```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now civitai-bot
 ```
 
-> **Single-instance constraint**: this service relies on local `fcntl` file
-> locks (`.monitor.lock`) for mutual exclusion. It **must run on a single
-> host as a single instance only**. Multi-host or multi-instance deployment
-> invalidates these locks and will cause **duplicate downloads and duplicate
-> pushes** to your Telegram channel.
+> [!WARNING]
+> **Single-instance constraint.** Mutual exclusion relies on a local `fcntl`
+> lock (`.monitor.lock`), so the bot must run on **one host as one instance**
+> only. Multi-host or multi-instance deployments invalidate the lock and cause
+> duplicate downloads and pushes.
 
----
+**Backup guide (generic):** keep these small files somewhere safe on your own
+backup schedule:
 
-## Video Download: Cookies Guide
+- `<install-dir>/config.yaml`, `<install-dir>/interval.json`, `<install-dir>/active_backfills.json`
+- `<install-dir>/seen_ids/` — per-user progress
+- `~/.civitai-monitor/.env` and `civitai_cookies.txt` — secrets kept outside the repo
 
-Civitai's CDN (`image.civitai.com`) requires an authenticated session (browser
-cookies) to serve real video files instead of cover images. Without cookies,
-video downloads will silently fail and only text links will be pushed.
+You can skip `downloads/` (re-downloadable cache), `.venv/` (rebuild from
+`requirements.lock`), `.git/`, and tool caches. To restore: copy the files back,
+rebuild the venv, reinstall dependencies, fix ownership, and restart the service.
 
-### Export Cookies from Browser
+</details>
 
-1. **Log in** to [civitai.com](https://civitai.com) (or civitai.red) in your browser
-   — you need an active login session.
-
-2. **Install a cookies export extension**:
-   - Chrome: [Get cookies.txt](https://chrome.google.com/webstore/detail/get-cookiestxt/bgaddhkoddajcdgocldbbfleckgcbcid)
-   - Firefox: [Get cookies.txt](https://addons.mozilla.org/en-US/firefox/addon/get-cookies-txt/)
-
-3. **Export**:
-   - Go to civitai.com
-   - Click the extension icon → **Export** → save as **Netscape format**
-   - You should get a file named something like `cookies.txt`
-
-4. **Place the file** in your project directory (e.g. `~/civitai-monitor/civitai_cookies.txt`)
-
-5. **Configure** in `config.yaml`:
-   ```yaml
-   http:
-     cookies_file: "/path/to/civitai_cookies.txt"
-   ```
-
-> **Note:** Cookies expire after some time. If video downloads stop working,
-> re-export a fresh cookies.txt from your browser.
-
-### How It Works
-
-With cookies:
-```
-image.civitai.com/xxx.mp4  ──301──►  B2 /default (cover)
-                                       │ rewrite to /original
-                                       ▼
-                                    B2 /original (real video ✅)
-```
-
-Without cookies:
-```
-image.civitai.com/xxx.mp4  ──301──►  B2 /default (cover JPEG only ❌)
-```
-
----
-
-## Configuration Reference
-
-See [`config.yaml.example`](config.yaml.example) for the full schema. Key sections:
-
-| Section | Purpose |
-|---------|---------|
-| `mode` | `incremental` (default) or `full` (backfill) |
-| `nsfw` | `sfw_only`, `nsfw_only`, or `both` (default) |
-| `video_enabled` | Enable/disable video detection and download |
-| `max_video_size_mb` | Skip videos larger than this (default: 1024) |
-| `compress` | Lossless-first compression of oversized photos/videos before upload |
-| `api` | API base URL, page size |
-| `download` | Output directory, URL size-suffix replacements, cache retention |
-| `http` | User-Agent, Referer, extra headers, **cookies_file** |
-| `telegram` | **Required** — bot token and chat/channel ID |
-| `authorized_users` | List of Telegram user IDs allowed to control the Bot |
-| `subscriptions` | **Per-Telegram-user** watch lists (keyed by Telegram user ID) |
-| `data` | Paths for `seen_ids` directory |
-
----
-
-## Admin Bot Commands
-
-| Command | Description |
-|---------|-------------|
-| `/add <name\|url\|@name>` | Add a user to your watch list (auto-validates existence) |
-| `/remove` | Interactive button list with pagination to remove a user |
-| `/list` | Show your watched users |
-| `/status` | Show monitor status (disk, seen count, config) |
-| `/mode <incremental\|full>` | Switch scan mode |
-| `/nsfw <sfw_only\|nsfw_only\|both>` | Switch NSFW filter |
-| `/cleanup [days]` | Manually clean cached images older than N days |
-| `/scan` | Trigger an immediate incremental scan |
-| `/backfill` | Interactive button list to backfill a user's full gallery |
-| `/interval <min>` | Set scan interval in minutes (default: 10) |
-| `/help` | Show all commands |
-
-Each Telegram user only sees and manages their **own** subscriptions.
-
----
-
-## Automating
-
-The bot (`civitai-bot.service`) runs scheduled scans automatically using its internal scheduler. See the **Scheduled Scanning** section above for details on configuring the scan interval via the bot.
-
-The old cron method is still technically possible but no longer the recommended way.
-
----
-
-## File Structure
+<details>
+<summary><b>Project Layout &amp; Local Testing</b></summary>
 
 ```
 civitai-monitor/
-├── monitor.py              # Main monitor script (incremental + full backfill)
-├── civitai-bot.py          # Admin Bot (manage via Telegram)
-├── backfill-memory-wrapper.py  # Stricter memory limit for backfill process
-├── load_env.py             # .env file loader
-├── config.yaml.example     # Configuration template (all placeholders)
-├── requirements.txt        # Python dependencies
-├── LICENSE                 # MIT
-├── README.md               # English
-├── README.zh-CN.md         # Chinese
-├── .gitignore
-├── tests/                  # Unit tests
-└── .github/workflows/      # CI/CD (lint + test)
+├── monitor.py                  # scanner: incremental + full backfill
+├── civitai-bot.py              # admin bot + built-in scheduler
+├── bot_ui.py                   # bot UI helpers
+├── civitai_client.py           # Civitai API client
+├── state_store.py              # per-user seen_ids / pushed_ids state
+├── telegram_media.py           # Telegram upload / compression pipeline
+├── media_compress.py           # lossless-first compression ladder
+├── config_io.py                # config.yaml read/write
+├── load_env.py                 # .env loader
+├── backfill-memory-wrapper.py  # backfill launch wrapper (os.execv passthrough to monitor.py)
+├── config.yaml.example         # annotated config template
+├── requirements.txt / requirements.lock
+├── assets/                     # logo (dark & light)
+├── tests/                      # pytest suite
+└── .github/workflows/          # CI (lint + tests)
 
-# Runtime (auto-generated, not in repo):
-# ├── config.yaml           # Your configuration
-# ├── active_backfills.json # Backfill recovery state
-# ├── interval.json         # Scan interval setting
-# ├── civitai_cookies.txt   # Browser cookies for video auth
-# ├── seen_ids/             # Per-user download progress
-# ├── downloads/            # Cached images & videos
-# ├── optimization_logs/    # Audit & optimization documents
-# └── monitor.log*          # Log files (journald primary)
+# Runtime files (git-ignored):
+#   config.yaml · interval.json · active_backfills.json
+#   civitai_cookies.txt · seen_ids/ · downloads/ · monitor.log*
 ```
 
----
-
-## Backup & restore
-
-### What is backed up
-
-A root crontab job runs every **Sunday 04:00 UTC** and writes a compressed
-archive to `/srv/backups/civitai-monitor/YYYYMMDD.tar.gz` (mode 0600):
-
-```
-umask 077; tar czf /srv/backups/civitai-monitor/$(date +%Y%m%d).tar.gz \
-  --exclude=downloads --exclude=__pycache__ --exclude=.git \
-  --exclude=.pytest_cache --exclude=.ruff_cache --exclude=.venv \
-  /srv/civitai-monitor/ /srv/.civitai-monitor/
-```
-
-- `/srv/civitai-monitor/` — code, `config.yaml`, per-subscription state
-  (`seen_ids/`) and bot runtime files (`interval.json`,
-  `active_backfills.json`, `reconciliation_status.json`, ...).
-- `/srv/.civitai-monitor/` — secrets kept outside the repo: `.env`,
-  `telegram-api.env`, `civitai_cookies.txt`.
-- Excluded on purpose: `downloads/` (re-downloadable cache), `.venv/`
-  (recreatable from `requirements.lock`), `.git/` and tool caches.
-- Archives older than 90 days are deleted by the same cron line.
-
-> **GNU tar gotcha:** `--exclude` is a positional option. Placed AFTER the
-> file operands it silently matches nothing (and tar exits non-zero, which
-> also breaks any `&&`-chained cleanup such as the 90-day prune below).
-> Keep the excludes BEFORE the operands.
-
-### Restoring from a backup
-
-Verified by drill on 2026-09-13: an archive made with the excludes above
-contains `seen_ids/*.json`, `config.yaml`, the state JSON files and
-`/srv/.civitai-monitor/.env`, and `.venv/` / `downloads/` are absent.
+Local testing:
 
 ```bash
-# 1. Unpack — the archive stores srv/... paths relative to /
-mkdir -p /tmp/restore && cd /tmp/restore
-tar xzf /srv/backups/civitai-monitor/YYYYMMDD.tar.gz
-
-# 2. Copy the trees back
-cp -a /tmp/restore/srv/civitai-monitor /srv/
-cp -a /tmp/restore/srv/.civitai-monitor /srv/
-
-# 3. Rebuild the virtualenv (excluded from the backup)
-cd /srv/civitai-monitor
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.lock
-
-# 4. Fix ownership and restart the service
-chown -R civitai:civitai /srv/civitai-monitor /srv/.civitai-monitor
-systemctl restart civitai-bot
+.venv/bin/pip install -r requirements.txt pytest
+.venv/bin/python -m pytest tests/
 ```
 
----
+</details>
 
-## Disclaimer & License
+## Disclaimer
 
-### Disclaimer
+> For **educational and personal use only**. Downloaded media belongs to its
+> creators; comply with Civitai's
+> [Terms of Service](https://civitai.com/terms-of-service) and each work's
+> license. Do not redistribute downloaded content without the creator's
+> explicit permission.
 
-> This software is provided for **educational and personal use only**.
->
-> - All images and videos downloaded by this tool are the intellectual
->   property of their respective creators.
-> - Users are responsible for complying with Civitai's
->   [Terms of Service](https://civitai.com/terms-of-service) and the
->   individual licensing terms attached to each artwork.
-> - Do **not** redistribute downloaded content without the creator's
->   explicit permission.
-> - The authors assume no liability for misuse of this tool.
-
-### License
+## License
 
 [MIT](LICENSE) © dorokuma
-
----
-
-## Scheduled Scanning
-
-The bot (`civitai-bot.service`) runs `monitor.py --mode incremental` on a configurable schedule as a background task, using `interval.json` to determine the frequency.
-
-### User-configurable interval
-
-Users can change the scan frequency from Telegram using the bot command:
-
-```
-/interval 15
-```
-
-- **Default**: 10 minutes (600 seconds)
-- **Allowed range**: 1 ~ 1440 minutes
-- The change takes effect on the next scan cycle.
-
-### Files
-
-| File | Purpose |
-|------|---------|
-| `interval.json` | Current user interval (`{"seconds": 600}`) |
