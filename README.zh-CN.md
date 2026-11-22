@@ -1,330 +1,256 @@
-# Civitai Monitor
+<div align="center">
 
-<p align="center">
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">中文</a>
-</p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.svg">
+  <img alt="civitai-monitor logo" src="assets/logo-light.svg" width="64" height="64">
+</picture>
 
-![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
+# civitai-monitor
 
-监控指定 Civitai 用户的图片和视频更新，自动下载原图/原视频并通过 Telegram Bot 推送到频道。
+**在 Telegram 里自动追更 Civitai 创作者——自动抓最高清原图与原视频，超限智能压缩不丢消息，1 GB 小内存机器也能稳稳跑。**
 
----
+![Python](https://img.shields.io/badge/Python-3.10%2B-18181b?style=flat-square&logo=python&logoColor=white)
+![Telegram Bot](https://img.shields.io/badge/Telegram-Bot-18181b?style=flat-square&logo=telegram&logoColor=white)
+![1 GB VPS](https://img.shields.io/badge/1%20GB-VPS%20Friendly-18181b?style=flat-square&logo=linux&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-18181b?style=flat-square&logo=opensourceinitiative&logoColor=white)
 
-## 功能特性
+[快速开始](#quick-start) · [核心特性](#highlights) · [Bot 命令](#bot-commands) · [进阶配置](#more-details)
 
-- 🔍 调用 Civitai 公开 REST API（图片无需 API Key）
-- 👥 **多用户监控** — 可同时监控任意数量的创作者
-- 🖼 **最高分辨率原图** — 自动将 `width=*` 替换为 `width=original`
-- 🎥 **视频下载** — 通过 Backblaze B2 CDN 获取全高清视频（需浏览器 cookies 认证，见下方教程）
-- 🤖 **Telegram 管理 Bot** — 通过聊天命令交互管理，支持按钮选择和翻页
-- 🔀 **两种扫描模式**：`incremental`（增量，适合定时任务）或 `full`（全量回填）
-- 🚦 **NSFW 过滤**：`sfw_only`（仅非敏感）、`nsfw_only`（仅敏感）、`both`（全部）
-- 👤 **多用户隔离** — 每个 Telegram 用户有独立的订阅列表和独立的下载进度（`seen_ids_{tg_id}_{username}.json`）
-- 🔐 **多号授权** — `authorized_users` 列表支持多个 Telegram ID 管理 Bot
-- 🧠 **智能用户名解析** — 支持纯用户名、`@用户名`、Civitai 主页链接（`civitai.com/user/xxx`、`civitai.red/user/xxx`）——非 Civitai 域名一律拒绝
-- ✅ **用户存在性验证** — 调 Civitai API 确认用户存在且有公开作品后才添加
-- 💾 **去重机制** — 双层保存（每track结束 + main最终保存），防止定时任务竞态导致重复推送
-- 📋 **推送审计日志** — 每次推送记录 ID、文件名、下载状态和推送结果
-- 🧹 **自动清理** — 自动删除超过 `keep_days` 天的缓存文件，或当总大小超过 `max_total_gb`（默认 10GB）时清理最旧文件
-- 🗂 **交互式取消关注和回填** — 按钮选择用户，支持分页
+[English](README.md) · **简体中文**
 
----
+</div>
 
-## 架构
-
-```
-                   ┌──────────────────────┐
-                   │   Telegram Bot        │
-                   │   (civitai-bot.py)    │
-                   │   - /add /remove      │
-                   │   - /list /status     │
-                   │   - /backfill /scan   │
-                   └──────┬───────────────┘
-                          │ 命令
-                          ▼
-  ┌─────────────────────────────────────────────┐
-  │  Cron: monitor.py (每10分钟)                  │
-  │                                              │
-  │  1. 按 Telegram 用户加载订阅列表               │
-  │  2. 通过 Civitai API 拉取最新图片              │
-  │  3. 对比该用户的 seen_ids 去重                 │
-  │  4. 下载新作品（图片 + 视频）                   │
-  │  5. 通过 Bot API 推送到 Telegram              │
-  │  6. 立即保存该用户进度                         │
-  └─────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    A["Civitai 创作者"] --> B["内置调度器 / Bot 命令"]
+    B --> C["原图 &amp; 高清视频下载器"]
+    C --> D["智能无损优先压缩<br/>(图 >10 MiB / 视频 >2 GiB)"]
+    D --> E["Telegram 频道"]
 ```
 
-**多用户隔离设计：**
-```
-config.yaml                       磁盘
-──────────────────────────────────────────────
-subscriptions:                      seen_ids/
-  YOUR_TELEGRAM_USER_ID: [Username] ├ seen_ids_YOUR_TG_ID_Username.json
-  ANOTHER_USER_ID: [Username2]      └ seen_ids_ANOTHER_ID_Username2.json
-```
+<a id="highlights"></a>
 
-**运维要点（v1.1.3+）：**
+## 核心特性
 
-- **多用户订阅 vs 单一推送频道**：每个授权 Telegram 用户可维护各自的*订阅列表*，但媒体推送到配置里**唯一的** `telegram.chat_id`（不是按订阅者每人一个私聊）。
-- **全局 `/mode` 与 `/nsfw`**：影响整个扫描器（全部订阅者），不是仅限下命令的管理员。
-- **`seen_ids` vs `pushed_ids`**：是否“已送达”以 **`pushed_ids` 去重为准**；`seen_ids` 主要记录扫描进度/缓存，发送失败时两者可能不一致。
-- **Token 双轨**：优先环境变量 `CIVITAI_BOT_TOKEN`（`load_env.py` 和/或 systemd `EnvironmentFile`）。勿把真 token 写进 yaml —— `write_config` 落盘时会 strip `bot_token`。
+| | |
+|---|---|
+| 📸 **无损原图 + 真高清视频** | 自动重写 URL 拉取最高清原图与 Backblaze B2 上的真高清视频——不是封面缩略图。 |
+| 🤖 **Bot 按钮分页管理** | 订阅 / 取消 / 回填 / 手动扫描 / 调间隔，全部通过分页交互按钮完成；每个 Telegram 用户的订阅列表互相隔离。 |
+| 🗜 **智能压缩不丢帖** | 图片超过 10 MiB、视频超过 2 GiB 时自动走无损优先压缩梯队并兜底——消息一定能送到频道。 |
+| 🪶 **1 GB 小内存友好** | 内存由 systemd（如 `MemoryMax`）静态约束，流式/轻量处理，OOM 断点续接回填，`fcntl` 文件锁防重推。 |
 
----
+<a id="quick-start"></a>
 
 ## 快速开始
 
-### 1. 准备工作
+### 1. 安装
 
 ```bash
 git clone https://github.com/dorokuma/civitai-monitor.git
 cd civitai-monitor
-pip install -r requirements.txt
-# 视频压缩需要 PATH 上有 ffmpeg/ffprobe（如 apt-get install -y ffmpeg）
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+# 视频压缩需要 PATH 上有 ffmpeg/ffprobe，例如：
+sudo apt-get install -y ffmpeg
 ```
 
-### 2. 配置
+### 2. 配置 `.env`
 
 ```bash
 cp config.yaml.example config.yaml
-# 编辑 config.yaml — 填入 Bot Token、Chat ID 和订阅列表
+
+mkdir -p ~/.civitai-monitor
+cat > ~/.civitai-monitor/.env <<'ENV'   # load_env.py 会自动加载
+CIVITAI_BOT_TOKEN=<你的-bot-token>
+ENV
+chmod 600 ~/.civitai-monitor/.env
+
+# 编辑 config.yaml → 填入 chat_id、authorized_users、subscriptions
 ```
 
-最小配置示例：
+最小 `config.yaml`：
 
 ```yaml
 telegram:
-  bot_token: "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
-  chat_id: "-1001234567890"
+  chat_id: "<你的-telegram-chat-id>"
 
 authorized_users:
-  - 123456789
+  - <你的-telegram-user-id>
 
 subscriptions:
-  '123456789':
-    - name: "YourTargetUser"
+  '<你的-telegram-user-id>':
+    - name: "<目标-civitai-用户名>"
 ```
 
-### 2b. 命令行参数
+> [!NOTE]
+> `subscriptions` 以 **Telegram 用户 ID** 为 key，不是 Civitai 用户名。
+> 在 Telegram 上给 @userinfobot 发消息即可查到数字用户 ID。
+
+### 3. 启动 Bot 与内置调度器
 
 ```bash
-python3 monitor.py                          # 使用 config.yaml（自动查找）
-python3 monitor.py --config /path/to.yaml   # 指定自定义配置文件
-python3 monitor.py --mode full              # 覆盖运行模式（incremental/full）
-python3 monitor.py --user username          # 只处理指定用户名
-python3 monitor.py --mode full --user xxx   # 全量回填单个用户
+.venv/bin/python3 civitai-bot.py
 ```
 
-`--mode` 和 `--user` 会临时覆盖 config.yaml 中的值，不影响配置文件本身。
-管理 Bot 触发回填时就是用 `monitor.py --mode full --user xxx` 这种方式，
-不再修改 config.yaml，安全可靠。
+> [!NOTE]
+> Bot 的**内置调度器**已取代旧的 cron 方案——按可配置的间隔（默认 10 分钟，
+> 用 `/interval` 调整）自动运行 `monitor.py` 增量扫描。无需再配置 crontab。
 
-### 3. 增量模式运行（默认）
+<a id="bot-commands"></a>
 
-```bash
-python3 monitor.py
-```
+## Bot 命令
 
-只检查最新图片，后续运行只增量拉取新作品。
-
-### 4. 全量回填（首次拉取全部历史）
-
-```yaml
-# 在 config.yaml 中设置：
-mode: "full"
-```
-
-```bash
-python3 monitor.py
-```
-
-遍历用户所有历史页面。一次性拉齐全量后，切换回 `incremental` 模式用于定时任务。
-
-### 5. 运行管理 Bot（可选）
-
-```bash
-python3 civitai-bot.py
-```
-
-或者用 systemd 托管：
-
-```bash
-sudo tee /etc/systemd/system/civitai-bot.service <<'SVC'
-[Unit]
-Description=Civitai Monitor Admin Bot
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/root/civitai-monitor
-ExecStart=/usr/bin/python3 /root/civitai-monitor/civitai-bot.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-SVC
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now civitai-bot
-```
-
-> **单实例约束**：本服务依赖本地 `fcntl` 文件锁（`.monitor.lock`）实现互斥，
-> **只能单主机单实例运行**。多主机或多实例部署会导致锁失效，引发
-> **重复下载与重复推送**。
-
----
-
-## 视频下载：Cookies 获取教程
-
-Civitai 的 CDN（`image.civitai.com`）需要登录态（浏览器 cookies）才能返回真正的视频文件。没有 cookies 时，视频下载会失败，只会推送文本链接。
-
-### 从浏览器导出 Cookies
-
-1. **登录** [civitai.com](https://civitai.com)（或 civitai.red）— 需要保持登录状态
-
-2. **安装 Cookies 导出扩展**：
-   - Chrome：[Get cookies.txt](https://chrome.google.com/webstore/detail/get-cookiestxt/bgaddhkoddajcdgocldbbfleckgcbcid)
-   - Firefox：[Get cookies.txt](https://addons.mozilla.org/en-US/firefox/addon/get-cookies-txt/)
-
-3. **导出**：
-   - 打开 civitai.com
-   - 点扩展图标 → **Export** → 选择 **Netscape 格式** 保存
-   - 得到一个类似 `cookies.txt` 的文件
-
-4. **放到项目目录**（如 `~/civitai-monitor/civitai_cookies.txt`）
-
-5. **在 `config.yaml` 中配置**：
-   ```yaml
-   http:
-     cookies_file: "/path/to/civitai_cookies.txt"
-   ```
-
-> **注意：** Cookies 会过期。如果视频下载突然失效，重新导出一份新的 cookies 即可。
-
-### 工作原理
-
-有 cookies 时：
-```
-image.civitai.com/xxx.mp4  ──301──►  B2 /default（封面图）
-                                       │ 替换为 /original
-                                       ▼
-                                    B2 /original（真视频 ✅）
-```
-
-无 cookies 时：
-```
-image.civitai.com/xxx.mp4  ──301──►  B2 /default（仅封面图 JPEG ❌）
-```
-
----
-
-## 配置说明
-
-完整配置项参见 [`config.yaml.example`](config.yaml.example)。核心配置段：
-
-| 配置段 | 用途 |
-|--------|------|
-| `mode` | `incremental`（增量，默认）或 `full`（全量回填） |
-| `nsfw` | `sfw_only`（仅非敏感）、`nsfw_only`（仅敏感）、`both`（全部） |
-| `video_enabled` | 启用/禁用视频检测和下载 |
-| `max_video_size_mb` | 跳过大于此值的视频（默认 1024MB） |
-| `compress` | 超限图片/视频上传前的无损优先压缩配置 |
-| `api` | API 地址、每页数量 |
-| `download` | 下载目录、URL 尺寸后缀、**缓存保留策略**（`keep_days` + `max_total_gb`） |
-| `http` | User-Agent、Referer、自定义请求头、**cookies_file** |
-| `telegram` | **必填** — Bot Token 和频道/群组 Chat ID |
-| `authorized_users` | 允许控制 Bot 的 Telegram 用户 ID 列表 |
-| `subscriptions` | **按 Telegram 用户隔离**的订阅列表（以 TG 用户 ID 为 key） |
-| `data` | 数据目录路径 |
-
----
-
-## 管理 Bot 命令
-
-| 命令 | 说明 |
+| 命令 | 作用 |
 |------|------|
-| `/add <用户名\|链接\|@名>` | 增加监控对象（自动验证用户是否存在） |
-| `/remove` | 交互式按钮列表，支持翻页，点击取消关注 |
-| `/list` | 查看当前号的监控列表 |
-| `/status` | 查看运行状态（磁盘、已处理数、配置） |
-| `/mode <incremental\|full>` | 切换运行模式 |
-| `/nsfw <sfw_only\|nsfw_only\|both>` | 切换 NSFW 过滤 |
-| `/cleanup [天数]` | 手动清理 N 天前的缓存 |
+| `/add <用户名\|链接\|@名>` | 添加监控——支持纯用户名、`@名`、`civitai.com/user/…` 链接，添加前自动验证用户存在 |
+| `/remove` | 分页按钮列表，点选取消关注 |
+| `/list` | 查看你的订阅列表 |
+| `/status` | 运行状态：磁盘、已处理数、配置 |
 | `/scan` | 立即执行一次增量扫描 |
-| `/backfill` | 交互式按钮列表，选择用户全量回填 |
-| `/interval <分钟>` | 设置扫描间隔（默认 10 分钟） |
-| `/help` | 显示所有命令说明 |
+| `/backfill` | 分页按钮列表，回填某创作者全部历史 |
+| `/interval <分钟>` | 设置扫描间隔（默认 10，范围 1–1440） |
+| `/mode <incremental\|full>` | 切换扫描模式（全局生效） |
+| `/nsfw <sfw_only\|nsfw_only\|both>` | 切换 NSFW 过滤（全局生效） |
+| `/cleanup [天数]` | 清理 N 天前的缓存文件 |
+| `/stop` | 终止当前定时扫描并释放 `.monitor.lock`（方便立即开始回填等操作） |
+| `/help` | 显示全部命令 |
 
-每个 Telegram 号只能看到和管理**自己**的订阅。
-
----
-
-## 定时自动化
-
-```bash
-# 每 10 分钟执行一次（config.yaml 中需设置 mode: "incremental"）
-*/10 * * * * cd ~/civitai-monitor && python3 monitor.py 
-```
-
----
-
-## 文件结构
-
-```
-civitai-monitor/
-├── monitor.py              # 主监控脚本（增量 + 全量回填）
-├── civitai-bot.py          # 管理 Bot（通过 Telegram 管理监控）
-├── backfill-memory-wrapper.py  # Backfill 进程内存限制包装器
-├── load_env.py             # .env 文件加载器
-├── config.yaml.example     # 配置模板（全部占位符）
-├── requirements.txt        # Python 依赖
-├── LICENSE                 # MIT 许可证
-├── README.md               # 英文说明
-├── README.zh-CN.md         # 中文说明
-├── .gitignore
-├── tests/                  # 单元测试
-└── .github/workflows/      # CI/CD（代码检查 + 测试）
-
-# 运行时生成（不在仓库中）：
-# ├── config.yaml           # 你的配置
-# ├── active_backfills.json # Backfill 恢复状态
-# ├── interval.json         # 扫描间隔设置
-# ├── civitai_cookies.txt   # 浏览器 cookies（视频认证用）
-# ├── seen_ids/             # 各用户的下载进度
-# ├── downloads/            # 缓存图片和视频
-# ├── optimization_logs/    # 审计与优化方案文档
-# └── monitor.log*          # 日志文件（主要走 journald）
-```
-
----
+每个授权 Telegram 用户只能看到和管理**自己**的订阅；
+推送目标始终是配置里唯一的 `telegram.chat_id` 频道。
 
 ## 最低硬件要求
 
 | 项目 | 要求 |
 |------|------|
-| **最低内存** | 1 GB（Full Backfill 时内存可达 1.7GB，1GB 机器可正常运行但建议 2GB+） |
-| **推荐内存** | 2 GB 及以上 |
-| **动态内存限制** | Bot 启动时自动根据总内存计算上限（≤1GB 取 55%，1-2GB 取 60%，≥2GB 取 65%，上限 1.8GB） |
-| **磁盘** | 根据订阅用户数量和缓存策略而定，建议预留 10GB 以上 |
+| **内存（最低）** | 1 GB——全量回填峰值接近 1.7 GB，1 GB 能跑但需留意 OOM |
+| **内存（推荐）** | 2 GB 及以上 |
+| **内存约束** | 进程内不设内存上限——需要时用 systemd（如 `MemoryMax`）静态约束；小内存运行依赖流式/轻量处理 |
+| **磁盘** | 取决于订阅量与缓存策略（`keep_days` + `max_total_gb`），建议预留 10 GB 以上 |
+| **Python** | 3.10+ |
+| **外部工具** | 视频压缩需要 `ffmpeg`/`ffprobe` |
 
-> **注意**：Full Backfill 时内存占用较高，低内存机器（1GB）请注意观察是否触发 OOM。已实现 Backfill 自动续接机制，因内存不足被杀死后可自动续接。
+> [!TIP]
+> 全量回填被 OOM 杀掉并不可怕——断点续接机制会自动从被杀的位置继续。
 
----
+<a id="more-details"></a>
 
-## 免责声明 & 许可证
+## 进阶配置与部署
 
-### 免责声明
+<details>
+<summary><b>完整环境变量参考</b></summary>
 
-> 本软件仅供**学习和个人使用**。
->
-> - 本工具下载的所有图片和视频均为其各自创作者的知识产权。
-> - 使用者有责任遵守 Civitai 的[服务条款](https://civitai.com/terms-of-service)以及每件作品的单独许可协议。
-> - **未经创作者明确许可，请勿重新分发下载的内容。**
-> - 作者不对本工具的滥用行为承担任何责任。
+| 变量 | 必填 | 说明 |
+|------|------|------|
+| `CIVITAI_BOT_TOKEN` | ✅ | Telegram Bot Token。优先于 `config.yaml`——`write_config` 保存 yaml 时会剥离 `bot_token`。 |
+| `telegram.chat_id`（yaml） | ✅ | 接收推送的频道/群组/私聊 ID。全部订阅者共用这一个推送目标。 |
+| `authorized_users`（yaml） | ✅ | 允许给 Bot 下命令的 Telegram 用户 ID。 |
+| `subscriptions`（yaml） | ✅ | 按 Telegram 用户隔离的订阅列表，以 TG 用户 ID 为 key。 |
+| `mode`（yaml） | | `incremental`（默认）或 `full` 全量回填。 |
+| `nsfw`（yaml） | | `sfw_only` / `nsfw_only` / `both`（默认）。 |
+| `video_enabled` / `max_video_size_mb`（yaml） | | 开关视频下载；跳过大于 N MiB 的视频（默认 1024）。 |
+| `compress`（yaml） | | 超限媒体的无损优先压缩梯队（默认开启；关闭后超限媒体降级为文本提示）。 |
+| `http.cookies_file`（yaml） | 仅视频 | 从已登录 Civitai 的浏览器导出的 Netscape 格式 cookies.txt——真视频下载必需。 |
+| `download.keep_days` / `download.max_total_gb`（yaml） | | 缓存保留：删 N 天前的文件，或总大小超上限（默认 10 GB）时删最旧的。 |
+| `data.data_dir`（yaml） | | 各用户 `seen_ids/` 进度 JSON 的存放目录（留空 = 仓库目录）。 |
+| `incremental.*` / `reconciliation.*`（yaml） | | 分页窗口与每日 03:30 对账扫描调优——见 `config.yaml.example`。 |
+| `interval.json` | | `/interval` 写入的运行时扫描间隔（`{"seconds": 600}`）。 |
 
-### 许可证
+完整带注释的 schema 见 [`config.yaml.example`](config.yaml.example)。
+`.env` 默认从 `~/.civitai-monitor/.env` 自动加载（见 `load_env.py`）。
+
+**视频 cookies：** CDN 要登录态才返回真视频文件。用浏览器扩展（如 *Get cookies.txt*）
+导出 `cookies.txt`，把 `http.cookies_file` 指过去即可；cookies 过期后重新导出。
+没有它，视频只会拿到封面图或退化为文本链接。
+
+</details>
+
+<details>
+<summary><b>systemd 部署与通用备份建议</b></summary>
+
+以 `<install-dir>` 为例安装（如 `/opt/civitai-monitor`），用 `<your-user>` 运行：
+
+```ini
+# /etc/systemd/system/civitai-bot.service
+[Unit]
+Description=Civitai Monitor Bot
+After=network.target
+
+[Service]
+Type=simple
+User=<your-user>
+WorkingDirectory=<install-dir>
+ExecStart=<install-dir>/.venv/bin/python3 <install-dir>/civitai-bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now civitai-bot
+```
+
+> [!WARNING]
+> **单实例约束。** 互斥依赖本地 `fcntl` 文件锁（`.monitor.lock`），
+> 只能在**单台主机上以单实例**运行。多主机或多实例部署会让锁失效，
+> 导致重复下载与重复推送。
+
+**通用备份建议：** 按你自己的备份计划保管以下小文件即可：
+
+- `<install-dir>/config.yaml`、`<install-dir>/interval.json`、`<install-dir>/active_backfills.json`
+- `<install-dir>/seen_ids/` —— 各用户下载进度
+- `~/.civitai-monitor/.env` 与 `civitai_cookies.txt` —— 仓库外的密钥文件
+
+可跳过：`downloads/`（可重下的缓存）、`.venv/`（用 `requirements.lock` 重建）、
+`.git/` 与工具缓存。恢复时把文件拷回、重建 venv、装依赖、修属主、重启服务即可。
+
+</details>
+
+<details>
+<summary><b>目录结构与本地测试</b></summary>
+
+```
+civitai-monitor/
+├── monitor.py                  # 扫描器：增量 + 全量回填
+├── civitai-bot.py              # 管理 Bot + 内置调度器
+├── bot_ui.py                   # Bot UI 辅助
+├── civitai_client.py           # Civitai API 客户端
+├── state_store.py              # 各用户 seen_ids / pushed_ids 状态
+├── telegram_media.py           # Telegram 上传 / 压缩流水线
+├── media_compress.py           # 无损优先压缩梯队
+├── config_io.py                # config.yaml 读写
+├── load_env.py                 # .env 加载器
+├── backfill-memory-wrapper.py  # 回填启动包装脚本（os.execv 透传 monitor.py）
+├── config.yaml.example         # 带注释的配置模板
+├── requirements.txt / requirements.lock
+├── assets/                     # Logo（暗色 & 亮色）
+├── tests/                      # pytest 测试
+└── .github/workflows/          # CI（lint + 测试）
+
+# 运行时文件（已被 git 忽略）：
+#   config.yaml · interval.json · active_backfills.json
+#   civitai_cookies.txt · seen_ids/ · downloads/ · monitor.log*
+```
+
+本地测试：
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt pytest
+.venv/bin/python -m pytest tests/
+```
+
+</details>
+
+## 免责声明
+
+> 仅供**学习与个人使用**。下载的媒体版权归创作者所有；请遵守 Civitai
+> [服务条款](https://civitai.com/terms-of-service)与各作品的授权协议。
+> 未经创作者明确许可，请勿再分发下载内容。
+
+## 许可证
 
 [MIT](LICENSE) © dorokuma
