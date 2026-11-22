@@ -2,6 +2,14 @@
 
 This file follows the [Keep a Changelog](https://keepachangelog.com/) format, and version numbers follow [SemVer](https://semver.org/).
 
+## [1.8.0] - 2026-11-22
+
+### Changed
+- **Enforce strict at-most-once Telegram push delivery**: replace best-effort post-send bookkeeping with lock-protected write-ahead claiming (`claim_push_slot` / `rollback_push_slot`) backed by a `chat_id`-scoped global ledger (`pushed_chat_<chat_id>.json`) with automatic first-use migration of historical `pushed_ids_*.json` and legacy `inflight`/`pending` files.
+- **Fail-closed state reads**: corrupt or unreadable `pushed_*.json` or legacy `inflight`/`pending` files now raise `StateReadError`, aborting the scan without overwriting or deleting damaged files.
+- **Explicit four-state delivery outcomes (`SendOutcome`)**: remove automatic retries on `5xx` and generic transport errors (keep `429` retry only with a 60s `Retry-After` cap and JSON `parameters.retry_after` fallback), forbid text fallback on `5xx`/`408`/`429`/uncertain failures, split `(connect, read)` timeouts across all endpoints (`sendMediaGroup` `(10, 180)`, `sendVideo` `(10, 600)`, `sendMessage` `(10, 60)`), and pre-compress media before claiming with guaranteed `finally` cleanup.
+- **Eliminate duplicate-push retry loops**: remove `_send_transient_download_failure` Telegram notices (transient download failures log warnings and retry silently on the next scan), set `PENDING_MAX_RETRIES = 0`, isolate per-creator `hole_window_items` from foreign creator IDs while converging cross-subscriber scans via `page_ids & chat_pushed`, and switch backlog alerts to `SendOutcome`.
+
 ## [1.7.0] - 2026-09-20
 
 ### Added
