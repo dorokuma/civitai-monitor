@@ -358,8 +358,8 @@ class TestTelegramMediaAntiDuplicate:
         monkeypatch.setattr(tm.requests, "post", lambda *a, **k: FakeResp())
         text_calls: list = []
         monkeypatch.setattr(
-            tm, "_send_telegram_text",
-            lambda *a, **k: text_calls.append(1) or True,
+            tm, "_send_telegram_text_outcome",
+            lambda *a, **k: text_calls.append(1) or tm.SendOutcome.DELIVERED_OK,
         )
         ok = tm._send_telegram_video("http://api/botT", "chat", "caption", video)
         assert ok is True
@@ -1280,7 +1280,8 @@ class TestIncrementalWindowDecouplingAndBacklogAlert:
         def fake_fetch(*args, **kwargs):
             return pages.pop(0)
 
-        with patch("monitor._fetch_and_process_page", side_effect=fake_fetch),              patch("monitor.time.sleep"),              patch("monitor.send_to_telegram") as mock_tg,              patch("monitor.save_seen_ids"),              caplog.at_level(logging.WARNING, logger="civitai-monitor"):
+        with patch("monitor._fetch_and_process_page", side_effect=fake_fetch),              patch("monitor.time.sleep"),              patch("monitor._send_telegram_text_outcome") as mock_tg,              patch("monitor.save_seen_ids"),              caplog.at_level(logging.WARNING, logger="civitai-monitor"):
+            mock_tg.return_value = m.SendOutcome.DELIVERED_OK
             m.run_incremental(
                 "alice",
                 seen_ids=set(),
@@ -1324,7 +1325,7 @@ class TestIncrementalWindowDecouplingAndBacklogAlert:
         def fake_fetch(*args, **kwargs):
             return pages.pop(0)
 
-        with patch("monitor._fetch_and_process_page", side_effect=fake_fetch),              patch("monitor.time.sleep"),              patch("monitor.send_to_telegram") as mock_tg,              patch("monitor.save_seen_ids"):
+        with patch("monitor._fetch_and_process_page", side_effect=fake_fetch),              patch("monitor.time.sleep"),              patch("monitor._send_telegram_text_outcome") as mock_tg,              patch("monitor.save_seen_ids"):
             m.run_incremental(
                 "alice",
                 seen_ids=pushed,
@@ -1383,9 +1384,10 @@ class TestIncrementalWindowDecouplingAndBacklogAlert:
 
         with patch("monitor._fetch_and_process_page", side_effect=fake_fetch), \
              patch("monitor.time.sleep"), \
-             patch("monitor.send_to_telegram") as mock_tg, \
+             patch("monitor._send_telegram_text_outcome") as mock_tg, \
              patch("monitor.save_seen_ids"), \
              caplog.at_level(logging.WARNING, logger="civitai-monitor"):
+            mock_tg.return_value = m.SendOutcome.DELIVERED_OK
             m.run_incremental(username, **kwargs)
             m.run_incremental(username, **kwargs)
 
@@ -1409,8 +1411,9 @@ class TestIncrementalWindowDecouplingAndBacklogAlert:
 
         with patch("monitor._fetch_and_process_page", side_effect=fake_fetch), \
              patch("monitor.time.sleep"), \
-             patch("monitor.send_to_telegram") as mock_tg, \
+             patch("monitor._send_telegram_text_outcome") as mock_tg, \
              patch("monitor.save_seen_ids"):
+            mock_tg.return_value = m.SendOutcome.DELIVERED_OK
             m.run_incremental(username, **kwargs)
 
         assert mock_tg.call_count == 3
@@ -1433,8 +1436,9 @@ class TestIncrementalWindowDecouplingAndBacklogAlert:
 
         with patch("monitor._fetch_and_process_page", side_effect=fake_fetch), \
              patch("monitor.time.sleep"), \
-             patch("monitor.send_to_telegram") as mock_tg, \
+             patch("monitor._send_telegram_text_outcome") as mock_tg, \
              patch("monitor.save_seen_ids"):
+            mock_tg.return_value = m.SendOutcome.DELIVERED_OK
             m.run_incremental(username, **kwargs)
             assert mock_tg.call_count == 1
 
@@ -1467,7 +1471,7 @@ class TestIncrementalWindowDecouplingAndBacklogAlert:
 
         with patch("monitor._fetch_and_process_page", side_effect=fake_fetch), \
              patch("monitor.time.sleep"), \
-             patch("monitor.send_to_telegram", side_effect=boom), \
+             patch("monitor._send_telegram_text_outcome", side_effect=boom), \
              patch("monitor.save_seen_ids"):
             m.run_incremental(username, **kwargs)
             assert calls["n"] == 1
@@ -1482,8 +1486,8 @@ class TestIncrementalWindowDecouplingAndBacklogAlert:
                 state = json.loads(path.read_text())
                 assert state.get("alice", {}).get("SFW") != _utc_today_iso()
 
-    def test_backlog_truncation_alert_send_false_does_not_burn_slot(self, tmp_path):
-        """False from send_to_telegram also leaves the slot free; success then throttles."""
+    def test_backlog_truncation_alert_definitely_not_sent_does_not_burn_slot(self, tmp_path):
+        """DEFINITELY_NOT_SENT releases today's slot; a later success throttles."""
         import json
 
         import monitor as m
@@ -1493,9 +1497,12 @@ class TestIncrementalWindowDecouplingAndBacklogAlert:
 
         with patch("monitor._fetch_and_process_page", side_effect=fake_fetch), \
              patch("monitor.time.sleep"), \
-             patch("monitor.send_to_telegram") as mock_tg, \
+             patch("monitor._send_telegram_text_outcome") as mock_tg, \
              patch("monitor.save_seen_ids"):
-            mock_tg.side_effect = [False, True]
+            mock_tg.side_effect = [
+                m.SendOutcome.DEFINITELY_NOT_SENT,
+                m.SendOutcome.DELIVERED_OK,
+            ]
             m.run_incremental(username, **kwargs)
             assert mock_tg.call_count == 1
             path = tmp_path / "backlog_truncation_alerts.json"

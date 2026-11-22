@@ -82,8 +82,16 @@ def _atomic_write(path: Path, text: str) -> None:
 
     OSError (disk full / ENOSPC, permission denied, ...) is wrapped into
     ``StateWriteError`` so every write entry point surfaces a single error
-    type to callers. A half-written tmp file is removed on failure; the
-    target file itself is never unlinked.
+    type to callers — but ONLY for failures before the rename commits. A
+    half-written tmp file is removed on failure; the target file itself is
+    never unlinked.
+
+    ``chmod(0o600)`` happens on the tmp file BEFORE the irreversible
+    rename — chmod-after-rename would briefly expose the new ledger with
+    umask permissions AND could turn an already-successful write into a
+    fake ``StateWriteError``. For the same reason a parent-directory fsync
+    failure AFTER the rename only logs a warning (the data is already
+    committed; failing now would falsely report a write error).
     """
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
@@ -91,22 +99,8 @@ def _atomic_write(path: Path, text: str) -> None:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
         tmp.replace(path)
-        try:
-            dir_fd = os.open(path.parent, os.O_RDONLY)
-        except OSError:
-            dir_fd = None
-        if dir_fd is not None:
-            try:
-                os.fsync(dir_fd)
-            except OSError as e:
-                # Filesystems without directory fsync (EINVAL/EBADF) — the
-                # rename still happened; durability is best-effort there.
-                if e.errno not in (22, 9):  # EINVAL / EBADF
-                    raise
-            finally:
-                os.close(dir_fd)
-        path.chmod(0o600)
     except OSError as e:
         # Best-effort cleanup; never mask the original write error.
         try:
@@ -116,6 +110,22 @@ def _atomic_write(path: Path, text: str) -> None:
         raise StateWriteError(
             f"OSError writing state file {path}: {e} (errno: {e.errno})"
         ) from e
+    # The rename committed — the write has succeeded. Best-effort parent-dir
+    # fsync so the rename itself is durable; any failure here (including
+    # filesystems without dir-fsync support) is a warning, never a fake
+    # StateWriteError for data already on disk.
+    try:
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+    except OSError:
+        dir_fd = None
+    if dir_fd is not None:
+        try:
+            os.fsync(dir_fd)
+        except OSError as e:
+            if e.errno not in (22, 9):  # EINVAL / EBADF
+                log.warning("Parent dir fsync failed for %s: %s", path, e)
+        finally:
+            os.close(dir_fd)
 
 
 def _safe_user_token(username: str) -> str:
@@ -244,40 +254,98 @@ def load_pushed_ids(pushed_dir: Path, tg_id: str, username: str) -> set[int]:
     return _read_int_set_strict(pushed_file_for_user(pushed_dir, tg_id, username))
 
 
-def load_chat_pushed_ids(pushed_dir: Path, chat_id: str) -> set[int]:
-    """Load the global per-chat pushed ledger — FAIL-CLOSED.
+def _read_legacy_push_state_ids_strict(path: Path) -> set[int]:
+    """Read one legacy ``inflight_push_*`` / ``pending_push_*`` file — STRICT.
 
-    On first use (no chat ledger file yet) the historical IDs of every
-    ``pushed_ids_*.json`` in ``pushed_dir`` are UNIONED into the chat ledger
-    so an upgraded install never re-pushes its history on the first scan.
-    Corrupt legacy per-user files are skipped with a warning during this
-    one-off merge; a corrupt chat ledger file itself raises StateReadError.
+    Same fail-closed contract as ``absorb_legacy_push_states``: the top
+    level must be a JSON dict and every key must coerce to ``int`` — any
+    unreadable / non-JSON / non-dict / non-int-key file raises
+    ``StateReadError`` immediately and the original is NEVER unlinked.
+    """
+    try:
+        raw = json.loads(path.read_text())
+        if not isinstance(raw, dict):
+            raise TypeError(
+                f"legacy push state top level is "
+                f"{type(raw).__name__}, not a dict"
+            )
+        return {int(k) for k in raw}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
+        raise StateReadError(
+            f"Unreadable legacy push state {path}: "
+            f"{type(e).__name__}: {e} (fail-closed: file "
+            f"kept, aborting scan — NOT resending)"
+        ) from e
+
+
+def _ensure_chat_ledger_locked(pushed_dir: Path, chat_id: str) -> set[int]:
+    """Load/init the global per-chat pushed ledger — caller holds .pushed.lock.
+
+    Single first-touch entry point shared by every pushed-ledger primitive
+    (``load_chat_pushed_ids``, ``claim_push_slot``, ``rollback_push_slot``,
+    ``absorb_legacy_push_states``) so the upgrade migration is identical no
+    matter which production caller runs first — whichever entry runs first
+    merges ALL historical IDs before the chat ledger exists, so no caller
+    can seal an empty ledger before the merge.
+
+    If ``pushed_chat_{chat_id}.json`` exists it is read strictly
+    (``StateReadError`` on corruption). If it does not exist yet — the
+    pre-upgrade layout — the IDs of EVERY ``pushed_ids_*.json`` AND every
+    legacy ``inflight_push_*.json`` / ``pending_push_*.json`` under
+    ``pushed_dir`` are unioned into it and atomically persisted under the
+    lock, so an upgraded install never re-pushes its history (nor an
+    uncertain inflight/pending item) regardless of which (tg_id, username)
+    scan runs first — including a cross-subscriber ``claim_push_slot`` that
+    runs before any ``absorb_legacy_push_states``. ANY corrupt historical
+    file raises ``StateReadError`` (fail-closed): a partial migration
+    would permanently lose unknown pushed IDs and re-push history.
+
+    The fully-parsed legacy inflight/pending files are left on disk for
+    ``absorb_legacy_push_states`` to delete once it has also folded their
+    IDs into the per-(tg_id, username) ledger — keeping this migration
+    side-effect-free for the user ledger while making ``absorb`` still
+    authoritative for legacy-file cleanup (and still idempotent).
     """
     path = pushed_chat_file(pushed_dir, chat_id)
     if path.exists():
         return _read_int_set_strict(path)
     merged: set[int] = set()
     for legacy in sorted(pushed_dir.glob("pushed_ids_*.json")):
-        try:
-            raw = json.loads(legacy.read_text())
-            if isinstance(raw, list):
-                merged.update(int(v) for v in raw)
-        except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
-            log.warning(
-                "Skipping unreadable legacy ledger %s during first-use "
-                "chat-ledger merge: %s", legacy.name, e,
-            )
+        merged.update(_read_int_set_strict(legacy))
+    for legacy in sorted(pushed_dir.glob("inflight_push_*.json")):
+        merged.update(_read_legacy_push_state_ids_strict(legacy))
+    for legacy in sorted(pushed_dir.glob("pending_push_*.json")):
+        merged.update(_read_legacy_push_state_ids_strict(legacy))
+    _atomic_write(path, json.dumps(sorted(merged), indent=2))
     if merged:
-        try:
-            _atomic_write(path, json.dumps(sorted(merged), indent=2))
-        except StateWriteError as e:
-            log.warning("Could not persist merged chat ledger %s: %s", path, e)
-        else:
-            log.info(
-                "Migrated %d historical pushed IDs into the global chat ledger %s",
-                len(merged), path.name,
-            )
+        log.info(
+            "Migrated %d historical pushed IDs into the global chat ledger %s",
+            len(merged), path.name,
+        )
     return merged
+
+
+def load_chat_pushed_ids(pushed_dir: Path, chat_id: str) -> set[int]:
+    """Load the global per-chat pushed ledger — FAIL-CLOSED.
+
+    Thin locked wrapper around ``_ensure_chat_ledger_locked``: the first-use
+    historical ``pushed_ids_*.json`` union now happens INSIDE .pushed.lock
+    so a concurrent claim can never be clobbered by a stale merge, and no
+    other entry point can race the ledger into existence without history.
+    """
+    lock_path = _save_lock_path(pushed_dir, name="pushed")
+    for attempt in range(3):
+        try:
+            with FileLock(str(lock_path), timeout=10):
+                return _ensure_chat_ledger_locked(pushed_dir, chat_id)
+        except Timeout:
+            if attempt < 2:
+                time.sleep(2)
+            else:
+                raise StateWriteError(
+                    f"Timeout loading chat pushed ledger for chat {chat_id} "
+                    f"after 3 attempts (lock: {lock_path})"
+                )
 
 
 def save_pushed_ids(pushed_dir: Path, tg_id: str, username: str, ids: set[int]) -> None:
@@ -344,7 +412,8 @@ def claim_push_slot(
     for attempt in range(3):
         try:
             with FileLock(str(lock_path), timeout=10):
-                chat_ids = _read_int_set_strict(chat_path)
+                chat_path_existed = chat_path.exists()
+                chat_ids = _ensure_chat_ledger_locked(pushed_dir, chat_id)
                 user_ids = _read_int_set_strict(user_path)
                 if item_id in chat_ids or item_id in user_ids:
                     return False
@@ -358,15 +427,27 @@ def claim_push_slot(
                 except StateWriteError:
                     # Keep the two ledgers consistent: undo the chat claim so
                     # a retry (after the write error heals) is not refused.
-                    try:
-                        _atomic_write(
-                            chat_path, json.dumps(sorted(chat_ids), indent=2)
-                        )
-                    except StateWriteError as revert_err:
-                        log.error(
-                            "Could not revert chat-ledger claim for id=%s after "
-                            "user-ledger write failure: %s", item_id, revert_err,
-                        )
+                    # Restore the pre-claim on-disk state exactly: delete the
+                    # file when the claim created it, rewrite it otherwise.
+                    if not chat_path_existed:
+                        try:
+                            chat_path.unlink(missing_ok=True)
+                        except OSError as revert_err:
+                            log.error(
+                                "Could not remove chat-ledger claim file for id=%s "
+                                "after user-ledger write failure: %s",
+                                item_id, revert_err,
+                            )
+                    else:
+                        try:
+                            _atomic_write(
+                                chat_path, json.dumps(sorted(chat_ids), indent=2)
+                            )
+                        except StateWriteError as revert_err:
+                            log.error(
+                                "Could not revert chat-ledger claim for id=%s after "
+                                "user-ledger write failure: %s", item_id, revert_err,
+                            )
                     raise
                 return True
         except Timeout:
@@ -388,10 +469,12 @@ def rollback_push_slot(
 ) -> None:
     """Remove ``item_id`` from both ledgers under .pushed.lock.
 
-    Delta-write only: reads each on-disk set, ``discard``es the ID and writes
-    the remainder back — concurrent claims of OTHER IDs made after this
-    item's claim are never clobbered. Used when the send provably never
-    reached Telegram (connect failure, pre-flight 429 with no text notice).
+    Delta-write only: BOTH ledgers are read first (fail-closed: a corrupt
+    ledger aborts the whole rollback WITHOUT having touched the other one),
+    then each on-disk set ``discard``es the ID and is written back —
+    concurrent claims of OTHER IDs made after this item's claim are never
+    clobbered. Used when the send provably never reached Telegram (connect
+    failure, pre-flight 429 with no text notice).
     """
     chat_path = pushed_chat_file(pushed_dir, chat_id)
     user_path = pushed_file_for_user(pushed_dir, tg_id, username)
@@ -399,12 +482,41 @@ def rollback_push_slot(
     for attempt in range(3):
         try:
             with FileLock(str(lock_path), timeout=10):
-                for path in (chat_path, user_path):
-                    on_disk = _read_int_set_strict(path)
-                    if item_id not in on_disk:
-                        continue
-                    on_disk.discard(item_id)
-                    _atomic_write(path, json.dumps(sorted(on_disk), indent=2))
+                # Read BOTH ledgers before writing anything: if the user
+                # ledger is corrupt we must not have already rewritten the
+                # chat ledger (that would violate "corrupt → don't touch
+                # disk" and leave the two ledgers split).
+                chat_ids = _ensure_chat_ledger_locked(pushed_dir, chat_id)
+                user_ids = _read_int_set_strict(user_path)
+                prev_chat = set(chat_ids)
+                if item_id in chat_ids:
+                    chat_ids.discard(item_id)
+                    _atomic_write(
+                        chat_path, json.dumps(sorted(chat_ids), indent=2)
+                    )
+                try:
+                    if item_id in user_ids:
+                        user_ids.discard(item_id)
+                        _atomic_write(
+                            user_path, json.dumps(sorted(user_ids), indent=2)
+                        )
+                except StateWriteError:
+                    # Symmetric to claim_push_slot: if the second ledger
+                    # write fails, restore the chat ledger to its pre-
+                    # rollback set so the two ledgers never split
+                    # (chat would say "free" while user still holds it).
+                    # Delta-write keeps concurrent other-ID claims intact.
+                    try:
+                        _atomic_write(
+                            chat_path, json.dumps(sorted(prev_chat), indent=2)
+                        )
+                    except StateWriteError as revert_err:
+                        log.error(
+                            "Could not restore chat-ledger rollback for "
+                            "id=%s after user-ledger write failure: %s",
+                            item_id, revert_err,
+                        )
+                    raise
                 return
         except Timeout:
             if attempt < 2:
@@ -429,7 +541,16 @@ def absorb_legacy_push_states(
     files behind. Every ID they contain is uncertain-or-worse; re-sending
     would duplicate pushes for items that were in fact delivered. Under the
     shared lock all IDs are merged into BOTH pushed ledgers and the legacy
-    files are deleted, so the old state costs zero re-sends.
+    files are deleted, so the old state costs zero re-sends. (The chat-ledger
+    half of this merge may already have happened inside
+    ``_ensure_chat_ledger_locked`` — absorb is idempotent either way.)
+
+    FAIL-CLOSED: any legacy file that cannot be read, is not valid JSON, is
+    not a dict at the top level, or contains a non-integer key raises
+    ``StateReadError`` IMMEDIATELY — the corrupt original is NEVER
+    ``unlink()``ed, so the only proof an item may already have been pushed
+    is never destroyed. Returns the absorbed ID set so callers can sync
+    their in-memory pushed set.
     """
     chat_path = pushed_chat_file(pushed_dir, chat_id)
     user_path = pushed_file_for_user(pushed_dir, tg_id, username)
@@ -437,7 +558,12 @@ def absorb_legacy_push_states(
     for attempt in range(3):
         try:
             with FileLock(str(lock_path), timeout=10):
+                # First-use history migration MUST happen before anything
+                # else touches the chat ledger — and before a first-ever
+                # absorb could seal a history-less ledger on disk.
+                chat_ids = _ensure_chat_ledger_locked(pushed_dir, chat_id)
                 absorbed: set[int] = set()
+                parsed_ok: list[Path] = []
                 legacy_files = [
                     _push_state_file(pushed_dir, "inflight", tg_id, username),
                     _push_state_file(pushed_dir, "pending", tg_id, username),
@@ -445,22 +571,13 @@ def absorb_legacy_push_states(
                 for lf in legacy_files:
                     if not lf.exists():
                         continue
-                    try:
-                        raw = json.loads(lf.read_text())
-                        if isinstance(raw, dict):
-                            for k in raw:
-                                try:
-                                    absorbed.add(int(k))
-                                except (TypeError, ValueError):
-                                    continue
-                    except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
-                        log.warning(
-                            "Could not parse legacy push state %s during "
-                            "absorption (skipping its IDs, file kept): %s",
-                            lf.name, e,
-                        )
+                    # Fail closed: NEVER unlink a file we could not
+                    # fully parse — it is the only record that its IDs
+                    # may already be delivered. Abort the whole absorb
+                    # (and therefore the whole page scan) instead.
+                    absorbed.update(_read_legacy_push_state_ids_strict(lf))
+                    parsed_ok.append(lf)
                 if absorbed:
-                    chat_ids = _read_int_set_strict(chat_path)
                     user_ids = _read_int_set_strict(user_path)
                     _atomic_write(
                         chat_path,
@@ -475,16 +592,18 @@ def absorb_legacy_push_states(
                         "pushed ledgers for @%s (zero-resend upgrade)",
                         len(absorbed), username,
                     )
-                for lf in legacy_files:
-                    if lf.exists():
-                        try:
-                            lf.unlink()
-                        except OSError as e:
-                            log.warning(
-                                "Could not remove absorbed legacy state file %s: %s",
-                                lf.name, e,
-                            )
-                return
+                # Only fully-parsed files are removed — every ID they held
+                # is now durably in both ledgers (an empty dict means there
+                # was nothing to absorb, so deleting it is also safe).
+                for lf in parsed_ok:
+                    try:
+                        lf.unlink()
+                    except OSError as e:
+                        log.warning(
+                            "Could not remove absorbed legacy state "
+                            "file %s: %s", lf.name, e,
+                        )
+                return absorbed
         except Timeout:
             if attempt < 2:
                 time.sleep(2)

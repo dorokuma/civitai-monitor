@@ -101,6 +101,7 @@ from state_store import (
     claim_push_slot,
     clear_inflight,  # noqa: F401
     clear_pending,  # noqa: F401
+    load_chat_pushed_ids,
     load_pending_map,  # noqa: F401
     load_push_timestamps,  # noqa: F401
     load_pushed_ids,
@@ -124,9 +125,10 @@ from telegram_media import (
     _cleanup_compressed_artifact,
     _send_telegram_media_group,  # noqa: F401
     _send_telegram_text,  # noqa: F401
+    _send_telegram_text_outcome,
     _send_telegram_video,  # noqa: F401
     escape_markdown,
-    get_tg_api_base,  # noqa: F401
+    get_tg_api_base,
     prepare_media_for_upload,
     send_media_to_telegram_outcome,
     send_to_telegram,
@@ -784,52 +786,65 @@ def process_and_push(
                     item_id, username,
                 )
                 return False
-        claimed = False
-        if stateful:
-            # In-loop re-check against the in-memory set (cheap) plus the
-            # on-disk claim (authoritative, covers other tracks/subscribers).
-            if pushed_ids is not None and item_id in pushed_ids:
-                return False
-            try:
-                claimed = claim_push_slot(pushed_dir, chat_id, tg_id, username, item_id)
-            except (StateReadError, StateWriteError) as e:
-                # Fail closed: an unreadable ledger means we cannot prove the
-                # item was not already pushed — abort with ZERO posts.
-                log.error(
-                    "Cannot claim push slot for id=%d @%s (%s); skipping "
-                    "with NO send (fail-closed)",
-                    item_id, username, e,
-                )
-                return False
-            if not claimed:
-                # Already pushed by an earlier scan, track or subscriber.
-                if pushed_ids is not None:
-                    pushed_ids.add(item_id)
-                log.info(
-                    "id=%d for @%s already claimed for chat %s; skipping send",
-                    item_id, username, chat_id,
-                )
-                return False
-        if shutdown_flag():
-            # Claimed but shutdown requested before the POST left: release
-            # the slot so the next run can retry cleanly.
-            if claimed:
+        # From here on every early return (mem re-check, claim refusal,
+        # shutdown, send crash) must still release the compressed
+        # artifacts prepare_media_for_upload just wrote to disk.
+        try:
+            claimed = False
+            if stateful:
+                # In-loop re-check against the in-memory set (cheap) plus
+                # the on-disk claim (authoritative, covers other
+                # tracks/subscribers).
+                if pushed_ids is not None and item_id in pushed_ids:
+                    return False
                 try:
-                    rollback_push_slot(pushed_dir, chat_id, tg_id, username, item_id)
+                    claimed = claim_push_slot(
+                        pushed_dir, chat_id, tg_id, username, item_id,
+                    )
+                except StateReadError:
+                    # Propagate fail-closed abort to the page loop.
+                    raise
                 except StateWriteError as e:
+                    # Fail closed: an unwritable ledger means we cannot
+                    # prove exclusivity — abort with ZERO posts.
                     log.error(
-                        "Could not release push slot for id=%d @%s on shutdown: %s",
+                        "Cannot claim push slot for id=%d @%s (%s); "
+                        "skipping with NO send (fail-closed)",
                         item_id, username, e,
                     )
-            return False
+                    return False
+                if not claimed:
+                    # Already pushed by an earlier scan, track or
+                    # subscriber.
+                    if pushed_ids is not None:
+                        pushed_ids.add(item_id)
+                    log.info(
+                        "id=%d for @%s already claimed for chat %s; "
+                        "skipping send", item_id, username, chat_id,
+                    )
+                    return False
+            if shutdown_flag():
+                # Claimed but shutdown requested before the POST left:
+                # release the slot so the next run can retry cleanly.
+                if claimed:
+                    try:
+                        rollback_push_slot(
+                            pushed_dir, chat_id, tg_id, username, item_id,
+                        )
+                    except StateWriteError as e:
+                        log.error(
+                            "Could not release push slot for id=%d @%s on "
+                            "shutdown: %s", item_id, username, e,
+                        )
+                return False
 
-        try:
             outcome = send_media_outcome(
                 bot_token, chat_id, text, files, compress, prepared=prepared,
             )
         finally:
-            # Idempotent: the production path already cleaned its artifacts;
-            # this covers the monkeypatched-compat path and any early raise.
+            # Idempotent: the production path already cleaned its
+            # artifacts; this covers every early return above plus the
+            # monkeypatched-compat path.
             if prepared is not None:
                 for artifact in prepared.artifacts:
                     _cleanup_compressed_artifact(artifact)
@@ -1026,12 +1041,32 @@ def _fetch_and_process_page(
         page_ids.add(item_id)
         valid_items.append(img)
 
-    # Zero-resend upgrade: fold any leftover inflight/pending IDs from the
-    # pre-strict design into the pushed ledgers. An unreadable/corrupt
-    # pushed ledger fails the whole page fail-closed (0 sends).
-    absorb_legacy_push_states(pushed_dir, chat_id, tg_id, username)
+    # Zero-resend upgrade + global dedup, both FAIL-FAST: a corrupt
+    # pushed/legacy ledger raises StateReadError and aborts the whole page
+    # for this creator (0 downloads, 0 sends, no backlog alert) — treating
+    # it as empty is exactly how duplicate pushes happen.
+    absorbed = absorb_legacy_push_states(pushed_dir, chat_id, tg_id, username)
+    chat_pushed = load_chat_pushed_ids(pushed_dir, chat_id)
+    # Only THIS creator's ids join pushed_ids — it feeds run_incremental's
+    # per-creator safe_lower_bound (hole_window_items). Merging the whole
+    # global chat ledger would let other creators' higher ids fake
+    # "caught up" (missed holes) or lower ids drag the bound down
+    # (over-fetching un-subscribed history). The page_ids & chat_pushed
+    # intersection is safe: every id in it is THIS creator's and already
+    # pushed to this chat, so it only lets a second subscriber whose own
+    # (tg_id, user) ledger is empty/stale converge on the first page
+    # instead of burning max_pages every scan.
+    pushed_ids |= absorbed | (page_ids & chat_pushed)
 
-    new_on_page = [img for img in valid_items if img["id"] not in pushed_ids]
+    # The per-(tg_id, user) ledger alone can never cover a second
+    # subscriber pushing the same creator to the same chat — without the
+    # global ledger the other subscriber would re-scan every page
+    # (download + compress + sleep per item) and eventually misfire a
+    # backlog alert. effective_pushed filters them out before processing;
+    # only this creator's on-page ids leak back into pushed_ids (above).
+    effective_pushed = pushed_ids | chat_pushed
+
+    new_on_page = [img for img in valid_items if img["id"] not in effective_pushed]
     did_push_attempt = False
 
     if new_on_page:
@@ -1048,7 +1083,7 @@ def _fetch_and_process_page(
                 continue
             # Same-page duplicates: an id appearing twice in one page must
             # only be processed once, even before any ledger round-trip.
-            if item_id in processed_this_page or item_id in pushed_ids:
+            if item_id in processed_this_page or item_id in effective_pushed:
                 continue
             if shutdown_flag():
                 log.info(
@@ -1058,9 +1093,12 @@ def _fetch_and_process_page(
                 break
             processed_this_page.add(item_id)
 
-            # Per-item isolation: a single bad item (malformed payload, send
-            # crash, unexpected state error) must not abort the rest of this
-            # page or the whole creator scan.
+            # Per-item isolation: a single bad item (malformed payload,
+            # send crash, unexpected state error) must not abort the rest
+            # of this page or the whole creator scan. StateReadError is
+            # NOT isolated: a corrupt ledger means we cannot prove
+            # exclusivity for ANY remaining item — abort the page (and
+            # therefore the creator) fail-closed with zero posts.
             try:
                 did_push_attempt = True
                 process_and_push(
@@ -1078,6 +1116,8 @@ def _fetch_and_process_page(
                     shutdown_flag=shutdown_flag,
                 )
                 time.sleep(2.0 + random.random() * 1.0)
+            except StateReadError:
+                raise
             except Exception:
                 log.exception(
                     "Unhandled error while processing id=%s for @%s; skipping item",
@@ -1204,12 +1244,23 @@ def run_incremental(
                 try:
                     # Alert failures must never kill the scan: catch-all by design.
                     if bot_token and chat_id and claim_backlog_truncation_alert(seen_dir, username, label):
-                        sent_ok = False
+                        alert_outcome = None
                         try:
-                            sent_ok = send_to_telegram(bot_token, chat_id, alert_msg)
+                            alert_outcome = _send_telegram_text_outcome(
+                                f"{get_tg_api_base()}/bot{bot_token}",
+                                chat_id, alert_msg,
+                            )
                         except Exception as e:  # noqa: BLE001
                             log.warning("Failed to send backlog truncation alert to Telegram: %s", e)
-                        if not sent_ok:
+                        # Roll back today's slot ONLY when the alert
+                        # provably never left (DEFINITELY_NOT_SENT) or the
+                        # call raised (alert_outcome is None → treated as
+                        # not-sent so a later scan can retry). DELIVERED_OK,
+                        # REJECTED_PERMANENT and UNCERTAIN_NO_ROLLBACK all
+                        # keep the claim — re-sending could double-alert.
+                        if alert_outcome in (
+                            SendOutcome.DEFINITELY_NOT_SENT, None,
+                        ):
                             rollback_backlog_truncation_alert(seen_dir, username, label)
                 except Exception as e:  # noqa: BLE001
                     log.warning("Failed to send backlog truncation alert to Telegram: %s", e)

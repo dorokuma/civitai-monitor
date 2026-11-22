@@ -173,7 +173,17 @@ def _telegram_post(
             raise requests.RequestException(f"upload file rewind failed: {e}") from e
         resp = requests.post(url, timeout=timeout, **kwargs)
         if resp.status_code == 429 and attempt < max_retries - 1:
-            retry_after_raw = resp.headers.get("Retry-After", "3")
+            retry_after_raw = resp.headers.get("Retry-After")
+            if retry_after_raw is None:
+                # Telegram Bot API (incl. local telegram-bot-api) also puts
+                # the wait in the JSON body: parameters.retry_after — the
+                # header is not always populated, so fall back to the body.
+                try:
+                    retry_after_raw = str(
+                        resp.json().get("parameters", {}).get("retry_after", "3")
+                    )
+                except (ValueError, TypeError, AttributeError):
+                    retry_after_raw = "3"
             try:
                 retry_after = int(float(retry_after_raw))
             except (TypeError, ValueError, OverflowError):
@@ -200,24 +210,47 @@ def _request_definitely_not_sent(exc: requests.RequestException) -> bool:
     """True when ``exc`` proves the request never reached Telegram.
 
     First-attempt connect failures only: ConnectTimeout, and a ConnectionError
-    whose underlying cause is urllib3's NewConnectionError (connection
-    refused / DNS / no route — before any byte was sent). Everything after a
-    socket was established is uncertain: the payload may be in flight.
+    whose underlying cause is urllib3's NewConnectionError — connection
+    refused / no route, and its subclass NameResolutionError (DNS failure),
+    which urllib3 2.x nests inside MaxRetryError.reason rather than the
+    exception chain. Everything after a socket was established is
+    uncertain: the payload may be in flight.
     """
     if isinstance(exc, requests.ConnectTimeout):
         return True
     if not isinstance(exc, requests.ConnectionError):
         return False
     try:
-        from urllib3.exceptions import NewConnectionError
+        from urllib3.exceptions import (
+            MaxRetryError,
+            NewConnectionError,
+        )
     except ImportError:  # pragma: no cover - urllib3 is a requests dep
-        NewConnectionError = ()  # type: ignore[assignment]
-    for cause in (exc.__cause__, exc.__context__):
-        if isinstance(cause, NewConnectionError):
+        MaxRetryError = NewConnectionError = ()  # type: ignore[assignment]
+
+    def _is_connect_failure(err: BaseException | None, depth: int = 0) -> bool:
+        if err is None or depth > 5:
+            return False
+        if isinstance(err, NewConnectionError):
             return True
-    # urllib3 wraps low-level errors inside MaxRetryError on the pool level.
-    return bool(re.search(r"NewConnectionError|Failed to establish a new connection",
-                          str(exc)))
+        # urllib3 2.x: NewConnectionError/NameResolutionError live in
+        # MaxRetryError.reason, not in exc.__cause__/__context__.
+        if isinstance(err, MaxRetryError):
+            return _is_connect_failure(err.reason, depth + 1)
+        return (
+            _is_connect_failure(err.__cause__, depth + 1)
+            or _is_connect_failure(err.__context__, depth + 1)
+        )
+
+    if _is_connect_failure(exc):
+        return True
+    # String fallback: NewConnectionError / DNS failure names embedded in
+    # the message when the chain could not be reconstructed.
+    return bool(re.search(
+        r"NewConnectionError|NameResolutionError|Failed to establish a new "
+        r"connection|Failed to resolve",
+        str(exc),
+    ))
 
 
 def send_media_to_telegram_outcome(
@@ -246,7 +279,13 @@ def send_media_to_telegram_outcome(
     if prepared is not None:
         try:
             if prepared.degrades_to_text:
-                return _degrade_to_text_notice(api_base, chat_id, text)
+                # The media can never upload, but the text notice itself is
+                # a fresh send: DEFINITELY_NOT_SENT (connect failure / 429)
+                # must stay retryable so the notice is not silently lost.
+                notice = _send_telegram_text_outcome(api_base, chat_id, text)
+                if notice is SendOutcome.DEFINITELY_NOT_SENT:
+                    return SendOutcome.DEFINITELY_NOT_SENT
+                return SendOutcome.REJECTED_PERMANENT
             if not prepared.files:
                 return SendOutcome.REJECTED_PERMANENT
             if prepared.is_video:
@@ -284,9 +323,18 @@ def _send_telegram_text_outcome(api_base: str, chat_id: str, text: str) -> SendO
     if resp.status_code == 429:
         # Retry-After exceeded the cap or retries exhausted — nothing sent.
         return SendOutcome.DEFINITELY_NOT_SENT
-    if 500 <= resp.status_code < 600:
-        # Server received (and possibly processed) the message — uncertain.
+    if 500 <= resp.status_code < 600 or resp.status_code == 408:
+        # 5xx: server received (and possibly processed) — uncertain.
+        # 408 Request Timeout: the payload may have been received — same.
         return SendOutcome.UNCERTAIN_NO_ROLLBACK
+    if resp.status_code in (401, 403):
+        # Auth/permission failure: definitively not delivered, retryable
+        # once credentials/permissions are fixed — never a silent loss.
+        log.warning(
+            "Message refused auth-wise (HTTP %d); treated as not sent",
+            resp.status_code,
+        )
+        return SendOutcome.DEFINITELY_NOT_SENT
     # Definitive 4xx: the message was rejected and will never be delivered.
     log.warning("Message permanently rejected (HTTP %d): %s",
                 resp.status_code, resp.text[:200])
@@ -382,13 +430,16 @@ def _degrade_to_text_notice(api_base: str, chat_id: str, text: str) -> SendOutco
 
     Whatever the notice's own outcome is, the outer item stays
     REJECTED_PERMANENT — the media can never be uploaded, so the claim is
-    kept and the item never retried.
+    kept and the item never retried. (The notice uses the same outcome
+    classifier internally; this path is for items already known to be
+    permanently rejected, where a failed notice cannot change that.)
     """
-    delivered = _send_telegram_text(api_base, chat_id, text)
-    if not delivered:
+    notice = _send_telegram_text_outcome(api_base, chat_id, text)
+    if notice is not SendOutcome.DELIVERED_OK:
         log.warning(
-            "Degraded text notice also failed; the item stays "
+            "Degraded text notice also failed (%s); the item stays "
             "REJECTED_PERMANENT (media can never upload — check manually)",
+            notice.value,
         )
     return SendOutcome.REJECTED_PERMANENT
 
@@ -411,10 +462,38 @@ def _classify_media_response(resp: requests.Response, api_base: str,
             kind, resp.status_code,
         )
         return SendOutcome.UNCERTAIN_NO_ROLLBACK
-    # Other 4xx: a definitive rejection — the media will never be accepted;
-    # the user gets at most one plain-text notice.
-    log.warning("%s send rejected (HTTP %d): %s", kind, resp.status_code, resp.text[:200])
-    return _degrade_to_text_notice(api_base, chat_id, text)
+    if resp.status_code in (401, 403):
+        # Auth/permission failure: Telegram definitively never accepted the
+        # media, but the item is not inherently unpushable — once the token
+        # /permissions are fixed it should retry. NO text fallback (the
+        # notice would hit the same 401/403 anyway).
+        log.warning(
+            "%s send refused auth-wise (HTTP %d); treated as not sent, "
+            "claim released for retry", kind, resp.status_code,
+        )
+        return SendOutcome.DEFINITELY_NOT_SENT
+    if resp.status_code == 408:
+        # Request Timeout: the payload may have been received — uncertain,
+        # so NO text fallback and NO rollback.
+        log.warning(
+            "%s send got HTTP 408; outcome uncertain, no text fallback", kind,
+        )
+        return SendOutcome.UNCERTAIN_NO_ROLLBACK
+    if 400 <= resp.status_code < 500:
+        # Other 4xx: a definitive rejection — the media will never be
+        # accepted; the user gets at most one plain-text notice.
+        log.warning(
+            "%s send rejected (HTTP %d): %s",
+            kind, resp.status_code, resp.text[:200],
+        )
+        return _degrade_to_text_notice(api_base, chat_id, text)
+    # Unexpected non-4xx/5xx status (1xx, 3xx, >=600): unknown server
+    # semantics — fail to uncertain, never to the text fallback.
+    log.warning(
+        "%s send got unexpected HTTP %d; outcome uncertain, no text fallback",
+        kind, resp.status_code,
+    )
+    return SendOutcome.UNCERTAIN_NO_ROLLBACK
 
 
 class PreparedMedia:
@@ -534,7 +613,18 @@ def _send_telegram_video_outcome(
     """Upload a prepared video through sendVideo — one attempt, classified."""
     upload_path = prepared.files[0]
     try:
-        with open(upload_path, "rb") as f:
+        f = open(upload_path, "rb")  # noqa: SIM115
+    except OSError as e:
+        # The file vanished / became unreadable BEFORE any byte was sent
+        # (e.g. a concurrent cache cleanup): definitively not sent — the
+        # claim is released so the next scan can retry the download+push.
+        log.warning(
+            "Video upload file unreadable before send (%s); "
+            "definitely not sent, safe to retry", e,
+        )
+        return SendOutcome.DEFINITELY_NOT_SENT
+    try:
+        with f:
             resp = _telegram_post(
                 f"{api_base}/sendVideo",
                 data={"chat_id": chat_id, "caption": text, "parse_mode": "Markdown"},
@@ -571,7 +661,17 @@ def _send_telegram_media_group_outcome(
                 "caption": text if i == 0 else "",
                 "parse_mode": "Markdown",
             })
-            fh = open(upload_path, "rb")  # noqa: SIM115
+            try:
+                fh = open(upload_path, "rb")  # noqa: SIM115
+            except OSError as e:
+                # File vanished/became unreadable before any byte was sent:
+                # definitively not sent — release the claim for a retry.
+                log.warning(
+                    "Media group file %s unreadable before send (%s); "
+                    "definitely not sent, safe to retry",
+                    upload_path.name, e,
+                )
+                return SendOutcome.DEFINITELY_NOT_SENT
             open_handles.append(fh)
             files[f"img{i}"] = (upload_path.name, fh, "image/jpeg")
 
@@ -635,11 +735,13 @@ def _send_telegram_media_group(
 ) -> bool | None:
     """Legacy thin wrapper: media group outcome only."""
     prepared = prepare_media_for_upload(file_paths, compress)
-    if prepared is None or not prepared.files:
+    if prepared is None:
         return False
     try:
         if prepared.degrades_to_text:
             outcome = _degrade_to_text_notice(api_base, chat_id, text)
+        elif not prepared.files:
+            return False
         else:
             outcome = _send_telegram_media_group_outcome(api_base, chat_id, text, prepared)
     finally:

@@ -224,7 +224,7 @@ class TestSendToTelegramDetailed:
                 "http://api/bot" + FAKE_TOKEN, "42", "hi"
             ) is telegram_media.SendOutcome.UNCERTAIN_NO_ROLLBACK
 
-        api.text_response = _api_response(403, False)
+        api.text_response = _api_response(400, False)
         with patch.object(telegram_media.requests, "post", api):
             assert telegram_media._send_telegram_text_outcome(
                 "http://api/bot" + FAKE_TOKEN, "42", "hi"
@@ -489,3 +489,118 @@ class TestLastScanErrorLine:
 
     def test_missing_file_returns_empty(self, tmp_path):
         assert civitai_bot._last_scan_error_line(str(tmp_path / "nope.log")) == ""
+
+
+# ---------------------------------------------------------------------------
+# Strict at-most-once outcome boundaries (merged from test_strict_at_most_once)
+# ---------------------------------------------------------------------------
+
+
+class TestOutcomeBoundaries:
+    """Status / transport boundaries the strict contract must not blur."""
+
+    @staticmethod
+    def _image(tmp_path):
+        img = tmp_path / "pic.png"
+        img.write_bytes(b"\x89PNG" + b"0" * 64)
+        return img
+
+    def test_media_408_uncertain_no_text_fallback(self, tmp_path):
+        """HTTP 408 Request Timeout: the payload may have been received —
+        uncertain, so NO text notice and NO rollback."""
+        img = self._image(tmp_path)
+        api = _FakeTelegramAPI()
+        api.media_responses = [_api_response(408, False)]
+        with patch.object(telegram_media.requests, "post", api), \
+             patch.object(telegram_media.time, "sleep", lambda *_a, **_k: None):
+            outcome = telegram_media.send_media_to_telegram_outcome(
+                FAKE_TOKEN, "42", "cap", [img]
+            )
+        assert outcome is telegram_media.SendOutcome.UNCERTAIN_NO_ROLLBACK
+        assert api.text_calls == 0
+
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_media_auth_failure_definitely_not_sent(self, tmp_path, status):
+        """HTTP 401/403 (token/permission): Telegram definitively never
+        accepted the media, but a fixed config should retry — classify as
+        DEFINITELY_NOT_SENT with NO text notice (it would 401/403 too)."""
+        img = self._image(tmp_path)
+        api = _FakeTelegramAPI()
+        api.media_responses = [_api_response(status, False)]
+        with patch.object(telegram_media.requests, "post", api), \
+             patch.object(telegram_media.time, "sleep", lambda *_a, **_k: None):
+            outcome = telegram_media.send_media_to_telegram_outcome(
+                FAKE_TOKEN, "42", "cap", [img]
+            )
+        assert outcome is telegram_media.SendOutcome.DEFINITELY_NOT_SENT
+        assert api.text_calls == 0
+
+    def test_name_resolution_error_is_definitely_not_sent(self, tmp_path):
+        """urllib3 2.x nests NewConnectionError subclasses inside
+        MaxRetryError.reason — a DNS NameResolutionError must still classify
+        as DEFINITELY_NOT_SENT (nothing ever left)."""
+        img = self._image(tmp_path)
+        try:
+            from urllib3.exceptions import (
+                MaxRetryError,
+                NameResolutionError,
+            )
+            inner = NameResolutionError(
+                "bot", "api.telegram.org", OSError("dns fail"),
+            )
+            exc = requests.ConnectionError(
+                MaxRetryError(None, "https://api.telegram.org/x", reason=inner),
+            )
+        except (ImportError, TypeError):
+            pytest.skip("urllib3 1.x layout — no MaxRetryError.reason")
+        api = _FakeTelegramAPI()
+        api.media_exception = exc
+        with patch.object(telegram_media.requests, "post", api), \
+             patch.object(telegram_media.time, "sleep", lambda *_a, **_k: None):
+            outcome = telegram_media.send_media_to_telegram_outcome(
+                FAKE_TOKEN, "42", "cap", [img]
+            )
+        assert outcome is telegram_media.SendOutcome.DEFINITELY_NOT_SENT
+        assert api.text_calls == 0
+
+    def test_429_json_body_retry_after(self, tmp_path):
+        """A 429 without a Retry-After header still honors the wait from the
+        JSON body parameters.retry_after (local bot-api server layout)."""
+        img = self._image(tmp_path)
+        api = _FakeTelegramAPI()
+        api.media_responses = [
+            _api_response(
+                429, False,
+                text='{"ok":false,"error_code":429,'
+                     '"parameters":{"retry_after":120}}',
+            ),
+        ]
+        # The MagicMock response has no .json() configured; give it one so
+        # _telegram_post can read parameters.retry_after from the body.
+        api.media_responses[0].json.return_value = {
+            "ok": False, "error_code": 429,
+            "parameters": {"retry_after": 120},
+        }
+        sleeps: list[float] = []
+        with patch.object(telegram_media.requests, "post", api), \
+             patch.object(telegram_media.time, "sleep", lambda s: sleeps.append(s)):
+            outcome = telegram_media.send_media_to_telegram_outcome(
+                FAKE_TOKEN, "42", "cap", [img]
+            )
+        # retry_after=120 > _TG_MAX_RETRY_AFTER → return immediately.
+        assert outcome is telegram_media.SendOutcome.DEFINITELY_NOT_SENT
+        assert sleeps == []
+        assert api.text_calls == 0
+
+    def test_open_oserror_before_send_is_not_sent(self, tmp_path):
+        """An upload file that vanished before open() → DEFINITELY_NOT_SENT:
+        zero bytes were ever sent, so the claim may safely retry."""
+        prepared = telegram_media.PreparedMedia(
+            [tmp_path / "ghost.mp4"], True, False, [],
+        )
+        api = _FakeTelegramAPI()
+        with patch.object(telegram_media.requests, "post", api):
+            outcome = telegram_media._send_telegram_video_outcome(
+                "http://api/bot" + FAKE_TOKEN, "42", "cap", prepared,
+            )
+        assert outcome is telegram_media.SendOutcome.DEFINITELY_NOT_SENT
