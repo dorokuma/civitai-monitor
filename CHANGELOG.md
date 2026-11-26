@@ -5,256 +5,152 @@ This file follows the [Keep a Changelog](https://keepachangelog.com/) format, an
 ## [1.8.0] - 2026-11-22
 
 ### Changed
-- **Enforce strict at-most-once Telegram push delivery**: replace best-effort post-send bookkeeping with lock-protected write-ahead claiming (`claim_push_slot` / `rollback_push_slot`) backed by a `chat_id`-scoped global ledger (`pushed_chat_<chat_id>.json`) with automatic first-use migration of historical `pushed_ids_*.json` and legacy `inflight`/`pending` files.
-- **Fail-closed state reads**: corrupt or unreadable `pushed_*.json` or legacy `inflight`/`pending` files now raise `StateReadError`, aborting the scan without overwriting or deleting damaged files.
-- **Explicit four-state delivery outcomes (`SendOutcome`)**: remove automatic retries on `5xx` and generic transport errors (keep `429` retry only with a 60s `Retry-After` cap and JSON `parameters.retry_after` fallback), forbid text fallback on `5xx`/`408`/`429`/uncertain failures, split `(connect, read)` timeouts across all endpoints (`sendMediaGroup` `(10, 180)`, `sendVideo` `(10, 600)`, `sendMessage` `(10, 60)`), and pre-compress media before claiming with guaranteed `finally` cleanup.
-- **Eliminate duplicate-push retry loops**: remove `_send_transient_download_failure` Telegram notices (transient download failures log warnings and retry silently on the next scan), set `PENDING_MAX_RETRIES = 0`, isolate per-creator `hole_window_items` from foreign creator IDs while converging cross-subscriber scans via `page_ids & chat_pushed`, and switch backlog alerts to `SendOutcome`.
+- **Strict at-most-once Telegram push delivery**: replaced best-effort post-send bookkeeping with lock-protected write-ahead claiming backed by a per-chat global ledger, automatically migrating historical pushed-ID and inflight/pending state files on first use.
+- **Fail-closed state reads**: corrupt or unreadable state files now abort the scan with an error instead of overwriting or deleting damaged files.
+- **Explicit delivery outcome handling**: removed automatic retries on HTTP `5xx` and generic transport errors (retaining `429` retries capped at 60s), disallowed text fallbacks on `5xx`/`408`/`429`/uncertain failures, split connect/read timeouts per Telegram endpoint, and moved media compression before slot claiming with guaranteed temporary-file cleanup.
+- **Eliminated duplicate-push retry loops**: removed transient download failure Telegram notices (warnings are logged and retried on the next scan), disabled automatic pending retries, and isolated per-creator hole windows while keeping cross-subscriber convergence.
 
 ## [1.7.0] - 2026-09-20
 
 ### Added
-- **Oversized media is compressed before upload (lossless first)**: new
-  `media_compress.py` shrinks photos above 10 MiB and videos above the
-  2 GiB local Bot API limit. The image ladder is (1) a metadata-only JPEG
-  rewrite — XMP/EXIF/ICC/IPTC/COM segments dropped, entropy-coded data
-  copied verbatim — or a lossless PNG re-deflate, (2) a JPEG quality
-  bisection between 95 and the configured floor (default 92), and (3) an
-  optional downscale from 0.95 down to `image_min_scale` (default 0.8);
-  RGBA/LA/`P` alpha is flattened onto white when a JPEG is required and a
-  PNG that can only be shrunk lossily is converted to high-quality JPEG
-  with a log line. The video ladder is (1) a stream-copy remux into a
-  faststart MP4, (2) `libx264 -crf 18 -preset slow` + AAC (`128k`) capped
-  by `-maxrate/-bufsize`, and (3) a bitrate-targeted encode
-  (`target_bytes * 8 * 0.9 / duration`), optionally downscaled to
-  `video_min_scale` (default 0.8). Every ffmpeg/ffprobe call runs through
-  `subprocess` with a hard `timeout_seconds` cap (default 300); a timeout
-  kills the child and fails the compression, and half-written candidates
-  are always removed.
-- **`compress:` config section** (`config.yaml`, documented in
-  `config.yaml.example`): `enabled` (default true), `image_quality_min`
-  (92), `image_allow_scale` (true), `image_min_scale` (0.8), `video_crf`
-  (18), `video_preset` (slow), `video_audio_bitrate` (128k),
-  `video_allow_scale` (true), `video_min_scale` (0.8),
-  `timeout_seconds` (300). Every field is optional, so a `config.yaml`
-  without the section (or with only some keys) still loads on defaults.
+- **Pre-upload media compression (lossless first)**: oversized photos (> 10 MiB) and videos (> 2 GiB local Bot API limit) are compressed before upload — stripping metadata or re-deflating PNGs first, then falling back to bounded JPEG quality/downscale for images and faststart remux, CRF 18 H.264/AAC, or duration-based bitrate targeting for videos, with hard timeouts (`timeout_seconds`, default 300) and automatic cleanup of failed artifacts.
+- **`compress:` configuration section**: added optional settings (`enabled`, `image_quality_min`, `image_allow_scale`, `image_min_scale`, `video_crf`, `video_preset`, `video_audio_bitrate`, `video_allow_scale`, `video_min_scale`, `timeout_seconds`) with safe defaults when omitted.
 
 ### Changed
-- **Telegram media path compresses instead of rerouting**: the video path
-  uses `sendVideo` only; an oversized video is compressed first and falls
-  back to the plain-text notice (existing `media_failed=True` semantics)
-  only when no usable artifact fits the limit. Photos are size-checked
-  before the media group is assembled and compressed individually;
-  a photo that cannot be shrunk enough degrades to the text notice as
-  well instead of being silently dropped. Compressed artifacts are
-  deleted after the upload; the original download stays on disk for
-  `cleanup_old_caches` (keep_days / max_total_gb). `Pillow` is now a
-  requirement and `ffmpeg`/`ffprobe` are required at runtime for video
-  compression.
+- **Compress instead of rerouting**: oversized videos now upload exclusively via `sendVideo` and photos are checked/compressed individually before assembling media groups, falling back to plain-text notices only if compression still cannot meet size limits. Compressed artifacts are deleted after upload while original downloads follow normal cache retention. Requires `Pillow` and runtime `ffmpeg`/`ffprobe`.
 
 ### Removed
-- **The document-upload branch for oversized videos** (endpoint,
-  `TELEGRAM_DOCUMENT_MAX_BYTES`, its `monitor.py` import and the tests that
-  depended on it) — it is replaced by compression. A regression test scans
-  the shipped sources, workflows, systemd units and docs to keep it from
-  coming back.
+- Removed the legacy document-upload fallback branch for oversized videos in favor of compression.
 
 ## [1.6.0] - 2026-09-15
 
 ### Changed
-- **/backfill interactive list is newest-first**: the `/backfill` button
-  panel (initial `_show_backfill_list` and `bf_pg` pagination) now shows
-  newly added subscriptions before older ones. `get_users`, `config.yaml`
-  storage order, `/list`, and `/remove` are unchanged.
+- **Newest-first `/backfill` list**: the `/backfill` interactive button panel and pagination now display newly added subscriptions before older ones, without changing storage order, `/list`, or `/remove`.
 
 ## [1.5.2] - 2026-09-14
 
 ### Fixed
-- **HTTP status titles require code-phrase adjacency**: a status code is
-  titled `Civitai API N` only when the number sits within 40 characters of
-  an error phrase (`Server Error`, `Client Error`, `Bad Gateway`,
-  `Gateway Time-out`, `Service Unavailable`, `Rate Limited`,
-  `Too Many Requests`) or an explicit form (`HTTP 502`, `status=503`,
-  `503, url=`). Soft words `Timeout` / `Unavailable` no longer unlock a
-  bare number, so `timed out after 500 ms` and
-  `TimeoutError while saving 503 items` are not titled as Civitai API
-  500/503. This release adds hits for the custom `RateLimitError` format
-  (`429 Rate Limited, retry after Ns`) and explicit forms (`HTTP 502`,
-  `status=503`, `503, url=`); requests-native `429 Client Error` already
-  titled as 429.
-- **Reconciliation alert titles stay job-scoped**: recon humanizes the
-  latest `[RECONCILE]` / recon-run log window (not scan lines). A site-wide
-  503 that also fails reconcile is titled `Civitai API 503 Service Unavailable`;
-  if that window has no extractable error, the title stays
-  `未能提取失败原因` instead of borrowing the last scan error. A recon
-  scheduler exception is named in the title rather than collapsed to the
-  generic fallback.
-- **Cron-alert state persist failures are rate-limited**: the first write
-  failure logs WARNING (with traceback); repeats within 24 hours are debug.
-  A later successful persist after a failure logs `告警状态持久化已恢复`.
-  Persist errors still never raise.
-
-### Changed
-- `VERSION` is 1.5.2 (the 1.5.1 bump had been omitted from `VERSION`).
+- **More accurate HTTP status alert titles**: status codes in alert titles now require explicit HTTP forms or nearby error phrases, preventing unrelated numbers (such as timeout milliseconds or item counts) from being misclassified as API `500`/`503` errors while still matching rate-limit and explicit `HTTP N` formats.
+- **Job-scoped reconciliation alert titles**: reconciliation failure alerts now summarize only the reconciliation log window instead of borrowing the last scan error.
+- **Rate-limited alert-state persistence warnings**: repeated state persistence failures are suppressed for 24 hours after the first warning and log a recovery notice once persistence succeeds again.
 
 ## [1.5.1] - 2026-09-14
 
 ### Changed
-- **Cron failure alerts wait 24 hours without a success**: Telegram pages
-  admins only after a `scan` / `reconciliation` job has gone 24 hours with
-  no success (one alert per continuous failure episode, then one daily
-  digest). A recovery notice is sent only if an alert was actually fired.
-  Gate state is persisted in `cron_alert_state.json` so a process restart
-  does not reset the 24h clock; a fresh process with no history uses the
-  current time as the baseline to avoid a startup false alarm. Manual
-  `/scan` still reports failures immediately.
+- **24-hour cron failure alert gate**: scheduled `scan` and `reconciliation` jobs notify admins only after 24 continuous hours without success (followed by a daily digest and a recovery notice if an alert was sent), persisted across restarts. Manual `/scan` continues to report failures immediately.
 
 ### Fixed
-- **Failure alert titles name the error**: HTTP status codes (502/503/429),
-  timeouts, and connection errors go in the title (e.g.
-  `❌ 定时扫描已连续 24 小时失败：Civitai API 503 Service Unavailable`).
-  When the log has no structured hit, the most informative tail line is
-  used; a bare exit code is no longer the only alert content.
+- **Informative failure alert titles**: HTTP status codes (`502`/`503`/`429`), timeouts, connection errors, or the most relevant tail log line now appear directly in failure alert titles instead of bare exit codes.
 
 ## [1.5.0] - 2026-09-13
 
 ### Added
-- **Weekly Telegram report** (Sundays 21:00 UTC to admin chats): scan success/failure/skip counts for the week, per-subscription push counts and last-push dates (subscriptions silent for 14+ days are flagged for manual review), and the last reconciliation date. Guards against the silent-failure mode where everything looks green while subscriptions quietly stop producing.
-- **Push history**: every confirmed push records a timestamp (35-day rolling retention) powering the report; write failures never fail confirmed pushes.
-- **CodeQL workflow** (python, SHA-pinned actions) alongside lint/test.
+- **Weekly Telegram report** (Sundays 21:00 UTC to admin chats): summarizes weekly scan counts, per-subscription push counts and last-push dates (flagging subscriptions silent for 14+ days), and the last reconciliation date.
+- **Push history tracking**: confirmed pushes record timestamps with 35-day rolling retention to power weekly reports without failing pushes if history writes fail.
 
 ### Fixed
-- **Backup archives were including everything**: the tar command's `--exclude` flags were positional arguments after the file list, so GNU tar ignored them - `downloads` (11 GB) was never excluded and the 90-day cleanup never ran. Excludes moved before operands, `.venv` excluded, and the archive shrank from 2.69 GiB to ~0.5 MB. Restore procedure documented in README (including venv recreation).
-
-### Changed
-- coverage baseline: monitor 75%, state_store 82%, civitai_client 83%, config_io 84%, telegram_media 78% (TOTAL 78%) with new tests for the push-history paths.
+- **Backup archive exclusions**: moved `--exclude` options before operands in the `tar` command and excluded `.venv`, preventing downloaded media from bloating backup archives and shrinking archives from ~2.7 GiB to ~0.5 MB.
 
 ## [1.4.0] - 2026-09-13
 
 ### Fixed
-- **Media-retry lifecycle actually works now**: pending entries carry a `media_failed` flag (backward-compatible with the old `(ts, retries)` on-disk format). A media upload that certainly failed is no longer swallowed by the 30-minute fresh-promotion branches (production logs showed 110 silent promotions, 0 real retries): on-page items with retries left are re-sent unconditionally, off-page items are kept pending until they reappear, and exhausted items are promoted with a warning.
-- **adopt_stale_inflight no longer refreshes the pending timestamp** (merges with min(ts) and ORs media_failed), so a crash mid-retry cannot reset the confirmation window.
-- **Downloads reject empty bodies** (0-byte "success" files are deleted and retried later) and the "Already exists" short-circuit re-downloads a zero-byte existing file instead of freezing the loss.
-- **API guards completed**: `items` that is not a list raises `FetchPageError` (was a silently skipped creator with exit 0); non-dict items are filtered.
-- **Cron/process hygiene**: /scan now registers its process so /stop can kill it; backfill lock files are no longer unlinked (removes the flock+unlink double-acquire window); the off-page promotion loop is per-item exception isolated; `reconciliation_status.json` and backfill lock files are gitignored.
-- telegram_media docstrings now document the timeout -> full-resend policy (duplicates preferred over loss).
+- **Media-retry lifecycle**: pending items now track media upload failures separately so failed uploads are actually retried (and off-page items stay pending until they reappear) instead of being prematurely promoted as pushed.
+- **Stale inflight recovery**: adopting stale inflight entries preserves the earliest timestamp and media-failure flag so crashes mid-retry do not reset the confirmation window.
+- **Empty download rejection**: 0-byte downloads are rejected before caching or sending.
+- **API response guards**: non-list `items` payloads raise a fetch error instead of silently skipping a creator, and non-dict items are filtered out.
+- **Process and lock hygiene**: `/scan` registers its process so `/stop` can terminate it; backfill lock files are no longer unlinked on release; off-page promotion handles exceptions per item.
 
 ## [1.3.0] - 2026-09-12
 
 ### Fixed
-- **Media can no longer be silently lost**: upload retries rewind file handles (a retried upload no longer sends 0 bytes), zero-byte files are rejected before sending, and when the media exists but its upload ultimately fails the item is parked as pending (retried next scan) instead of being marked pushed by the text fallback.
-- **Message length budgets**: createdAt is capped and captions/messages are clipped to Telegram limits (1000 media / 4000 text), so a tampered `createdAt` cannot push media over the caption limit into the same silent-loss path.
-- **API response guards**: non-dict JSON payloads raise `FetchPageError` (alerted scan failure) instead of a silently swallowed AttributeError; a tampered `meta` field is treated as missing instead of crashing the item every scan.
-- **Cron robustness**: an invalid `reconciliation.time` falls back to 03:30 instead of killing the reconciliation loop; `load_config` survives `yaml.YAMLError` (falls back to the minimal config); `_load_interval` rejects non-dict/non-int payloads instead of killing the scan loop.
-- **State hygiene**: `active_backfills.json` ownership corrected (service user can resume backfills again); `monitor_status.json` is written atomically; the monitor lock file is no longer unlinked (removes the classic flock+unlink double-acquire window); `interval.json` is no longer tracked in git.
+- **Prevent silent media loss**: upload retries rewind file handles, reject zero-byte files, and park failed media uploads as pending for the next scan instead of marking them pushed via text fallback.
+- **Message length limits**: timestamps are capped and captions/messages are clipped to Telegram limits (`1000` for media captions, `4000` for text) to prevent caption overflow failures.
+- **API response guards**: non-dict JSON payloads raise a fetch error instead of silently failing, and malformed item metadata no longer crashes every scan.
+- **Cron resilience**: invalid reconciliation times fall back to `03:30`, malformed YAML configs fall back safely to minimal defaults, and corrupted interval state no longer breaks the scan loop.
+- **State hygiene**: fixed `active_backfills.json` ownership, atomic status writes, and monitor lock handling.
 
 ### Security
-- Weekly backup archives are now 0600/0700 (they contain the bot token and Civitai cookies; they were world-readable).
+- Restricted weekly backup archive permissions (`0600`/`0700`) since archives contain the bot token and Civitai cookies.
 
 ## [1.2.0] - 2026-09-12
 
-### Fixed
-- **Download path traversal**: API-provided item ids are coerced to `int`, file extensions are whitelisted per media type, and the final download path is resolve-checked to stay inside the output directory; a tampered API response can no longer overwrite arbitrary files.
-- **Per-item and per-creator exception isolation**: one malformed API item no longer crashes the scan process and silently skips every later subscription; scans now log, continue, and exit with a stable signal.
-- **Retry-After hardening**: HTTP-date and non-numeric headers no longer crash `RateLimitError` construction, and the wait is capped at 120s so a hostile header cannot pin the monitor lock indefinitely.
-- **Bot token never reaches log files**: Telegram transport errors are sanitized (`/bot<token>` -> `/bot***`) before logging.
-- **State writes degrade gracefully on disk-full**: OSError in `_atomic_write` is wrapped as `StateWriteError` (with tmp cleanup), matching the existing lock-timeout recovery path.
-- **Backfill heartbeat race**: generation guard prevents a self-rescheduling heartbeat from keeping `active_backfills.json` alive forever, which permanently suppressed scheduled scans until restart.
-- **Image downloads capped** (30MB, streamed abort) and `/cleanup` rejects day counts below 1.
-- **CI**: GitHub Actions pinned to commit SHAs.
-
 ### Added
-- **Scan/reconciliation failure alerts in Telegram**: admin chats are notified on success->failure transitions, with continuous-failure dedup and a recovery notice; silent missed scans are now visible.
+- **Scan and reconciliation failure alerts**: admin chats receive deduplicated failure and recovery notifications in Telegram.
+
+### Fixed
+- **Download path traversal protection**: API item IDs are validated as integers, extensions are whitelisted per media type, and resolved paths are constrained inside the output directory.
+- **Per-item and per-creator error isolation**: a single malformed item no longer aborts the scan for remaining subscriptions.
+- **`Retry-After` hardening**: HTTP-date and invalid headers no longer crash rate-limit handling, and waits are capped at 120s.
+- **Log token sanitization**: Telegram bot tokens are masked in transport error logs.
+- **Graceful disk-full handling**: disk write errors convert into clean state-write errors with temporary file cleanup.
+- **Backfill heartbeat race**: generation guards prevent stale heartbeats from blocking scheduled scans indefinitely.
+- **Download and cleanup guards**: image downloads are capped at 30 MB and `/cleanup` rejects day counts below 1.
 
 ## [1.1.5] - 2026-08-26
 
-### Fixed
-- `fetch_page` keeps the API `nextCursor` even on empty pages, and `run_full` continues walking on `([], next_cursor)` instead of dropping the cursor and missing later works.
-- `run_full` stops after 3 consecutive empty pages, so pathological empty runs cannot loop forever.
-
 ### Added
-- `run_full` detects API cursor loops via a `visited_cursors` set and breaks out of content-bearing pagination cycles.
-- `run_full` hard per-track page cap (`MAX_FULL_PAGES_PER_TRACK = 500`) so an endless track cannot hold the process lock.
-- Regression tests covering empty-page cursor preservation, consecutive-empty guard, cursor-loop detection, and the page cap.
+- Cursor-loop detection and a per-track page cap (`500`) in full scans to prevent infinite pagination loops from holding the process lock.
+
+### Fixed
+- Full scans now preserve `nextCursor` across empty pages and stop after 3 consecutive empty pages instead of dropping the cursor or looping endlessly.
 
 ## [1.1.4] - 2026-08-26
 
 ### Fixed
-- Incremental scan requests `sort=Newest` from Civitai so newly published works are found on the first page instead of being missed by the default ordering.
+- Incremental scans request `sort=Newest` from Civitai so newly published works appear on the first page.
 
 ## [1.1.3] - 2026-08-08
 
 ### Added
-- Module split (compat re-exports from `monitor.py` / bot imports):
-  `config_io.py`, `civitai_client.py`, `state_store.py`, `telegram_media.py`, `bot_ui.py`.
-- `FetchPageError`: network/HTTP hard failures from `fetch_page` raise instead of returning empty; `main()` exits 2.
-- Telegram send path: limited 429 `Retry-After` retries + Markdown escape for dynamic usernames.
-- Shared `paginated_user_keyboard` for remove/backfill UI.
+- Modularized codebase layout with backwards-compatible imports.
+- Hard HTTP/network fetch failures now raise and exit with status code `2` instead of returning empty results silently.
+- Limited `429 Retry-After` retries on Telegram sends and Markdown escaping for dynamic usernames.
+- Paginated keyboard UI shared between `/remove` and `/backfill`.
 
 ### Fixed
-- `write_config`: redacts `telegram.bot_token` (env-injected tokens never written back) + atomic `tmp`/`os.replace`.
-- `load_seen_ids` / `load_pushed_ids`: corrupt JSON → empty set + warning.
-- `download_video`: without Content-Length, stream-count bytes and abort past cap (default 1024 MB).
-- `_clear_status(interrupted=True)` keeps the interrupted snapshot (no immediate unlink).
-- Backfill timeout user text matches idle 1800s (30 min no output), not “2 hours”.
-- `/mode` and `/nsfw` replies warn that settings are **global** (all subscribers).
-- `/cleanup` reuses `monitor.cleanup_old_caches` (incl. `max_total_gb`).
+- Config writes atomically and redacts environment-injected `telegram.bot_token` values.
+- Corrupt seen/pushed JSON state files degrade to empty sets with a warning.
+- Streaming video downloads without `Content-Length` enforce the configured size cap (default `1024 MB`).
+- Interrupted `/status` snapshots are preserved instead of immediately deleted.
+- Updated backfill idle-timeout message to `1800s` (30 minutes), clarified that `/mode` and `/nsfw` are global settings, and unified `/cleanup` cache limits.
 
 ### Changed
-- Removed unused `pydantic-settings` from requirements.
-- Docs: multi-user subscribe vs single channel push; seen vs pushed; env token dual-track.
+- Removed unused `pydantic-settings` dependency and updated documentation for multi-user subscriptions and environment token handling.
 
 ## [1.1.2] - 2026-08-05
 
 ### Fixed
-- monitor.py: 视频下载时 Content-Length 头无法解析为数字不再导致崩溃，按未知大小处理并继续下载。
-- civitai-bot.py: `/status` 命令扫描文件元数据时捕获 JSONDecodeError（ValueError 子类），损坏的 JSON 缓存不再导致命令崩溃。
-- backfill-memory-wrapper.py: 启用 backfill 进程的虚拟内存限制（RLIMIT_AS，软 1400MB / 硬 1500MB），并同步修正主服务内存注释（MemoryMax=4G）。
-
-### Notes
-- monitor.py: 补充注释说明 2048MB 的 sendVideo 阈值与本地 telegram-bot-api 服务器（127.0.0.1:8081，上限 2GB）匹配，此值应保持 2048 而非改为官方云 API 的 50MB。
+- Handled non-numeric `Content-Length` headers gracefully during video downloads instead of crashing.
+- Handled corrupt JSON metadata files in `/status` without crashing the command.
+- Enabled virtual memory limits (`1400 MB` soft / `1500 MB` hard) for backfill processes and aligned main service memory limit documentation (`MemoryMax=4G`).
 
 ## [1.1.1] - 2026-07-29
 
 ### Fixed
-- Admin Bot no longer pages admins for transient Telegram transport errors (`NetworkError` / `httpx.ReadError` / `TimedOut` / `RetryAfter`) that PTB already retries during long-polling.
-- Admin Bot now uses `telegram.api_base_url` (local Bot API Server at `http://127.0.0.1:8081`) for polling and replies — same endpoint monitor already used for media pushes. This avoids flaky direct connections to `api.telegram.org`.
-- Increased HTTP/getUpdates timeouts for the PTB Application to reduce spurious read errors under load.
+- Admin bot no longer pages admins for transient Telegram polling transport errors automatically retried by the client library.
+- Admin bot now uses the configured local Bot API Server (`telegram.api_base_url`) for polling and replies, matching media pushes.
+- Increased HTTP polling timeouts to reduce spurious read errors under load.
 
 ## [1.1.0] - 2026-07-27
 
 ### Added
-- Telegram global error handler: catches unhandled exceptions and alerts the admin, with a 5-minute debounce per root cause.
-- API 5xx / 429 exponential backoff retries, reducing missed pushes caused by rate limiting and transient failures.
-- Automatic digestion of pending off-page entries to avoid omissions after page scrolling.
-- Unified graceful shutdown of background tasks to prevent dangling tasks.
-- Ops tooling: logrotate configuration and ownership self-heal script.
+- Global Telegram error handler with 5-minute per-root-cause alert deduplication.
+- Exponential backoff retries on API `5xx` and `429` responses to reduce missed pushes.
+- Automatic processing of pending off-page entries after pagination.
+- Graceful shutdown for background tasks.
+- Logrotate configuration and ownership self-heal script.
 
 ### Fixed
-- `CLOSE-WAIT` connection pile-up caused by unclosed streaming download connections.
-- `asyncio` task leak.
-- Permanent stall of `pending_push` entries.
-- Reduced time complexity of `cleanup_old_caches` from O(n^2).
-- Cookie path hardcoding causing divergence (inconsistent paths across multiple instances/users).
-- Dead-code cleanup in docstrings.
+- Fixed `CLOSE-WAIT` connection pile-up, `asyncio` task leaks, and permanently stalled pending pushes.
+- Optimized cache cleanup complexity and unified cookie path configuration across users/instances.
 
 ### Security
-- `bot_token` removed from `config.yaml`; now injected uniformly via environment variable.
+- Removed `bot_token` from `config.yaml`; tokens are now injected exclusively via environment variables.
 
 ### Changed
-- Log format now includes year and timezone information.
-- Removed `_apply_memory_limit`; memory control moved to static systemd configuration.
-
-### Tests
-- Fixed 2 pre-existing `MagicMock` not `await`-able test failures; full suite 82 passed.
+- Log timestamps now include year and timezone information.
+- Moved process memory limits from in-app enforcement to static systemd configuration.
 
 ## [1.0.0] - 2026-06-07
 
-First tagged release.
-
-Between v1.0.0 and v1.1.0 there were 13 untagged commits, summarized below:
-- Video processing: `feat` support sending >50MB videos after compression; `feat` switched to a local Bot API Server for uploading large videos; `fix` routed >50MB videos through `sendDocument` instead of compression; `chore` removed the unused compression function.
-- Stability and de-duplication: `fix` prevented duplicate Telegram downloads and re-pushes; `fix` resolved hangs/crashes and optimized missed-push prevention logic, added channel push support.
-- Rate limiting and config: `fix` added rate limiting, config externalization, timeout defaults, lock deps and service deps, type hints (including one duplicate-commit fix).
-- File-lock robustness: `fix` added retries for `FileLock` timeouts; `fix` wrote the PID into the lock file and added `_is_scan_running` to support stale-lock detection.
-- Security hardening and exceptions: `fix` security hardening (enum validation, log sanitization, lock error handling, env path fallback); `fix` memory optimization + security hardening + exception handling improvements.
-- Memory management: `fix` removed the virtual memory limit, leaving physical memory control to systemd.
+First tagged release. Subsequent untagged updates before `v1.1.0` added local Bot API Server support for large videos, duplicate download/push prevention, rate limiting, externalized config, stale-lock detection, security hardening, and systemd-managed memory limits.
