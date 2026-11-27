@@ -214,8 +214,9 @@ sudo systemctl enable --now civitai-bot
 
 ```
 civitai-monitor/
-├── monitor.py                  # 扫描器：增量 + 全量回填
-├── civitai-bot.py              # 管理 Bot + 内置调度器
+├── monitor.py                  # 扫描器 CLI 入口与向后兼容门面
+├── civitai-bot.py              # 管理 Bot CLI 入口、内置调度器与门面
+├── civitai_monitor/            # 拆分后的扫描、媒体下载、Bot 状态/调度/指令核心包
 ├── bot_ui.py                   # Bot UI 辅助
 ├── civitai_client.py           # Civitai API 客户端
 ├── state_store.py              # 各用户 seen_ids / pushed_ids 状态
