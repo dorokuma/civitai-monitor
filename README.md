@@ -220,8 +220,9 @@ rebuild the venv, reinstall dependencies, fix ownership, and restart the service
 
 ```
 civitai-monitor/
-├── monitor.py                  # scanner: incremental + full backfill
-├── civitai-bot.py              # admin bot + built-in scheduler
+├── monitor.py                  # scanner CLI entrypoint & backward-compat facade
+├── civitai-bot.py              # admin bot CLI entrypoint, built-in scheduler & facade
+├── civitai_monitor/            # modular scanner, media download, bot state/cron/command package
 ├── bot_ui.py                   # bot UI helpers
 ├── civitai_client.py           # Civitai API client
 ├── state_store.py              # per-user seen_ids / pushed_ids state
