@@ -7,6 +7,7 @@ import time as _time_mod
 from pathlib import Path
 from types import ModuleType
 from typing import Any, NamedTuple
+from urllib.parse import urlparse
 
 import requests
 
@@ -186,7 +187,7 @@ def download_video(
             resp.raise_for_status()
             b2_url = str(resp.url)
 
-        if "image-b2.civitai.com" in b2_url and b2_url.endswith("/default"):
+        if urlparse(b2_url).hostname == "image-b2.civitai.com" and b2_url.endswith("/default"):
             resolved_url = b2_url[:-8] + "/original"
             log.info("B2: /default → /original")
             content_url = resolved_url
