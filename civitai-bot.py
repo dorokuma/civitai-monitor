@@ -2,63 +2,99 @@
 """
 Civitai Monitor Admin Bot — manage your monitor via Telegram chat.
 
-Commands:
-  /add <username>       — Add a user to the watch list
-  /remove <username>    — Remove a user from the watch list
-  /list                 — List all watched users
-  /status               — Show monitor status (disk, seen count, config)
-  /mode <mode>          — Switch scan mode: incremental | full
-  /nsfw <filter>        — Switch NSFW filter: sfw_only | nsfw_only | both
-  /cleanup [days]       — Manually clean cached images older than N days
-  /scan                 — Trigger an immediate incremental scan
-  /backfill <username>  — Run a full backfill for a user
-  /help                 — Show this message
-
-Run as a systemd service for 24/7 availability.
+Thin orchestration facade: domain logic lives in ``civitai_monitor/bot_*.py``,
+while this entrypoint preserves CLI invocation (`python3 civitai-bot.py`) and
+module-level symbols expected by existing tests.
 """
 
 from __future__ import annotations
 
 import asyncio
-import fcntl
-import http.cookiejar
-import json
+import fcntl  # noqa: F401
 import logging
-import os
-import re
-import signal
+import os  # noqa: F401
 import subprocess
 import sys
-import tempfile
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone  # noqa: F401
 from functools import wraps
-from http import HTTPStatus
 from pathlib import Path
+from typing import Any
 
-import requests
-from telegram import BotCommand, Update
-from telegram.error import NetworkError, RetryAfter, TimedOut
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram import Update
+from telegram.ext import Application, ContextTypes
 
-from bot_ui import paginated_user_keyboard, resolve_callback_username
-
-# Import unified config from monitor / config_io (re-exported by monitor)
-from monitor import MonitorConfig, cleanup_old_caches, load_config, write_config
-from state_store import _atomic_write, load_push_history
-
-# Transient Telegram transport failures during long-polling / send. PTB already
-# retries these in its network loop; they must not page admins as "unhandled".
-_TRANSIENT_TG_ERRORS: tuple[type[BaseException], ...] = (
-    NetworkError,
-    TimedOut,
-    RetryAfter,
+from bot_ui import paginated_user_keyboard, resolve_callback_username  # noqa: F401
+from civitai_monitor import bot_commands as _commands
+from civitai_monitor import bot_cron as _cron
+from civitai_monitor import bot_errors as _errors
+from civitai_monitor import bot_state as _state
+from civitai_monitor.bot_cron import (
+    _WEEKLY_REPORT_HOUR_UTC,  # noqa: F401
+    _WEEKLY_REPORT_MINUTE_UTC,  # noqa: F401
+    _WEEKLY_REPORT_STALE_DAYS,  # noqa: F401
+    _WEEKLY_REPORT_WEEKDAY,  # noqa: F401
+    _WEEKLY_REPORT_WINDOW_DAYS,  # noqa: F401
 )
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+from civitai_monitor.bot_cron import (
+    build_weekly_report as _build_weekly_report,  # noqa: F401
+)
+from civitai_monitor.bot_cron import (
+    format_last_push_date as _format_last_push_date,  # noqa: F401
+)
+from civitai_monitor.bot_cron import (
+    weekly_report_due as _weekly_report_due,  # noqa: F401
+)
+from civitai_monitor.bot_errors import (
+    _BARE_EXIT_NOISE,  # noqa: F401
+    _CONN_MARKERS,  # noqa: F401
+    _CRON_ALERT_LABELS,  # noqa: F401
+    _HTTP_ADJACENT_RE,  # noqa: F401
+    _HTTP_ERROR_PHRASE,  # noqa: F401
+    _HTTP_EXPLICIT_RE,  # noqa: F401
+    _HTTP_STATUS_CODES,  # noqa: F401
+    _RECON_END_MARKERS,  # noqa: F401
+    _RECON_START_MARKER,  # noqa: F401
+    _SCAN_ERROR_FALLBACK_MARKERS,  # noqa: F401
+    _SCAN_ERROR_MARKERS,  # noqa: F401
+    _TIMEOUT_MARKERS,  # noqa: F401
+    _TRANSIENT_TG_ERRORS,  # noqa: F401
+    _classify_failure,  # noqa: F401
+    _http_error_status,  # noqa: F401
+    _human_size,  # noqa: F401
+    _humanize_scan_error,  # noqa: F401
+    _is_transient_telegram_error,  # noqa: F401
+    _last_recon_error_line,
+    _last_scan_error_line,
+    _log_tail_candidates,  # noqa: F401
+    _looks_like_bare_exit,  # noqa: F401
+    _pick_error_line,  # noqa: F401
+    _recon_window_lines,  # noqa: F401
+    _strip_log_prefix,  # noqa: F401
+    _summarise_log,  # noqa: F401
+)
+from civitai_monitor.bot_helpers import (
+    _CIVITAI_URL_PREFIXES,  # noqa: F401
+    CIVITAI_API,  # noqa: F401
+    USERNAME_RE,  # noqa: F401
+    _application_builder_for_config,  # noqa: F401
+    communicate_with_idle_timeout,  # noqa: F401
+    get_users,  # noqa: F401
+    parse_username_input,  # noqa: F401
+    read_config_from,
+    set_users,  # noqa: F401
+)
+from civitai_monitor.bot_helpers import (
+    validate_username_exists as _validate_username_exists,
+)
+from monitor import (  # noqa: F401
+    MonitorConfig,
+    cleanup_old_caches,
+    load_config,
+    write_config,
+)
+from state_store import _atomic_write, load_push_history  # noqa: F401
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,580 +105,42 @@ log = logging.getLogger("civitai-bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
-# Background task tracking & clean shutdown
+# Module state (preserved here so per-instance test monkeypatches work cleanly)
 # ---------------------------------------------------------------------------
-# Long-lived asyncio tasks (scheduled scan, auto-resumed backfills) must be kept
-# referenced and cancelled on shutdown. Without this they can be garbage-collected
-# mid-flight, producing "Task was destroyed but it is pending!" warnings on exit.
 
 _background_tasks: set[asyncio.Task] = set()
-
-
-def _track_task(task: asyncio.Task) -> asyncio.Task:
-    """Register a background task; auto-discard it from the registry on completion."""
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-    return task
-
-
-async def _shutdown_background_tasks(application: Application) -> None:
-    """Cancel every tracked background task and wait for them to finish."""
-    pending = [t for t in _background_tasks if not t.done()]
-    if not pending:
-        return
-    for t in pending:
-        t.cancel()
-    try:
-        await asyncio.gather(*pending, return_exceptions=True)
-    except asyncio.CancelledError:
-        # The shutdown sequence itself was cancelled; the loop close will reap
-        # any still-pending tasks. Swallow so we never mask the real shutdown.
-        pass
-
-
-# Admin chat ids to alert on unhandled errors (populated from config in main()).
 _ADMIN_CHAT_IDS: list[int] = []
-
-# Bot handle used by the cron loops for failure alerts (populated in post_init;
-# the cron coroutines have no other way to reach the Bot instance).
 _alert_bot = None
-
-# 24h-without-success cron alert gate: job -> {"last_success_ts": float,
-# "alerted": bool, "last_alert_date": "YYYY-MM-DD"}. Persisted to
-# cron_alert_state.json so a restart does not reset the window.
 _cron_alert_state: dict[str, dict] = {}
 _cron_alert_disk_loaded = False
 CRON_ALERT_WINDOW_S = 24 * 3600
-# Persist-failure rate limit: first WARNING, then debug for 24h; info on recover.
 _cron_alert_persist_had_failure = False
 _cron_alert_persist_warned_at: float | None = None
-
-# Debounce identical admin error alerts (once per error class / 5 minutes).
 _last_error_alert: dict[str, float] = {}
 _ERROR_ALERT_INTERVAL = 300.0
-
-
-def _is_transient_telegram_error(exc: BaseException | None) -> bool:
-    """Return True for recoverable Telegram/httpx transport glitches."""
-    if exc is None:
-        return False
-    if isinstance(exc, _TRANSIENT_TG_ERRORS):
-        return True
-    # Some PTB paths wrap the real cause; walk a short chain.
-    cause = getattr(exc, "__cause__", None)
-    return isinstance(cause, _TRANSIENT_TG_ERRORS)
-
-
-async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Global error handler: always log; admin-alert only for non-transient bugs."""
-    exc = context.error
-
-    # Network blips during getUpdates (httpx.ReadError / Bad Gateway / timeouts)
-    # are expected on long-poll; PTB retries. Log at WARNING, never spam admins.
-    if _is_transient_telegram_error(exc):
-        log.warning(
-            "Transient Telegram network error (will retry; not alerting): %s: %s",
-            type(exc).__name__,
-            exc,
-        )
-        return
-
-    if exc is not None:
-        log.error("Unhandled exception in update handler (update=%r)", update, exc_info=exc)
-    else:
-        log.error("Unhandled exception in update handler (update=%r); no error attached", update)
-
-    # Best-effort admin alert, debounced by exception class to avoid flooding.
-    try:
-        if not _ADMIN_CHAT_IDS or exc is None:
-            return
-        now = time.time()
-        key = type(exc).__name__
-        if now - _last_error_alert.get(key, 0.0) < _ERROR_ALERT_INTERVAL:
-            return
-        _last_error_alert[key] = now
-        text = (
-            "⚠️ Bot 未处理异常\n"
-            f"类型: {type(exc).__name__}\n"
-            f"信息: {str(exc)[:500]}"
-        )
-        for cid in _ADMIN_CHAT_IDS:
-            try:
-                await context.bot.send_message(chat_id=cid, text=text)
-            except Exception:
-                log.debug("Failed to deliver error alert to admin %s", cid, exc_info=True)
-    except Exception:
-        # Never let the error handler itself crash the dispatcher.
-        log.debug("error_handler: admin-alert dispatch failed", exc_info=True)
-
-
-def _cron_alert_state_path() -> Path:
-    """Path of the persisted 24h cron-alert gate state.
-
-    Override with CIVITAI_CRON_ALERT_STATE (used by tests so they never
-    touch the production file). Default: <SCRIPT_DIR>/cron_alert_state.json.
-    """
-    raw = os.environ.get("CIVITAI_CRON_ALERT_STATE")
-    if raw:
-        return Path(raw)
-    return SCRIPT_DIR / "cron_alert_state.json"
-
-
-def _read_cron_alert_state_file() -> dict[str, dict]:
-    """Load persisted gate state. Corrupt/missing files yield {}."""
-    path = _cron_alert_state_path()
-    try:
-        if not path.exists() or path.stat().st_size == 0:
-            return {}
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    out: dict[str, dict] = {}
-    for job, st in data.items():
-        if not isinstance(job, str) or not isinstance(st, dict):
-            continue
-        try:
-            ts = float(st.get("last_success_ts"))
-        except (TypeError, ValueError):
-            continue
-        out[job] = {
-            "last_success_ts": ts,
-            "alerted": bool(st.get("alerted", False)),
-            "last_alert_date": str(st.get("last_alert_date") or ""),
-        }
-    return out
-
-
-def _persist_cron_alert_state() -> None:
-    """Best-effort atomic write of in-memory gate state. Never raises.
-
-    First persist failure logs WARNING (with traceback); repeats within
-    24 hours are debug. A later success after a failure logs recovery.
-    """
-    global _cron_alert_persist_had_failure, _cron_alert_persist_warned_at
-    try:
-        payload = json.dumps(_cron_alert_state, indent=2, sort_keys=True)
-        _atomic_write(_cron_alert_state_path(), payload)
-    except Exception:
-        _cron_alert_persist_had_failure = True
-        now = time.time()
-        if (
-            _cron_alert_persist_warned_at is None
-            or now - _cron_alert_persist_warned_at >= CRON_ALERT_WINDOW_S
-        ):
-            _cron_alert_persist_warned_at = now
-            log.warning("Failed to persist cron alert state", exc_info=True)
-        else:
-            log.debug("Failed to persist cron alert state", exc_info=True)
-        return
-    if _cron_alert_persist_had_failure:
-        _cron_alert_persist_had_failure = False
-        _cron_alert_persist_warned_at = None
-        log.info("告警状态持久化已恢复")
-
-
-def _ensure_cron_alert_state_loaded() -> None:
-    """Merge on-disk state into memory once per process (or after a test reset)."""
-    global _cron_alert_disk_loaded
-    if _cron_alert_disk_loaded:
-        return
-    _cron_alert_disk_loaded = True
-    disk = _read_cron_alert_state_file()
-    for job, st in disk.items():
-        _cron_alert_state.setdefault(job, st)
-
-
-def _job_alert_state(job: str, now: float) -> dict:
-    """Return per-job gate state, bootstrapping from now when history is missing."""
-    _ensure_cron_alert_state_loaded()
-    if job not in _cron_alert_state:
-        _cron_alert_state[job] = {
-            "last_success_ts": now,
-            "alerted": False,
-            "last_alert_date": "",
-        }
-        _persist_cron_alert_state()
-    return _cron_alert_state[job]
-
-
-def _cron_alert_gate(
-    job: str, *, failing: bool, now: float | None = None
-) -> str | None:
-    """Decide whether a cron outcome should page the admins (24h-success gate).
-
-    Semantics:
-      * no history: record ``now`` as last_success_ts (no startup false alarm)
-      * failure and now - last_success_ts < 24h: silent
-      * failure and window elapsed, not yet alerted: "fail" (once/episode)
-      * failure still ongoing, new UTC day: "digest" (one per day)
-      * success: refresh last_success_ts; "recover" only if we had alerted
-    State is persisted to cron_alert_state.json so a restart does not reset
-    the 24h clock. ``scan`` and ``reconciliation`` share this helper (job key).
-    """
-    if now is None:
-        now = time.time()
-    today = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
-    state = _job_alert_state(job, now)
-    try:
-        last_success = float(state.get("last_success_ts"))
-    except (TypeError, ValueError):
-        last_success = now
-        state["last_success_ts"] = now
-        _persist_cron_alert_state()
-
-    if failing:
-        if now - last_success < CRON_ALERT_WINDOW_S:
-            return None
-        if not state.get("alerted"):
-            state["alerted"] = True
-            state["last_alert_date"] = today
-            _persist_cron_alert_state()
-            return "fail"
-        if state.get("last_alert_date") != today:
-            state["last_alert_date"] = today
-            _persist_cron_alert_state()
-            return "digest"
-        return None
-
-    was_alerted = bool(state.get("alerted"))
-    state["last_success_ts"] = now
-    state["alerted"] = False
-    state["last_alert_date"] = ""
-    _persist_cron_alert_state()
-    if was_alerted:
-        return "recover"
-    return None
-
-
-_CRON_ALERT_LABELS = {"scan": "定时扫描", "reconciliation": "每日对账"}
-
-_SCAN_ERROR_MARKERS = (
-    "Page query failed",
-    "Fatal page fetch failure",
-    "fetch_page failed",
-)
-_SCAN_ERROR_FALLBACK_MARKERS = (
-    "Service Unavailable",
-    "Server Error",
-    "Too Many Requests",
-    "Rate Limited",
-    "timed out",
-    "ReadTimeout",
-    "ConnectTimeout",
-    "ConnectionError",
-    "Connection refused",
-    "Max retries exceeded",
-    "Failed to establish",
-)
-_BARE_EXIT_NOISE = (
-    "Scheduled scan failed (exit",
-    "Daily reconciliation finished with code",
-    "monitor.py 非零退出",
-    "reconcile 非零退出",
-)
-_HTTP_STATUS_CODES = r"401|403|404|429|500|502|503|504"
-# Phrases that must sit next to the status code. Soft words Timeout/Unavailable
-# are NOT included: they remain timeout/connection classifiers, not HTTP keys.
-_HTTP_ERROR_PHRASE = (
-    r"Server Error|Client Error|Bad Gateway|Gateway Time-?out|"
-    r"Service Unavailable|Rate Limited|Too Many Requests"
-)
-# Status code and error phrase within 40 characters (no digits in the gap).
-_HTTP_ADJACENT_RE = re.compile(
-    rf"(?:\b(?P<pre>{_HTTP_STATUS_CODES})\b\D{{0,40}}(?:{_HTTP_ERROR_PHRASE})"
-    rf"|(?:{_HTTP_ERROR_PHRASE})\D{{0,40}}\b(?P<post>{_HTTP_STATUS_CODES})\b)",
-    re.IGNORECASE,
-)
-# Explicit forms that do not need a phrase: HTTP 502, status=503, aiohttp 503, url=
-_HTTP_EXPLICIT_RE = re.compile(
-    rf"(?:HTTP(?:/\d+(?:\.\d+)?)?\s+\b(?P<http>{_HTTP_STATUS_CODES})\b"
-    rf"|\bstatus\s*[=:]\s*(?P<st>{_HTTP_STATUS_CODES})\b"
-    rf"|\b(?P<aio>{_HTTP_STATUS_CODES})\s*,\s*"
-    rf"(?:message\s*=.*?,\s*)?url\s*=)",
-    re.IGNORECASE,
-)
-_TIMEOUT_MARKERS = ("timed out", "timeout", "readtimeout", "connecttimeout")
-_CONN_MARKERS = (
-    "connectionerror",
-    "connection refused",
-    "connection reset",
-    "max retries exceeded",
-    "failed to establish",
-    "name or service not known",
-    "temporary failure in name resolution",
-    "network is unreachable",
-)
-
-
-def _http_error_status(text: str) -> int | None:
-    """HTTP status only when the number is adjacent to error evidence."""
-    if not text:
-        return None
-    m = _HTTP_ADJACENT_RE.search(text)
-    if m:
-        return int(m.group("pre") or m.group("post"))
-    m = _HTTP_EXPLICIT_RE.search(text)
-    if m:
-        for key in ("http", "st", "aio"):
-            val = m.group(key)
-            if val:
-                return int(val)
-    return None
-
-
-def _looks_like_bare_exit(text: str) -> bool:
-    """True when the only useful token is a subprocess exit code."""
-    if not re.search(r"\bexit\s+\d+\b", text) and "非零退出" not in text:
-        return False
-    low = text.lower()
-    return not (
-        _http_error_status(text) is not None
-        or any(m in low for m in _TIMEOUT_MARKERS)
-        or any(m in low for m in _CONN_MARKERS)
-    )
-
-
-def _humanize_scan_error(reason: str) -> str:
-    """Turn a raw log line into a short title fragment (never a bare exit code)."""
-    text = (reason or "").strip()
-    if not text:
-        return ""
-    code = _http_error_status(text)
-    if code is not None:
-        try:
-            phrase = HTTPStatus(code).phrase
-        except ValueError:
-            phrase = ""
-        if phrase:
-            return f"Civitai API {code} {phrase}"
-        return f"Civitai API {code}"
-    low = text.lower()
-    if any(marker in low for marker in _TIMEOUT_MARKERS):
-        return "连接超时"
-    if any(marker in low for marker in _CONN_MARKERS):
-        return "连接错误"
-    if _looks_like_bare_exit(text):
-        return ""
-    cleaned = text
-    for sep in ("civitai-monitor: ", "civitai-bot: "):
-        if sep in cleaned:
-            cleaned = cleaned.split(sep, 1)[-1]
-    cleaned = cleaned.strip()
-    return cleaned[:160]
-
-
-def _log_tail_candidates(log_path: str | None = None):
-    """Yield decoded log-tail lines from the first readable candidate files."""
-    candidates: list[Path] = []
-    if log_path:
-        candidates.append(Path(log_path))
-    else:
-        try:
-            target = os.readlink("/proc/self/fd/1")
-            if target.startswith("/"):
-                candidates.append(Path(target))
-        except OSError:
-            pass
-        candidates.append(Path("/var/log/civitai-bot.log"))
-    for cand in candidates:
-        try:
-            if not cand.exists() or cand.stat().st_size == 0:
-                continue
-            with cand.open("rb") as f:
-                f.seek(0, 2)
-                size = f.tell()
-                f.seek(max(0, size - 65536))
-                tail = f.read().decode("utf-8", "replace")
-            yield tail.splitlines()
-        except OSError:
-            continue
-
-
-def _strip_log_prefix(reason: str) -> str:
-    for sep in ("civitai-monitor: ", "civitai-bot: "):
-        if sep in reason:
-            reason = reason.split(sep, 1)[-1]
-    return reason.strip()[:200]
-
-
-def _pick_error_line(lines: list[str]) -> str:
-    """Most informative page-fetch / transport error from a log-line window."""
-    hits = [line for line in lines if any(m in line for m in _SCAN_ERROR_MARKERS)]
-    if not hits:
-        hits = [
-            line for line in lines
-            if any(m in line for m in _SCAN_ERROR_FALLBACK_MARKERS)
-            and not any(n in line for n in _BARE_EXIT_NOISE)
-        ]
-    if not hits:
-        hits = [
-            line for line in lines
-            if (
-                "[ERROR]" in line
-                or "[WARNING]" in line
-                or " Error" in line
-                or line.endswith("Error")
-            )
-            and not any(n in line for n in _BARE_EXIT_NOISE)
-            and "Scheduled scan starting" not in line
-        ]
-    if not hits:
-        return ""
-    return _strip_log_prefix(hits[-1])
-
-
-_RECON_START_MARKER = "Daily deep reconciliation starting"
-_RECON_END_MARKERS = (
-    "Daily reconciliation finished with code",
-    "Daily reconciliation error:",
-    "Daily deep reconciliation completed successfully",
-)
-
-
-def _recon_window_lines(lines: list[str]) -> list[str]:
-    """Latest reconcile-subprocess slice; never a preceding/following scan run."""
-    start_idx = None
-    for i, line in enumerate(lines):
-        if _RECON_START_MARKER in line:
-            start_idx = i
-    if start_idx is None:
-        return [ln for ln in lines if "[RECONCILE]" in ln]
-    end_idx = len(lines)
-    for i in range(start_idx + 1, len(lines)):
-        if any(m in lines[i] for m in _RECON_END_MARKERS):
-            end_idx = i + 1
-            break
-    return lines[start_idx:end_idx]
-
-
-def _last_scan_error_line(log_path: str | None = None) -> str:
-    """Best-effort: most recent monitor page-fetch / transport error from the log.
-
-    The systemd unit appends both the bot and the spawned monitor to the same
-    log file, so when a scheduled scan exits non-zero the underlying reason
-    (e.g. a Civitai API 503) is in the tail. Prefers structured page-fetch
-    lines; otherwise the most informative HTTP/timeout/connection line.
-    Returns an empty string when nothing useful is found — callers must not fall back
-    to a bare exit code as the only alert content.
-    """
-    for lines in _log_tail_candidates(log_path):
-        reason = _pick_error_line(lines)
-        if reason:
-            return reason
-    return ""
-
-
-def _last_recon_error_line(log_path: str | None = None) -> str:
-    """Most recent error from the latest [RECONCILE] / recon-run log window.
-
-    Scan-only lines outside that window are ignored so a site-wide 503 that
-    also fails reconcile can still be titled from recon's own logs, without
-    borrowing a later or earlier scheduled-scan error.
-    """
-    for lines in _log_tail_candidates(log_path):
-        reason = _pick_error_line(_recon_window_lines(lines))
-        if reason:
-            return reason
-    return ""
-
-
-def _cron_failure_headline(
-    job: str, detail: str = "", *, log_path: str | None = None
-) -> str:
-    """Title fragment for a failing cron job; recon never borrows scan logs."""
-    if job == "reconciliation":
-        raw = _last_recon_error_line(log_path)
-        return (
-            _humanize_scan_error(raw)
-            or _humanize_scan_error(detail)
-            or "未能提取失败原因"
-        )
-    raw = _last_scan_error_line(log_path)
-    return (
-        _humanize_scan_error(raw)
-        or _humanize_scan_error(detail)
-        or "未能从日志提取失败原因"
-    )
-
-
-async def _report_cron_outcome(job: str, *, failing: bool, detail: str = "") -> None:
-    """Best-effort Telegram alert about a cron outcome.
-
-    Never raises: a failing send (or any other error here) must never take
-    down the cron loop. Sends one message per admin chat in _ADMIN_CHAT_IDS.
-    Failure titles name the HTTP/timeout/connection error; they never consist
-    of a bare exit code alone. Reconciliation titles use the recon log window
-    (or the job's own detail) and never borrow a scan log line.
-    """
-    try:
-        kind = _cron_alert_gate(job, failing=failing)
-        if kind is None:
-            return
-        label = _CRON_ALERT_LABELS.get(job, job)
-        if kind == "recover":
-            text = f"✅ {label}已恢复正常"
-        else:
-            headline = _cron_failure_headline(job, detail)
-            if kind == "fail":
-                head = f"❌ {label}已连续 24 小时失败：{headline}"
-            else:
-                head = f"❌ {label}仍在失败（每日摘要）：{headline}"
-            text = f"{head}\n{detail}" if detail else head
-        bot = _alert_bot
-        if bot is None or not _ADMIN_CHAT_IDS:
-            log.debug("Cron alert skipped (no bot/admin chats configured): %s", text)
-            return
-        for cid in _ADMIN_CHAT_IDS:
-            try:
-                await bot.send_message(chat_id=cid, text=text)
-            except Exception:
-                log.debug("Failed to deliver cron alert to admin %s", cid, exc_info=True)
-    except Exception:
-        log.debug("Cron alert dispatch failed", exc_info=True)
-
-
-def _application_builder_for_config(token: str, api_base_url: str):
-    """Build Application.builder wired to config telegram.api_base_url.
-
-    monitor.py already pushes media via the local Bot API Server
-    (http://127.0.0.1:8081). The admin bot must poll the same endpoint;
-    otherwise getUpdates hits api.telegram.org directly and surfaces
-    httpx.ReadError / Bad Gateway as noisy admin alerts.
-    """
-    base = (api_base_url or "https://api.telegram.org").rstrip("/")
-    builder = (
-        Application.builder()
-        .token(token)
-        # Generous timeouts: long-poll + local Bot API can be slow under load.
-        .connect_timeout(30.0)
-        .read_timeout(30.0)
-        .write_timeout(30.0)
-        .pool_timeout(30.0)
-        .get_updates_connect_timeout(30.0)
-        .get_updates_read_timeout(50.0)
-        .get_updates_pool_timeout(30.0)
-        .get_updates_write_timeout(30.0)
-    )
-    # Official default is https://api.telegram.org/bot — only override when
-    # config points elsewhere (local Bot API Server).
-    if base and base != "https://api.telegram.org":
-        builder = (
-            builder
-            .base_url(f"{base}/bot")
-            .base_file_url(f"{base}/file/bot")
-        )
-        # --local mode returns absolute filesystem paths for downloaded files.
-        if base.startswith(("http://127.0.0.1", "http://localhost")):
-            builder = builder.local_mode(True)
-    return builder
-
-# ---------------------------------------------------------------------------
-# Rate limiting
-# ---------------------------------------------------------------------------
-
 _user_last_call: dict[str, float] = defaultdict(float)
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+CONFIG_PATH = SCRIPT_DIR / "config.yaml"
+DOWNLOAD_DIR = SCRIPT_DIR / "downloads"
+MONITOR_SCRIPT = SCRIPT_DIR / "monitor.py"
+INTERVAL_CONFIG = SCRIPT_DIR / "interval.json"
+ACTIVE_BACKFILLS = SCRIPT_DIR / "active_backfills.json"
+
+_backfill_serial_lock: asyncio.Lock | None = None
+_scan_interval: int = 600
+_current_scan_proc: asyncio.subprocess.Process | None = None
+_current_recon_proc: asyncio.subprocess.Process | None = None
+_shutdown_requested = False
+AUTHORIZED_USER_IDS: set[int] = set()
+
+_scan_stats: dict[str, int] = {"success": 0, "failure": 0, "skipped": 0}
+_weekly_report_last_sent_date: str | None = None
+
+
+def _bot() -> Any:
+    return sys.modules[__name__]
+
 
 def rate_limit(min_interval: float = 5.0):
     """Per-user rate limiter: at least min_interval seconds between calls."""
@@ -658,8 +156,6 @@ def rate_limit(min_interval: float = 5.0):
             if elapsed < min_interval:
                 remaining = int(min_interval - elapsed) + 1
                 notice = f"⏳ 请等 {remaining} 秒后再试"
-                # Callback queries have no update.message — use effective_message
-                # or answer the callback so the bot never crashes on button taps.
                 msg = update.effective_message
                 if msg is not None:
                     await msg.reply_text(notice)
@@ -674,1589 +170,129 @@ def rate_limit(min_interval: float = 5.0):
         return wrapper
     return decorator
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-SCRIPT_DIR = Path(__file__).parent.resolve()
-CONFIG_PATH = SCRIPT_DIR / "config.yaml"
-DOWNLOAD_DIR = SCRIPT_DIR / "downloads"
-MONITOR_SCRIPT = SCRIPT_DIR / "monitor.py"
-
-# Scan interval config file
-INTERVAL_CONFIG = SCRIPT_DIR / "interval.json"
-
-# Active backfills state file (persists running backfill tasks across restarts)
-ACTIVE_BACKFILLS = SCRIPT_DIR / "active_backfills.json"
-
-
-def _load_active_backfills() -> dict[str, dict[str, str]]:
-    """Load active backfills state. Returns {tg_id: {username: last_active_iso, ...}, ...}."""
-    try:
-        return json.loads(ACTIVE_BACKFILLS.read_text())
-    except (json.JSONDecodeError, OSError, FileNotFoundError):
-        return {}
-
-
-def _save_active_backfills(data: dict[str, dict[str, str]]) -> None:
-    """Atomically write active backfills state via rename."""
-    tmp = tempfile.NamedTemporaryFile(  # noqa: SIM115
-        mode="w", suffix=".tmp", dir=SCRIPT_DIR, delete=False, encoding="utf-8"
-    )
-    try:
-        json.dump(data, tmp)
-        tmp.close()
-        os.replace(tmp.name, str(ACTIVE_BACKFILLS))
-    except Exception as e:
-        log.error("Failed to save active_backfills.json: %s", e)
-        if os.path.exists(tmp.name):
-            os.unlink(tmp.name)
-        raise
-
-
-# ---------------------------------------------------------------------------
-# Real backfill lock — held by the bot for the entire backfill lifecycle.
-# Returns the open fd; caller must call _release_backfill_lock(fd, path) to free.
-# Two-tier protection:
-#   1. This fd-level flock: prevents concurrent backfills across bot restarts
-#      (a fresh bot sees the fd held by an orphaned process and bails out).
-#   2. The asyncio.Lock (`_backfill_serial_lock`) below: serialises backfill
-#      tasks within the same bot process.
-# ---------------------------------------------------------------------------
-def _acquire_backfill_lock(tg_id: str, username: str) -> tuple[int, Path] | None:
-    """Acquire an exclusive fcntl flock for the backfill. Returns (fd, path) or None.
-
-    The lock is held until the caller releases it via _release_backfill_lock().
-    The .backfill_lock_*.lck file is a permanent sentinel: _release_backfill_lock
-    never unlinks it (unlink-after-unlock would race with a concurrent opener).
-    """
-    lock_path = SCRIPT_DIR / f".backfill_lock_{tg_id}_{username}.lck"
-    fd = None
-    try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return fd, lock_path
-    except OSError:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                log.exception("Failed to close lock fd")
-        return None
-
-
-def _release_backfill_lock(fd: int, path: Path) -> None:
-    """Release the fcntl flock (the lock file itself is left on disk).
-
-    Deliberately NOT unlinked: unlink-after-unlock races with a waiter that
-    has just opened the same path — it would flock the fresh inode while we
-    still hold the orphaned one, letting two processes both believe they own
-    the lock. The file is a permanent sentinel; flock on the live inode is
-    what protects concurrent backfills, and the _resume_stale_backfills
-    probe no longer amplifies the race either. `path` stays in the signature
-    for call-site compatibility.
-    """
-    try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-    except OSError:
-        pass
-
-
-# In-process serialisation: only one backfill runs at a time per bot process.
-_backfill_serial_lock: asyncio.Lock | None = None
-
-
-def _get_backfill_serial_lock() -> asyncio.Lock:
-    global _backfill_serial_lock
-    if _backfill_serial_lock is None:
-        _backfill_serial_lock = asyncio.Lock()
-    return _backfill_serial_lock
-
-
-def _register_backfill(tg_id: str, username: str) -> None:
-    """Register (or refresh) a running backfill so it can be resumed after restart."""
-    from datetime import datetime, timezone
-    data = _load_active_backfills()
-    if tg_id not in data:
-        data[tg_id] = {}
-    data[tg_id][username] = datetime.now(timezone.utc).isoformat()
-    _save_active_backfills(data)
-
-
-def _unregister_backfill(tg_id: str, username: str) -> None:
-    """Remove a backfill from the active registry (called on completion/failure)."""
-    data = _load_active_backfills()
-    if tg_id in data and username in data[tg_id]:
-        del data[tg_id][username]
-        if not data[tg_id]:
-            del data[tg_id]
-        _save_active_backfills(data)
-
-
-def _load_interval() -> int:
-    """Load interval from file, default 600s (10 min).
-
-    The JSON top level must be an object and ``seconds`` a positive int;
-    anything else (scalar/array top level, non-int seconds) falls back to 600
-    instead of crashing the scan cron with AttributeError.
-    """
-    try:
-        data = json.loads(INTERVAL_CONFIG.read_text())
-    except FileNotFoundError:
-        log.info("No interval config at %s, using default 600s", INTERVAL_CONFIG)
-        return 600
-    except (json.JSONDecodeError, OSError) as e:
-        log.warning("Invalid interval config, using default 600s: %s", e)
-        return 600
-    seconds = data.get("seconds", 600) if isinstance(data, dict) else None
-    if isinstance(seconds, int) and not isinstance(seconds, bool) and seconds > 0:
-        return seconds
-    log.warning(
-        "Invalid interval config (top-level %s, seconds=%r), using default 600s",
-        type(data).__name__, seconds,
-    )
-    return 600
-
-
-def _save_interval(seconds: int) -> None:
-    """Persist scan interval atomically (tmp + rename) to match other state files."""
-    tmp = INTERVAL_CONFIG.with_suffix(INTERVAL_CONFIG.suffix + ".tmp")
-    with open(tmp, "w") as f:
-        f.write(json.dumps({"seconds": seconds}))
-        f.flush()
-        os.fsync(f.fileno())
-    tmp.replace(INTERVAL_CONFIG)
-    INTERVAL_CONFIG.chmod(0o600)
-
-
-def _reconciliation_status_file(cfg: MonitorConfig | None = None) -> Path:
-    if cfg is None:
-        cfg = read_config()
-    data_dir = Path(cfg.data.data_dir) if cfg.data.data_dir else SCRIPT_DIR
-    return data_dir / "reconciliation_status.json"
-
-
-def _load_reconciliation_last_success(cfg: MonitorConfig | None = None) -> str | None:
-    """Load last successful reconciliation date (YYYY-MM-DD)."""
-    path = _reconciliation_status_file(cfg)
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text())
-        return data.get("last_success_date")
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
-def _save_reconciliation_last_success(date_str: str, cfg: MonitorConfig | None = None) -> None:
-    """Atomically persist last successful reconciliation date."""
-    path = _reconciliation_status_file(cfg)
-    _atomic_write(path, json.dumps({"last_success_date": date_str}, indent=2))
-
-
-_scan_interval: int = 600
-
-# Track current scheduled-scan / manual-scan (/scan) / reconciliation subprocesses so cmd_stop can terminate
-# them without using pgrep — pgrep "python3.*monitor.py" would also match a
-# running backfill subprocess and kill the wrong thing.
-_current_scan_proc: asyncio.subprocess.Process | None = None
-_current_recon_proc: asyncio.subprocess.Process | None = None
-
-# Loop-exit flag for scheduled_scan_cron. In production this is never
-# set — the scan task is torn down by PTB's Application.stop(), and the
-# finally-block handles the subprocess cleanup. The flag exists for
-# tests and as a documented early-exit hook.
-_shutdown_requested = False
-
-# Authorised user — resolved from config at startup
-AUTHORIZED_USER_IDS: set[int] = set()
-
-# ---------------------------------------------------------------------------
-# Config helpers
-# ---------------------------------------------------------------------------
-
 
 def read_config() -> MonitorConfig:
-    if not CONFIG_PATH.exists():
-        # Return minimal config so bot can still respond before setup
-        return MonitorConfig(
-            telegram={"bot_token": "UNSET", "chat_id": "UNSET"},
-            subscriptions={},
-            authorized_users=[],
-        )
-    # Load config safely: if config is corrupted or validation fails,
-    # fall back to minimal config instead of crashing the bot process
-    cfg = load_config(CONFIG_PATH)
-    if cfg is None:
-        log.warning("Config validation failed, using minimal config fallback")
-        return MonitorConfig(
-            telegram={"bot_token": "UNSET", "chat_id": "UNSET"},
-            subscriptions={},
-            authorized_users=[],
-        )
-    return cfg
-
-
-# write_config is imported from monitor/config_io (redacts bot_token, atomic write)
-
-
-def get_users(cfg: MonitorConfig, telegram_user_id: int) -> list[str]:
-    subs = cfg.subscriptions or {}
-    raw = subs.get(str(telegram_user_id), [])
-    return [u.get("name", str(u)) if isinstance(u, dict) else str(u) for u in raw]
-
-
-def set_users(cfg: MonitorConfig, telegram_user_id: int, users: list[str]) -> MonitorConfig:
-    if not cfg.subscriptions:
-        cfg.subscriptions = {}
-    cfg.subscriptions[str(telegram_user_id)] = [{"name": u} for u in users]
-    return cfg
-
-
-# ---------------------------------------------------------------------------
-# Username parsing & validation
-# ---------------------------------------------------------------------------
-
-CIVITAI_API = "https://civitai.com/api/v1"
-USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{2,64}$")
-
-# Known Civitai user profile URL prefixes (only these are accepted)
-_CIVITAI_URL_PREFIXES = (
-    "https://www.civitai.com/user/", "http://www.civitai.com/user/",
-    "https://civitai.com/user/", "http://civitai.com/user/",
-    "www.civitai.com/user/", "civitai.com/user/",
-    "https://www.civitai.red/user/", "http://www.civitai.red/user/",
-    "https://civitai.red/user/", "http://civitai.red/user/",
-    "www.civitai.red/user/", "civitai.red/user/",
-)
-
-
-def parse_username_input(raw: str) -> str | None:
-    """Extract Civitai username from various input formats.
-
-    Only accepts:
-      - https://civitai.com/user/Username
-      - https://civitai.red/user/Username
-      - @Username
-      - Username (plain text)
-
-    Returns None if input doesn't match any known format.
-    """
-    text = raw.strip()
-
-    # URL: only match known Civitai domains
-    for prefix in _CIVITAI_URL_PREFIXES:
-        if text.lower().startswith(prefix.lower()):
-            cand = text[len(prefix):].split("/")[0].split("?")[0].split("#")[0]
-            if USERNAME_RE.match(cand):
-                return cand
-            return None
-
-    # Also reject URLs that look like a different site entirely
-    if text.startswith(("http://", "https://", "www.")):
-        return None
-
-    # @username
-    if text.startswith("@"):
-        cand = text[1:]
-        if USERNAME_RE.match(cand):
-            return cand
-        return None
-
-    # Plain username
-    if USERNAME_RE.match(text):
-        return text
-
-    return None
+    return read_config_from(CONFIG_PATH)
 
 
 def validate_username_exists(username: str, cookies_path: str | Path | None = None) -> tuple[bool, str]:
-    """Check if a Civitai username exists and has public content.
-
-    Since NSFW content moved to civitai.red, we query both domains
-    with cookies + browsingLevel to detect all content types.
-    Returns (ok, message).
-    """
-    # Try to load cookies for NSFW API access
-    s = requests.Session()
-    s.headers.update({"User-Agent": "CivitaiMonitor/2.0"})
-    if cookies_path is None:
-        # Backwards-compatible fallback when no config cookies path is supplied
-        cookies_path = SCRIPT_DIR / "civitai_cookies.txt"
-    else:
-        cookies_path = Path(cookies_path)
-    if cookies_path.exists():
-        try:
-            cj = http.cookiejar.MozillaCookieJar(str(cookies_path))
-            cj.load(ignore_expires=True, ignore_discard=True)
-            s.cookies.update(cj)
-        except (OSError, http.cookiejar.LoadError, Exception) as e:  # noqa: BLE001
-            log.warning("Failed to load cookies from %s: %s", cookies_path, e)
-
-    has_sfw = False
-    has_nsfw = False
-    errors = []
-    apis = [("civitai.com", "https://civitai.com/api/v1/images"),
-            ("civitai.red", "https://civitai.red/api/v1/images")]
-
-    for api_name, api_url in apis:
-        for nsfw_flag, label in [(False, "SFW"), (True, "NSFW")]:
-            if not nsfw_flag and api_name != "civitai.com":
-                continue  # SFW only needed from civitai.com
-            try:
-                # NOTE: some users return 0 items with sort=Newest (Civitai API bug),
-                # so we omit sort entirely and use the API default (Most Reactions).
-                # The goal here is just to verify the user HAS public content.
-                params: dict = {"username": username, "limit": 5}
-                if nsfw_flag:
-                    params["nsfw"] = "true"
-                    # browsingLevel omitted — cookies provide the user level
-                resp = s.get(api_url, params=params, timeout=10)
-                if resp.status_code == 404:
-                    return False, f"❌ 用户 @{username} 不存在（Civitai 返回 404）"
-                if resp.status_code == 403:
-                    return False, f"❌ 无法验证 @{username}（被 API 拒绝，可能已封禁或限制访问）"
-                resp.raise_for_status()
-                items = resp.json().get("items", [])
-                if items:
-                    if nsfw_flag:
-                        has_nsfw = True
-                    else:
-                        has_sfw = True
-            except requests.RequestException as e:
-                errors.append(f"{api_name}/{label}: {e}")
-
-    if errors:
-        return False, f"❌ 验证用户时出错: {'; '.join(errors)}"
-
-    if not has_sfw and not has_nsfw:
-        return False, f"❌ 用户 @{username} 存在但未找到公开作品，无法监控"
-
-    parts = []
-    if has_sfw:
-        parts.append("SFW ✅")
-    if has_nsfw:
-        parts.append("NSFW ✅")
-    return True, f"✅ 用户 @{username} 存在，有公开作品（{' '.join(parts)}）"
+    return _validate_username_exists(username, cookies_path, default_script_dir=SCRIPT_DIR)
 
 
-# ---------------------------------------------------------------------------
-# Authorisation guard
-# ---------------------------------------------------------------------------
+def _track_task(task: asyncio.Task) -> asyncio.Task:
+    return _state.track_task(_bot(), task)
 
 
-async def _check_auth(update: Update) -> bool:
-    """Return True if the sender is authorised."""
-    if update.effective_user and update.effective_user.id in AUTHORIZED_USER_IDS:
-        return True
-    if update.message:
-        await update.message.reply_text("⛔ 未授权，此 Bot 仅限主人使用")
-    return False
+async def _shutdown_background_tasks(application: Application) -> None:
+    await _state.shutdown_background_tasks(_bot(), application)
 
 
-# ---------------------------------------------------------------------------
-# Command handlers
-# ---------------------------------------------------------------------------
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _state.error_handler(_bot(), update, context)
 
 
-@rate_limit(min_interval=3.0)
-async def cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _check_auth(update):
-        return
-    text = (
-        "🤖 *Civitai Monitor Admin Bot*\n\n"
-        "`/add <username>` — Add a user to the watch list\n"
-        "`/remove <username>` — Remove a user\n"
-        "`/list` — List all watched users\n"
-        "`/status` — Show monitor status\n"
-        "`/mode <incremental|full>` — Switch scan mode\n"
-        "`/nsfw <sfw_only|nsfw_only|both>` — Switch NSFW filter\n"
-        "`/cleanup [days]` — Clean cached images older than N days\n"
-        "`/scan` — Trigger an immediate incremental scan\n"
-        "`/backfill <username>` — Full backfill for a user\n"
-        "`/help` — Show this message"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
+def _cron_alert_state_path() -> Path:
+    return _state.cron_alert_state_path(_bot())
 
 
-@rate_limit(min_interval=3.0)
-async def cmd_add(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _check_auth(update):
-        return
-    args = update.message.text.strip().split(maxsplit=1)
-    if len(args) < 2:
-        await update.message.reply_text(
-            "用法: `/add <用户名|主页链接|@用户名>`\n"
-            "示例: `/add TargetUser`\n"
-            "      `/add https://civitai.red/user/TargetUser`\n"
-            "      `/add @TargetUser`",
-            parse_mode="Markdown",
-        )
-        return
+def _read_cron_alert_state_file() -> dict[str, dict]:
+    return _state.read_cron_alert_state_file(_bot())
 
-    # 智能识别用户名
-    username = parse_username_input(args[1])
-    if not username:
-        await update.message.reply_text(
-            "❌ 无法识别用户名。支持的格式：\n"
-            "• 纯用户名: `TargetUser`\n"
-            "• 主页链接: `https://civitai.com/user/xxx`\n"
-            "• @用户名: `@TargetUser`",
-            parse_mode="Markdown",
-        )
-        return
 
-    # 格式校验
-    if not USERNAME_RE.match(username):
-        await update.message.reply_text(
-            f"❌ 用户名 `{username}` 格式无效（仅允许字母、数字、下划线、连字符和点，2-64位）",
-            parse_mode="Markdown",
-        )
-        return
+def _persist_cron_alert_state() -> None:
+    _state.persist_cron_alert_state(_bot())
 
-    # 发送验证中提示
-    verifying_msg = await update.message.reply_text(f"⏳ 正在验证 @{username} 是否存在...")
 
-    # 存在性校验（使用 config 配置的 cookies 路径做 NSFW 检测）
-    cookies_file = read_config().http.cookies_file or None
-    ok, msg = await asyncio.to_thread(validate_username_exists, username, cookies_file)
-    if not ok:
-        await verifying_msg.edit_text(msg)
-        return
-    await verifying_msg.edit_text(msg)
+def _ensure_cron_alert_state_loaded() -> None:
+    _state.ensure_cron_alert_state_loaded(_bot())
 
-    # 检查是否已监控（大小写不敏感：同名大小写变体指向同一画师，
-    # 复订阅会经 chat 账本去重拦截，但订阅列表本身不应重复）
-    cfg = read_config()
-    uid = update.effective_user.id
-    users = get_users(cfg, uid)
-    if any(u.casefold() == username.casefold() for u in users):
-        await update.message.reply_text(f"👤 @{username} 已经在监控列表中了")
-        return
 
-    # 添加用户
-    users.append(username)
-    cfg = set_users(cfg, uid, users)
-    write_config(cfg, CONFIG_PATH)
-    await update.message.reply_text(
-        f"✅ 已添加 @{username} 到监控列表\n"
-        f"下次定时任务（每10分钟）将自动开始抓取",
+def _job_alert_state(job: str, now: float) -> dict:
+    return _state.job_alert_state(_bot(), job, now)
+
+
+def _cron_failure_headline(
+    job: str, detail: str = "", *, log_path: str | None = None
+) -> str:
+    return _errors._cron_failure_headline(
+        job,
+        detail,
+        log_path=log_path,
+        scan_err_fn=_last_scan_error_line,
+        recon_err_fn=_last_recon_error_line,
     )
 
 
-@rate_limit(min_interval=3.0)
-async def cmd_remove(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _check_auth(update):
-        return
-    await _show_remove_list(update.message, update.effective_user.id, page=0)
+def _cron_alert_gate(job: str, *, failing: bool, now: float | None = None) -> str | None:
+    return _state.cron_alert_gate(_bot(), job, failing=failing, now=now)
 
 
-async def _show_remove_list(message, telegram_user_id: int, page: int = 0) -> None:
-    """Display paginated user list with remove buttons."""
-    cfg = read_config()
-    users = get_users(cfg, telegram_user_id)
-    if not users:
-        await message.reply_text("📭 监控列表是空的，先 `/add` 加几个吧", parse_mode="Markdown")
-        return
+async def _report_cron_outcome(job: str, *, failing: bool, detail: str = "") -> None:
+    await _state.report_cron_outcome(_bot(), job, failing=failing, detail=detail)
 
-    markup, total_text, _page = paginated_user_keyboard(
-        users, page,
-        item_prefix="rem",
-        item_label_fmt="❌ @{u}",
-        page_prefix="rem_pg",
-        close_data="rem_cl",
-    )
-    await message.reply_text(
-        f"{total_text}\n点击按钮取消关注：",
-        reply_markup=markup,
-    )
 
+def _load_active_backfills() -> dict[str, dict[str, str]]:
+    return _state.load_active_backfills(_bot())
 
-@rate_limit(min_interval=3.0)
-async def cmd_remove_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle remove button presses."""
-    if not await _check_auth(update):
-        return
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    uid = query.from_user.id
 
-    try:
-        # Close — remove keyboard to avoid repeat clicks
-        if data == "rem_cl":
-            await query.edit_message_text("🔒 已关闭", reply_markup=None)
-            return
+def _save_active_backfills(data: dict[str, dict[str, str]]) -> None:
+    _state.save_active_backfills(_bot(), data)
 
-        # Pagination
-        if data.startswith("rem_pg:"):
-            page = int(data.split(":", 1)[1])
-            cfg = read_config()
-            users = get_users(cfg, uid)
-            await _render_remove_page(query, users, page)
-            return
 
-        # Remove user
-        if data.startswith("rem:"):
-            # bot_ui short-hashes usernames that would push callback_data past
-            # Telegram's 64-byte limit; resolve hashes back to the real
-            # username (plain names pass through unchanged).
-            username = resolve_callback_username(data.split(":", 1)[1])
-            cfg = read_config()
-            users = get_users(cfg, uid)
-            if username not in users:
-                await query.edit_message_text(f"👤 @{username} 已不在监控列表中", reply_markup=None)
-                return
-            users.remove(username)
-            cfg = set_users(cfg, uid, users)
-            write_config(cfg, CONFIG_PATH)
+def _acquire_backfill_lock(tg_id: str, username: str) -> tuple[int, Path] | None:
+    return _state.acquire_backfill_lock(_bot(), tg_id, username)
 
-            if users:
-                await query.edit_message_text(f"✅ 已取消关注 @{username}", reply_markup=None)
-                await _show_remove_list(query.message, uid, page=0)
-            else:
-                await query.edit_message_text(f"✅ 已取消关注 @{username}\n📭 监控列表已清空", reply_markup=None)
-    except Exception as e:
-        log.exception("Remove callback error: %s", e)  # noqa: TRY401
-        try:
-            await query.edit_message_text("❌ 操作失败，请重试 /remove", reply_markup=None)
-        except Exception as e:
-            log.exception("Nested error in remove callback: %s", e)  # noqa: TRY401
 
+def _release_backfill_lock(fd: int, path: Path) -> None:
+    _state.release_backfill_lock(fd, path)
 
-async def _render_remove_page(query, users: list[str], page: int) -> None:
-    """Update the message with a fresh page of remove buttons."""
-    markup, total_text, _page = paginated_user_keyboard(
-        users, page,
-        item_prefix="rem",
-        item_label_fmt="❌ @{u}",
-        page_prefix="rem_pg",
-        close_data="rem_cl",
-    )
-    await query.edit_message_text(
-        f"{total_text}\n点击按钮取消关注：",
-        reply_markup=markup,
-    )
 
+def _get_backfill_serial_lock() -> asyncio.Lock:
+    return _state.get_backfill_serial_lock(_bot())
 
-@rate_limit(min_interval=3.0)
-async def cmd_list(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _check_auth(update):
-        return
-    cfg = read_config()
-    users = get_users(cfg, update.effective_user.id)
-    if not users:
-        await update.message.reply_text("📭 No users configured. Use `/add` to add some.", parse_mode="Markdown")
-        return
-    lines = [f"👤 {u}" for u in users]
-    text = f"*Watched users ({len(lines)}):*\n" + "\n".join(lines)
-    await update.message.reply_text(text, parse_mode="Markdown")
 
+def _register_backfill(tg_id: str, username: str) -> None:
+    _state.register_backfill(_bot(), tg_id, username)
 
-@rate_limit(min_interval=3.0)
-async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _check_auth(update):
-        return
-    cfg = read_config()
-    users = get_users(cfg, update.effective_user.id)
 
-    # Stats
-    seen_count = 0
-    mtime = ""
-    data_dir = Path(cfg.data.data_dir) if cfg.data.data_dir else SCRIPT_DIR
-    seen_dir = data_dir / "seen_ids"
-    if seen_dir.exists():
-        latest_mtime = 0
-        for f in seen_dir.iterdir():
-            if f.suffix == ".json":
-                try:
-                    data = json.loads(f.read_text())
-                    seen_count += len(data) if isinstance(data, list) else 0
-                    latest_mtime = max(latest_mtime, f.stat().st_mtime)
-                except (OSError, ValueError) as e:
-                    log.warning("Error checking file mtime: %s", e)
-        if latest_mtime:
-            from zoneinfo import ZoneInfo
-            mt = datetime.fromtimestamp(latest_mtime, tz=timezone.utc)
-            bj = mt.astimezone(ZoneInfo("Asia/Shanghai"))
-            mtime = bj.strftime("%Y-%m-%d %H:%M")
+def _unregister_backfill(tg_id: str, username: str) -> None:
+    _state.unregister_backfill(_bot(), tg_id, username)
 
-    download_size = 0
-    if DOWNLOAD_DIR.exists():
-        download_size = sum(f.stat().st_size for f in DOWNLOAD_DIR.iterdir() if f.is_file())
 
-    size_str = _human_size(download_size)
+def _load_interval() -> int:
+    return _state.load_interval(_bot())
 
-    lines = [
-        f"👥 监控 · {len(users)} 人",
-        "",
-        f"💾 缓存 · {size_str}",
-        "",
-        f"🕐 更新 · {mtime}",
-    ]
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+def _save_interval(seconds: int) -> None:
+    _state.save_interval(_bot(), seconds)
 
-async def cmd_mode(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _check_auth(update):
-        return
-    args = update.message.text.strip().split(maxsplit=1)
-    if len(args) < 2:
-        await update.message.reply_text(
-            "Usage: `/mode <incremental|full>`\n"
-            "⚠️ *全局设置*：会影响**全部订阅者**的扫描模式。",
-            parse_mode="Markdown",
-        )
-        return
-    mode = args[1].strip().lower()
-    if mode not in ("incremental", "full"):
-        await update.message.reply_text("Invalid mode. Choose `incremental` or `full`.", parse_mode="Markdown")
-        return
-    cfg = read_config()
-    cfg.mode = mode
-    write_config(cfg, CONFIG_PATH)
-    await update.message.reply_text(
-        f"✅ Mode set to `{mode}`.\n"
-        f"⚠️ *全局设置*：此变更影响**全部订阅者**（不是仅你自己）。",
-        parse_mode="Markdown",
-    )
 
+def _reconciliation_status_file(cfg: MonitorConfig | None = None) -> Path:
+    return _state.reconciliation_status_file(_bot(), cfg)
 
-async def cmd_nsfw(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _check_auth(update):
-        return
-    args = update.message.text.strip().split(maxsplit=1)
-    if len(args) < 2:
-        await update.message.reply_text(
-            "Usage: `/nsfw <sfw_only|nsfw_only|both>`\n"
-            "⚠️ *全局设置*：会影响**全部订阅者**的 NSFW 过滤。",
-            parse_mode="Markdown",
-        )
-        return
-    val = args[1].strip().lower()
-    if val not in ("sfw_only", "nsfw_only", "both"):
-        await update.message.reply_text("Invalid. Choose `sfw_only`, `nsfw_only`, or `both`.", parse_mode="Markdown")
-        return
-    cfg = read_config()
-    cfg.nsfw = val
-    write_config(cfg, CONFIG_PATH)
-    await update.message.reply_text(
-        f"✅ NSFW filter set to `{val}`.\n"
-        f"⚠️ *全局设置*：此变更影响**全部订阅者**（不是仅你自己）。",
-        parse_mode="Markdown",
-    )
 
+def _load_reconciliation_last_success(cfg: MonitorConfig | None = None) -> str | None:
+    return _state.load_reconciliation_last_success(_bot(), cfg)
 
-async def cmd_cleanup(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _check_auth(update):
-        return
-    args = update.message.text.strip().split(maxsplit=1)
-    days = 7
-    if len(args) >= 2:
-        try:
-            days = int(args[1])
-        except ValueError:
-            await update.message.reply_text("Usage: `/cleanup [days]` — days must be a number.", parse_mode="Markdown")
-            return
-        if days < 1:
-            # 0 or negative makes cleanup_old_caches treat every cached file
-            # as already expired and wipes the whole downloads cache.
-            await update.message.reply_text(
-                "Usage: `/cleanup [days]` — days 必须为 ≥ 1 的整数（0/负数会清空全部缓存，已拒绝）。",
-                parse_mode="Markdown",
-            )
-            return
 
-    if not DOWNLOAD_DIR.exists():
-        await update.message.reply_text("📂 Download directory does not exist — nothing to clean.")
-        return
-
-    # Reuse monitor.cleanup_old_caches (days + max_total_gb) so bot and scanner share semantics.
-    cfg = read_config()
-    max_total_gb = getattr(cfg.download, "max_total_gb", 0) or 0
-    before_files = []
-    for root, _dirs, files in os.walk(DOWNLOAD_DIR):
-        for fname in files:
-            fpath = Path(root) / fname
-            try:
-                before_files.append((fpath, fpath.stat().st_size))
-            except OSError:
-                pass
-    before_size = sum(s for _, s in before_files)
-
-    removed = cleanup_old_caches(DOWNLOAD_DIR, days, max_total_gb)
-
-    after_size = 0
-    if DOWNLOAD_DIR.exists():
-        for root, _dirs, files in os.walk(DOWNLOAD_DIR):
-            for fname in files:
-                try:
-                    after_size += (Path(root) / fname).stat().st_size
-                except OSError:
-                    pass
-    size_freed = max(0, before_size - after_size)
-
-    if removed:
-        extra = f"，并按 max_total_gb={max_total_gb} 限额裁剪" if max_total_gb > 0 else ""
-        await update.message.reply_text(
-            f"🧹 Cleaned {removed} cached file(s) older than {days} days{extra} "
-            f"(freed {_human_size(size_freed)})."
-        )
-    else:
-        await update.message.reply_text(f"📂 No cached files older than {days} days.")
-
-
-async def communicate_with_idle_timeout(proc: asyncio.subprocess.Process, timeout: float = 1800.0) -> tuple[bytes, bytes]:
-    """
-    Read stdout and stderr of proc in a streaming fashion.
-    If no data is received on either stdout or stderr for `timeout` seconds,
-    raises asyncio.TimeoutError.
-    Returns (stdout_bytes, stderr_bytes).
-    """
-    out_chunks = []
-    err_chunks = []
-    queue = asyncio.Queue()
-
-    async def read_stream(stream, stream_type):
-        try:
-            while True:
-                data = await stream.read(4096)
-                if not data:
-                    break
-                await queue.put((stream_type, data))
-        except Exception as e:  # noqa: BLE001
-            await queue.put(("error", e))
-        finally:
-            await queue.put((stream_type, None))
-
-    # Start reading tasks
-    stdout_task = asyncio.create_task(read_stream(proc.stdout, "stdout"))
-    stderr_task = asyncio.create_task(read_stream(proc.stderr, "stderr"))
-
-    finished_streams = 0
-    try:
-        while finished_streams < 2:
-            try:
-                # Wait for data with idle timeout
-                stream_type, data = await asyncio.wait_for(queue.get(), timeout=timeout)
-            except asyncio.TimeoutError:
-                # Idle timeout reached! Cancel reading tasks and propagate exception
-                stdout_task.cancel()
-                stderr_task.cancel()
-                raise asyncio.TimeoutError()
-
-            if stream_type == "error":
-                raise data
-            elif data is None:
-                finished_streams += 1
-            else:
-                if stream_type == "stdout":
-                    out_chunks.append(data)
-                elif stream_type == "stderr":
-                    err_chunks.append(data)
-    finally:
-        # Ensure tasks are cleaned up
-        stdout_task.cancel()
-        stderr_task.cancel()
-        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-
-    return b"".join(out_chunks), b"".join(err_chunks)
-
-
-@rate_limit(min_interval=10.0)
-async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Manually trigger an incremental scan (mostly for debugging).
-
-    Uses asyncio.create_subprocess_exec instead of blocking subprocess.run
-    so the PTB event loop stays responsive — other Telegram messages
-    (e.g. /list, /help, /backfill) are not blocked while scan runs.
-    """
-    if not await _check_auth(update):
-        return
-    await update.message.reply_text("🔍 Running incremental scan...")
-    try:
-        # 30-minute ceiling: incremental normally takes a few minutes, but
-        # 8 users × slow Civitai API + video downloads can stretch it. The
-        # scheduled cron (scheduled_scan_cron) runs without an arbitrary
-        # ceiling — it just waits for the subprocess to finish on its own.
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, str(MONITOR_SCRIPT),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(SCRIPT_DIR),
-        )
-        # Publish the handle so /stop (cmd_stop) and _kill_running_scan can
-        # terminate a manual scan too — same registration pattern as
-        # scheduled_scan_cron below. /scan and the cron share one slot: a
-        # manual scan started while a scheduled scan runs overwrites the
-        # registration (the two monitor.py processes serialise themselves via
-        # .monitor.lock, so the loser exits 75 on its own). Cleanup only
-        # clears the slot while this proc still owns it.
-        global _current_scan_proc
-        _current_scan_proc = proc
-        try:
-            _out, err = await communicate_with_idle_timeout(proc, timeout=1800)
-        except asyncio.TimeoutError:
-            try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=10)
-            except (ProcessLookupError, asyncio.TimeoutError):
-                proc.kill()
-                await proc.wait()
-            await update.message.reply_text("⏱ 扫描空闲超时（30 分钟无输出）已终止。")
-            return
-        finally:
-            # Unregister once the subprocess is done (or was terminated) so a
-            # finished handle never lingers in the /stop slot. Only clear the
-            # slot while this proc still owns it — a concurrent cron
-            # registration wins.
-            if _current_scan_proc is proc:
-                _current_scan_proc = None
-        stderr = err.decode("utf-8") if isinstance(err, bytes) else err
-        if proc.returncode == 75:
-            progress = _read_scan_status()
-            msg = progress if progress else "⏳ 当前有定时扫描正在运行。"
-            await update.message.reply_text(msg, parse_mode="Markdown")
-            return
-        if proc.returncode != 0:
-            reason = _classify_failure(proc.returncode, stderr)
-            await update.message.reply_text(f"❌ Scan failed: {reason}")
-            return
-        # Log output is on stderr; stdout is empty in incremental mode (no JSON output)
-        # Try to extract meaningful info from stderr
-        summary = _summarise_log(stderr)
-        await update.message.reply_text(
-            f"✅ Scan complete.\n{summary}",
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        log.exception("Scan command error: %s", e)  # noqa: TRY401
-        await update.message.reply_text(f"❌ Error: {e}")
-
-
-async def cmd_interval(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Set scan interval in minutes."""
-    if not await _check_auth(update):
-        return
-    args = update.message.text.strip().split(maxsplit=1)
-    if len(args) < 2:
-        await update.message.reply_text(
-            "Usage: `/interval <minutes>`  e.g. `/interval 30`", parse_mode="Markdown"
-        )
-        return
-    try:
-        minutes = int(args[1])
-        if minutes < 1 or minutes > 1440:
-            await update.message.reply_text("Interval must be between 1 and 1440 minutes.")
-            return
-        global _scan_interval
-        seconds = minutes * 60
-        _scan_interval = seconds
-        _save_interval(seconds)
-        await update.message.reply_text(f"✅ Scan interval set to {minutes} minutes.")
-    except ValueError:
-        await update.message.reply_text("Invalid number. Usage: `/interval <minutes>`", parse_mode="Markdown")
-
-
-async def cmd_stop(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Stop current scheduled scan and/or reconciliation scan so you can /backfill."""
-    if not await _check_auth(update):
-        return
-
-    procs_to_stop: list[tuple[asyncio.subprocess.Process, str]] = []
-    if _current_scan_proc is not None and _current_scan_proc.returncode is None:
-        procs_to_stop.append((_current_scan_proc, "定时增量扫描"))
-    if _current_recon_proc is not None and _current_recon_proc.returncode is None:
-        procs_to_stop.append((_current_recon_proc, "每日对账扫描"))
-
-    if not procs_to_stop:
-        await update.message.reply_text("当前没有正在运行的定时扫描。")
-        return
-
-    for proc, label in procs_to_stop:
-        pid = proc.pid
-        try:
-            proc.terminate()  # SIGTERM — monitor.py will save state and exit cleanly
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=30)
-                await update.message.reply_text(
-                    f"🛑 已终止{label}（PID: {pid}）。\n"
-                    f"锁已释放，你现在可以用 `/backfill` 了。"
-                )
-            except asyncio.TimeoutError:
-                log.warning("%s PID %s did not exit in 30s, sending SIGKILL", label, pid)
-                proc.kill()
-                try:
-                    await proc.wait()
-                except ProcessLookupError:
-                    pass
-                await update.message.reply_text(
-                    f"🛑 {label} PID {pid} 不响应 SIGTERM，已 SIGKILL。\n"
-                    f"你现在可以用 `/backfill` 了。"
-                )
-        except ProcessLookupError:
-            await update.message.reply_text(f"{label}进程已不在了，锁应该已释放。")
-        except Exception as e:
-            log.exception("Stop scan error: %s", e)  # noqa: TRY401
-            await update.message.reply_text(f"❌ 终止失败: {e}")
-
-
-@rate_limit(min_interval=10.0)
-async def cmd_backfill(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _check_auth(update):
-        return
-    await _show_backfill_list(update.message, update.effective_user.id, page=0)
-
-
-async def _show_backfill_list(message, telegram_user_id: int, page: int = 0) -> None:
-    """Display paginated user list with backfill buttons."""
-    cfg = read_config()
-    users = list(reversed(get_users(cfg, telegram_user_id)))
-    if not users:
-        await message.reply_text("📭 监控列表是空的，先 `/add` 加几个吧", parse_mode="Markdown")
-        return
-
-    markup, total_text, _page = paginated_user_keyboard(
-        users, page,
-        item_prefix="bf",
-        item_label_fmt="⏳ @{u}",
-        page_prefix="bf_pg",
-        close_data="bf_cl",
-    )
-    await message.reply_text(
-        f"{total_text}\n点击用户开始全量回填：",
-        reply_markup=markup,
-    )
-
-
-@rate_limit(min_interval=3.0)
-async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle backfill button presses."""
-    if not await _check_auth(update):
-        return
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    uid = query.from_user.id
-
-    try:
-        # Close
-        if data == "bf_cl":
-            await query.edit_message_text("🔒 已关闭", reply_markup=None)
-            return
-
-        # Pagination
-        if data.startswith("bf_pg:"):
-            page = int(data.split(":", 1)[1])
-            cfg = read_config()
-            users = list(reversed(get_users(cfg, uid)))
-            await _render_backfill_page(query, users, page)
-            return
-
-        # Start backfill
-        if data.startswith("bf:"):
-            # Same short-hash resolution as the remove panel (see bot_ui).
-            username = resolve_callback_username(data.split(":", 1)[1])
-            await query.edit_message_text(f"⏳ 正在全量回填 @{username}...\n这可能需要一段时间，完成后会通知你", reply_markup=None)
-
-            try:
-                result = await _run_backfill(username, uid)
-
-                if result is None:
-                    # Idle timeout: no stdout/stderr for 1800s (30 min). Not a hard 2h wall clock.
-                    await query.message.reply_text(
-                        "⏱ 回填超时：连续 30 分钟无输出（idle 1800s），已终止子进程"
-                    )
-                    return
-                if result == "busy":
-                    # Extremely unlikely: scan still running after kill+retry
-                    await query.message.reply_text(
-                        "❌ 无法获取回填锁，请稍后重试或输入 /stop 检查扫描状态",
-                        parse_mode="Markdown",
-                    )
-                    return
-                if result.returncode != 0:
-                    stderr = result.stderr or ""
-                    reason = _classify_failure(result.returncode, stderr)
-                    log.warning("Backfill failed for username=%s returncode=%s stderr=%r", username, result.returncode, stderr[-4000:])
-                    await query.message.reply_text(f"❌ 回填 @{username} 失败：{reason}")
-                    return
-
-                summary = _summarise_log(result.stderr)
-                await query.message.reply_text(
-                    f"✅ 回填 @{username} 完成\n{summary}",
-                    parse_mode="Markdown",
-                )
-            except Exception as e:
-                log.exception("Backfill error: %s", e)  # noqa: TRY401
-                await query.message.reply_text(f"❌ 回填出错: {e}")
-    except Exception as e:
-        log.exception("Backfill callback outer error: %s", e)  # noqa: TRY401
-
-
-async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProcess | None | str:
-    """Run backfill serially within this bot process.
-
-    Two layers of protection:
-      1. ``_backfill_serial_lock`` (asyncio.Lock): serialises concurrent backfill
-         tasks within the same bot — multiple Telegram button presses queue up
-         instead of racing for the .monitor.lock.
-      2. ``_acquire_backfill_lock`` (fcntl.flock): cross-process lock so that a
-         restarted bot can detect a backfill already in progress and not resume
-         it. The lock is held for the full backfill lifetime.
-
-    The heartbeat is an ``asyncio`` timer scheduled via ``loop.call_later``,
-    bound to the lifetime of this coroutine. Each tick carries a generation
-    number: the ``finally`` block bumps the generation BEFORE cancelling, so a
-    tick racing the shutdown can neither refresh nor re-arm the heartbeat (a
-    leaked heartbeat would keep ``active_backfills.json`` fresh forever and
-    permanently suppress scheduled scans until restart). The ``finally`` block
-    also unregisters the backfill regardless of how we exit (success, timeout,
-    exception).
-
-    Usernames are re-validated against USERNAME_RE at entry (see below).
-
-    Returns CompletedProcess, None (timeout/invalid username), or 'busy'
-    (cross-process lock held).
-    """
-    # Re-validate at the trust boundary: usernames can arrive via Telegram
-    # callback_data or restart-resume paths, and must never reach subprocess
-    # argv or the .backfill_lock_*.lck file name unchecked.
-    if not USERNAME_RE.fullmatch(username or ""):
-        log.error("Backfill rejected: invalid username %r", username)
-        return None
-
-    tg_id_str = str(tg_uid)
-
-    # Layer 1: cross-process lock. If another bot process holds it, bail out
-    # immediately (the original bot is still running the backfill).
-    cross_lock = _acquire_backfill_lock(tg_id_str, username)
-    if cross_lock is None:
-        log.info("Backfill for @%s skipped: cross-process lock held", username)
-        return "busy"
-    cross_fd, cross_path = cross_lock
-
-    # Layer 2: in-process serialisation. Multiple Telegram button presses for
-    # the SAME user will collapse into one backfill; presses for DIFFERENT users
-    # will queue behind this one.
-    async with _get_backfill_serial_lock():
-        # Register and start heartbeat BEFORE launching subprocess so the file
-        # is populated the moment a concurrent scan tick arrives.
-        _register_backfill(tg_id_str, username)
-        loop = asyncio.get_running_loop()
-        heartbeat_handle: asyncio.TimerHandle | None = None
-        # Generation guard: each tick is armed with the generation that was
-        # current when it was scheduled. The finally block bumps the
-        # generation BEFORE cancelling, so a tick that already fired (or fires
-        # after the coroutine exited) sees a stale generation and refuses to
-        # refresh the registry or reschedule itself. Without this guard a tick
-        # racing the finally block re-arms the heartbeat forever, keeping
-        # active_backfills.json fresh so _sweep_stale_backfills can never
-        # clean it up — scheduled scans/reconciliation would be skipped until
-        # the next bot restart.
-        heartbeat_generation = 0
-
-        def _heartbeat_tick(generation: int) -> None:
-            """Refresh active_backfills.json. Reschedules itself while current."""
-            nonlocal heartbeat_handle
-            if generation != heartbeat_generation:
-                log.debug(
-                    "Backfill heartbeat for @%s: generation %d superseded (%d is current) — stopping",
-                    username, generation, heartbeat_generation,
-                )
-                return
-            try:
-                _register_backfill(tg_id_str, username)
-            except Exception as e:
-                log.exception("Backfill heartbeat for @%s failed: %s", username, e)  # noqa: TRY401
-            heartbeat_handle = loop.call_later(10.0, _heartbeat_tick, generation)
-
-        heartbeat_handle = loop.call_later(10.0, _heartbeat_tick, heartbeat_generation)
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, str(SCRIPT_DIR / "backfill-memory-wrapper.py"),
-                sys.executable, str(MONITOR_SCRIPT), "--mode", "full", "--user", username,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(SCRIPT_DIR),
-                start_new_session=True,
-            )
-            try:
-                out, err = await communicate_with_idle_timeout(proc, timeout=1800)
-            except asyncio.TimeoutError:
-                log.warning("Backfill for @%s idle timeout (30 min without output), killing", username)
-                try:
-                    # Check if process already exited before killpg
-                    if proc.returncode is not None:
-                        log.info("Backfill for @%s already exited (rc=%s), skipping killpg", username, proc.returncode)
-                    else:
-                        os.killpg(proc.pid, signal.SIGTERM)
-                        await asyncio.wait_for(proc.wait(), timeout=30)
-                except (ProcessLookupError, ChildProcessError, asyncio.TimeoutError):
-                    try:
-                        if proc.returncode is not None:
-                            log.info("Backfill for @%s exited during SIGTERM wait", username)
-                        else:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                            await proc.wait()
-                    except (ProcessLookupError, ChildProcessError):
-                        log.info("Backfill for @%s process group already gone", username)
-                return None
-
-            out_str = out.decode("utf-8") if isinstance(out, bytes) else out
-            err_str = err.decode("utf-8") if isinstance(err, bytes) else err
-            returncode = proc.returncode if proc.returncode is not None else -1
-            return subprocess.CompletedProcess(
-                args=[], returncode=returncode, stdout=out_str, stderr=err_str
-            )
-        finally:
-            # Heartbeat is always invalidated; active_backfills is always
-            # cleared. This is the only path that touches the registry for a
-            # backfill, so a hung task can no longer leak state. Bump the
-            # generation BEFORE cancel(): cancel() alone cannot stop a tick
-            # that already fired and re-armed itself.
-            heartbeat_generation += 1
-            if heartbeat_handle is not None:
-                heartbeat_handle.cancel()
-            _unregister_backfill(tg_id_str, username)
-            _release_backfill_lock(cross_fd, cross_path)
-
-
-def _resume_stale_backfills(application: Application) -> None:
-    """Check active_backfills.json for tasks interrupted by previous shutdown and auto-resume them."""
-    active = _load_active_backfills()
-    if not active:
-        return
-
-    loop = asyncio.get_running_loop()
-
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc)
-    STALE_THRESHOLD_MINUTES = 30  # consider zombie if no heartbeat for 30 minutes
-
-    log.info("Found %d stale backfill tasks to resume: %s", len(active), active)
-
-    async def _do_resume(tg_id: str, username: str, last_active_str: str | None) -> None:
-        log.info("Auto-resuming backfill for @%s (user %s, last_active=%s)",
-                 username, tg_id, last_active_str)
-
-        # Check timestamp as secondary zombie detection
-        is_zombie_by_time = False
-        if last_active_str:
-            try:
-                last_active = datetime.fromisoformat(last_active_str)
-                # Ensure timezone-aware
-                if last_active.tzinfo is None:
-                    last_active = last_active.replace(tzinfo=timezone.utc)
-                age_minutes = (now - last_active).total_seconds() / 60
-                if age_minutes > STALE_THRESHOLD_MINUTES:
-                    is_zombie_by_time = True
-                    log.info("Task @%s is stale by time (%.1f min old) — will resume", username, age_minutes)
-            except (KeyError, ValueError, json.JSONDecodeError) as e:
-                log.warning("Could not parse last_active %s for @%s: %s", last_active_str, username, e)
-
-        # Try to acquire the cross-process lock briefly to detect a running
-        # backfill. We use timeout=0 (pure probe) — if the lock is held we know
-        # another process is still working on it. The lock file is closed
-        # immediately after the probe so we never accidentally hold it.
-        probe = _acquire_backfill_lock(tg_id, username)
-        if probe is not None:
-            fd, path = probe
-            _release_backfill_lock(fd, path)
-        lock_free = probe is not None
-        if not lock_free and not is_zombie_by_time:
-            log.info("Skipping @%s — cross-process lock held and not stale by time (still running)", username)
-            return
-
-        # Schedule as a background task (tracked for clean shutdown)
-        _track_task(loop.create_task(_resume_backfill_task(application, tg_id, username)))
-
-    for tg_id, users_dict in active.items():
-        for username, last_active_str in users_dict.items():
-            try:
-                _track_task(loop.create_task(_do_resume(tg_id, username, last_active_str)))
-            except Exception as e:
-                log.exception("Error resuming backfill @%s: %s", username, e)  # noqa: TRY401
-
-
-async def _resume_backfill_task(application: Application, tg_id: str, username: str) -> None:
-    """Run a resumed backfill and notify the user on completion."""
-    try:
-        result = await _run_backfill(username, int(tg_id))
-        if result is None:
-            log.warning("Resumed backfill @%s timed out", username)
-            return
-        if result == "busy":
-            log.warning("Resumed backfill @%s — monitor busy, will retry next bot start", username)
-            return
-        if result.returncode != 0:
-            reason = _classify_failure(result.returncode, result.stderr or "")
-            log.warning("Resumed backfill @%s failed (exit %d)", username, result.returncode)
-            # Notify user if chat_id is known
-            try:
-                chat_id = int(tg_id)
-                await application.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"❌ 重启后自动续接的回填 @{username} 失败：{reason}",
-                )
-            except Exception as e:
-                log.exception("Could not notify user %s: %s", tg_id, e)  # noqa: TRY401
-            return
-
-        log.info("Resumed backfill @%s completed successfully", username)
-        # Notify user if chat_id is known
-        try:
-            chat_id = int(tg_id)
-            await application.bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ 后台任务完成：@{username} 的全量回填已在重启后自动续接并完成",
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            log.exception("Could not notify user %s: %s", tg_id, e)  # noqa: TRY401
-    except Exception as e:
-        log.exception("Resumed backfill @%s error: %s", username, e)  # noqa: TRY401
-
-
-async def _render_backfill_page(query, users: list[str], page: int) -> None:
-    """Update the message with a fresh page of backfill buttons."""
-    markup, total_text, _page = paginated_user_keyboard(
-        users, page,
-        item_prefix="bf",
-        item_label_fmt="⏳ @{u}",
-        page_prefix="bf_pg",
-        close_data="bf_cl",
-    )
-    await query.edit_message_text(
-        f"{total_text}\n点击用户开始全量回填：",
-        reply_markup=markup,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _human_size(bytes_: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if bytes_ < 1024:
-            return f"{int(bytes_)}{unit}" if unit == "B" else f"{bytes_:.1f}{unit}"
-        bytes_ /= 1024
-    return f"{bytes_:.1f}TB"
+def _save_reconciliation_last_success(date_str: str, cfg: MonitorConfig | None = None) -> None:
+    _state.save_reconciliation_last_success(_bot(), date_str, cfg)
 
 
 def _is_scan_running() -> bool:
-    """Check if monitor scan is currently running via lock file."""
-    try:
-        lock_path = SCRIPT_DIR / ".monitor.lock"
-        if not lock_path.exists():
-            return False
-        fd = os.open(str(lock_path), os.O_RDONLY)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            os.close(fd)
-            return False
-        except (BlockingIOError, OSError):
-            os.close(fd)
-            return True
-    except (BlockingIOError, OSError):
-        return False
+    return _state.is_scan_running(_bot())
 
 
 def _kill_running_scan() -> list[int]:
-    """Terminate the current scheduled scan or reconciliation subprocess. Returns list of killed PIDs.
-
-    Uses the tracked ``_current_scan_proc`` / ``_current_recon_proc`` instead of pgrep,
-    because pgrep on "python3.*monitor.py" would also match an in-flight backfill subprocess
-    and kill the wrong thing. (Backfills start with ``start_new_session=True``,
-    so pgrep can't distinguish them by session either.)
-    """
-    killed = []
-    for proc in (_current_scan_proc, _current_recon_proc):
-        if proc is None or proc.returncode is not None:
-            continue
-        pid = proc.pid
-        try:
-            proc.terminate()
-            killed.append(pid)
-        except ProcessLookupError:
-            pass
-        except OSError as e:
-            log.warning("Failed to terminate scan PID %s: %s", pid, e)
-    return killed
+    return _state.kill_running_scan(_bot())
 
 
 def _read_scan_status() -> str:
-    """Check if monitor scan is running. Returns status text or empty string."""
-    if not _is_scan_running():
-        return ""
-    try:
-        import json
-        path = SCRIPT_DIR / "monitor_status.json"
-        elapsed = 0
-        if path.exists():
-            data = json.loads(path.read_text())
-            elapsed = data.get("elapsed_seconds", 0)
-        lines = ["⏳ 定时扫描运行中"]
-        if elapsed >= 60:
-            lines.append(f"已运行 {elapsed//60} 分钟")
-        else:
-            lines.append(f"已运行 {elapsed} 秒")
-        lines.append("")
-        lines.append("输入 /stop 终止扫描后即可 /backfill")
-        return "\n".join(lines)
-    except Exception:
-        log.exception("Error generating status message (non-critical)")
-        return ""
-
-
-def _classify_failure(returncode: int, stderr: str) -> str:
-    """Classify a monitor.py failure into a user-facing reason string.
-
-    Only the tail of stderr ([-2000:]) is inspected: fatal error lines are
-    always printed last, while non-fatal download warnings in the middle of
-    the log can contain timeout/503-like substrings and must not pollute the
-    classification. Returncode 75 (scan lock held) wins over any text.
-    """
-    tail = (stderr or "")[-2000:]
-    if returncode == 75:
-        return "另一个扫描进程正在运行，请稍后再试"
-    if "Service Unavailable" in tail or "503 Server Error" in tail:
-        return "Civitai API 暂时不可用（503），稍后可重试"
-    if "Rate Limited" in tail:
-        return "触发 Civitai 限流，请稍后再试"
-    if "Timeout" in tail or "timeout" in tail or "timed out" in tail:
-        return "网络请求超时，稍后可重试"
-    return "未知错误，详见服务日志"
-
-
-def _summarise_log(stderr: str) -> str:
-    """Extract the most interesting lines from the monitor.py stderr output."""
-    lines = stderr.strip().split("\n")
-    # Collect relevant lines
-    relevant = []
-    for line in lines:
-        lower = line.lower()
-        if any(kw in lower for kw in ("new images", "no new", "cleaned", "pushed", "new artwork", "new:", "complete", "total new", "fetched", "saved", "another monitor")):
-            # Strip timestamp prefix for readability
-            if " [" in line:
-                line = line.split("] ", 1)[-1] if "] " in line else line
-            relevant.append(line)
-
-    if not relevant:
-        return "No new images found."
-
-    # Deduplicate and limit
-    seen = set()
-    unique = []
-    for line in relevant:
-        if line not in seen:
-            seen.add(line)
-            unique.append(line)
-
-    safe_lines = [line.replace(chr(96), chr(92)+chr(96)) for line in unique[-15:]]
-    return chr(96)*3 + chr(10) + chr(10).join(safe_lines) + chr(10) + chr(96)*3
-
-
-# ---------------------------------------------------------------------------
-# Startup — set bot commands
-# ---------------------------------------------------------------------------
-
-
-async def scheduled_scan_cron() -> None:
-    """Run monitor.py on a configurable interval as a background task.
-
-    Lifecycle:
-      * Loops until PTB's Application.stop() tears the task down. The
-        ``_shutdown_requested`` flag is a tests-only early-exit hook;
-        in production it is never set.
-      * Each iteration:
-          1. Stale-watchdog: if ``active_backfills.json`` contains tasks that
-             have not been refreshed in STALE_BACKFILL_MINUTES, treat them as
-             zombie (e.g. the previous bot died while holding them) and
-             unregister them. This is the only safety net for a bot that was
-             killed -9 mid-backfill without a chance to clean up.
-          2. If any active backfill remains, sleep the interval and retry.
-          3. Spawn monitor.py (incremental) and wait. The .monitor.lock inside
-             monitor.py is what serialises against any concurrent backfill —
-             if a backfill is in progress, monitor.py exits with code 75 and we
-             back off for the interval.
-          4. Re-read ``interval.json`` so ``/interval`` takes effect without
-             a bot restart.
-      * On shutdown: SIGTERM the current monitor.py, wait up to 30s, then
-        SIGKILL. We do NOT call ``os._exit`` — that would bypass PTB's own
-        shutdown sequence and any in-flight backfill tasks.
-    """
-    global _current_scan_proc
-    cfg = read_config()
-    STALE_BACKFILL_MINUTES = cfg.backfill.stale_backfill_minutes
-    proc: asyncio.subprocess.Process | None = None
-    try:
-        while not _shutdown_requested:
-            # 1. Stale watchdog — clean up zombie backfill registrations
-            _sweep_stale_backfills(STALE_BACKFILL_MINUTES)
-
-            # 2. Re-read interval at the top of every loop so /interval works
-            current_interval = _load_interval()
-
-            # 3. Skip if a non-stale backfill is still running
-            active_backfills = _load_active_backfills()
-            if active_backfills:
-                log.info("Scheduled scan skipped: active backfill(s) %s", list(active_backfills.keys()))
-                await asyncio.sleep(current_interval)
-                continue
-            try:
-                log.info("Scheduled scan starting...")
-                proc = await asyncio.create_subprocess_exec(
-                    sys.executable, str(MONITOR_SCRIPT),
-                    cwd=str(SCRIPT_DIR),
-                )
-                # Publish the proc so cmd_stop can terminate it precisely,
-                # without a pgrep that would also match a running backfill.
-                _current_scan_proc = proc
-                rc = await proc.wait() if proc is not None else None
-                _current_scan_proc = None
-                if _shutdown_requested:
-                    break
-                returncode = int(rc) if rc is not None else -1
-                if returncode == 0:
-                    log.info("Scheduled scan completed")
-                    _scan_stats["success"] += 1
-                    await _report_cron_outcome("scan", failing=False)
-                elif returncode == 75:
-                    # monitor.py exits 75 when .monitor.lock is held (i.e. a
-                    # backfill claimed the slot). Treat as "skipped", not a
-                    # failure — back off for the rest of the interval.
-                    log.info("Scheduled scan skipped: monitor lock held (backfill in progress)")
-                    _scan_stats["skipped"] += 1
-                else:
-                    log.warning("Scheduled scan failed (exit %d)", returncode)
-                    _scan_stats["failure"] += 1
-                    detail = f"monitor.py 非零退出（exit {returncode}），本轮扫描可能未完成；将按当前间隔自动重试"
-                    reason = _last_scan_error_line()
-                    if reason:
-                        detail += f"\n原因: {reason}"
-                    await _report_cron_outcome(
-                        "scan",
-                        failing=True,
-                        detail=detail,
-                    )
-            except Exception as e:
-                log.exception("Scheduled scan error: %s", e)  # noqa: TRY401
-                _scan_stats["failure"] += 1
-                await _report_cron_outcome(
-                    "scan",
-                    failing=True,
-                    detail=f"扫描调度异常：{type(e).__name__}: {e}",
-                )
-            if _shutdown_requested:
-                break
-            await asyncio.sleep(current_interval)
-    finally:
-        # Graceful shutdown: give the subprocess up to 30s to save and exit.
-        #
-        # At this point the event loop is being torn down: PTB's
-        # Application.run_polling() installs its own SIGTERM handler and
-        # closes the loop on shutdown, which destroys the scan task
-        # mid-flight while it is inside `await proc.wait()`. asyncio's
-        # `asyncio.timeout()` then raises "no running event loop" — and
-        # the only reason this finally-block runs at all is because
-        # Python's GC re-enters the coroutine during interpreter
-        # shutdown. We catch RuntimeError and fall back to a no-wait
-        # exit: the subprocess already got SIGTERM (via proc.terminate()
-        # or via the process-group signal from systemd), so the OS will
-        # reap it when the parent exits.
-        if proc is not None and proc.returncode is None:
-            log.info("Shutdown: stopping current scan...")
-            try:
-                proc.terminate()  # SIGTERM -> monitor.py saves current page
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=30)
-                log.info("Shutdown: scan exited cleanly (exit %d)", proc.returncode)
-            except RuntimeError:
-                # Event loop is closed — the OS will reap the subprocess on
-                # parent exit. Don't try to wait_for() in a no-loop context.
-                log.info("Shutdown: event loop already closed, leaving scan to OS reaper")
-            except asyncio.TimeoutError:
-                log.warning("Shutdown: scan did not exit in 30s, sending SIGKILL")
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                try:
-                    await proc.wait()
-                except RuntimeError:
-                    pass
-        log.info("Scheduled scan stopped. Returning to event loop for clean shutdown.")
+    return _state.read_scan_status(_bot())
 
 
 def _sweep_stale_backfills(max_age_minutes: int) -> int:
-    """Remove backfill registrations whose heartbeat is older than max_age_minutes.
-
-    Returns the number of entries removed. Used by the scan cron to clean up
-    after a bot that was killed mid-backfill (e.g. OOM kill, machine reboot).
-    Without this, the scan cron would permanently skip forever after such an
-    incident — see the post-mortem on the 8-hour deadlock in the README.
-    """
-    data = _load_active_backfills()
-    if not data:
-        return 0
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc)
-    removed = 0
-    for tg_id, users_dict in list(data.items()):
-        for username, last_active_str in list(users_dict.items()):
-            try:
-                last_active = datetime.fromisoformat(last_active_str)
-                if last_active.tzinfo is None:
-                    last_active = last_active.replace(tzinfo=timezone.utc)
-                age_minutes = (now - last_active).total_seconds() / 60
-                if age_minutes > max_age_minutes:
-                    log.warning(
-                        "Stale backfill detected: @%s (tg=%s) age=%.0f min — unregistering",
-                        username, tg_id, age_minutes,
-                    )
-                    _unregister_backfill(tg_id, username)
-                    removed += 1
-            except Exception as e:
-                log.exception("Could not parse last_active %r for @%s: %s", last_active_str, username, e)  # noqa: TRY401
-    return removed
-
-
-# ---------------------------------------------------------------------------
-# Weekly Telegram report — a digest sent to the admins every Sunday 21:00 UTC.
-#
-# The alert crons only cover hard failures (scan exits non-zero). This report
-# surfaces the *silent* failure modes: an upstream 200-but-empty page, a
-# subscription that quietly stopped updating — everything "green" while the
-# owner hasn't received a single push in weeks and nobody notices. It gives a
-# weekly at-a-glance view of scan health and per-subscription activity.
-#
-# State policy: the scan counters and the "already sent today" marker live in
-# memory, same trade-off as the cron alerts — losing them on restart costs at
-# most one duplicate report, which is acceptable.
-# ---------------------------------------------------------------------------
-
-# datetime.weekday() value for Sunday.
-_WEEKLY_REPORT_WEEKDAY = 6
-_WEEKLY_REPORT_HOUR_UTC = 21
-_WEEKLY_REPORT_MINUTE_UTC = 0
-# The report counts pushes over the last 7 days...
-_WEEKLY_REPORT_WINDOW_DAYS = 7
-# ...and flags subscriptions whose last push is older than this (or missing).
-_WEEKLY_REPORT_STALE_DAYS = 14
-
-# Scan-outcome counters for the report. Incremented by scheduled_scan_cron
-# (success / failure / skipped-75 branches); zeroed after the report is sent.
-_scan_stats: dict[str, int] = {"success": 0, "failure": 0, "skipped": 0}
-
-# ISO date (YYYY-MM-DD, UTC) of the last weekly report actually sent.
-_weekly_report_last_sent_date: str | None = None
+    return _state.sweep_stale_backfills(_bot(), max_age_minutes)
 
 
 def _reset_scan_stats() -> None:
@@ -2264,404 +300,129 @@ def _reset_scan_stats() -> None:
     _scan_stats = {"success": 0, "failure": 0, "skipped": 0}
 
 
-def _weekly_report_due(now: datetime, last_sent_date: str | None) -> bool:
-    """True when the weekly report should fire at ``now`` (aware UTC datetime).
-
-    Fires on Sundays at/after 21:00 UTC, at most once per calendar day: the
-    marker is written right after a successful send, so within one Sunday
-    evening the report is emitted exactly once (a restart may re-send once).
-    """
-    if now.weekday() != _WEEKLY_REPORT_WEEKDAY:
-        return False
-    if (now.hour, now.minute) < (_WEEKLY_REPORT_HOUR_UTC, _WEEKLY_REPORT_MINUTE_UTC):
-        return False
-    return last_sent_date != now.strftime("%Y-%m-%d")
-
-
 def _collect_weekly_creator_stats(cfg: MonitorConfig | None = None) -> list[dict]:
-    """Per-subscription push activity over the report window.
-
-    Reads the durable push history that monitor.py records on every
-    successful push (state_store.record_push_history). Returns one dict per
-    configured subscription: username, tg_id, pushes_7d, last_push_ts.
-    """
-    if cfg is None:
-        cfg = read_config()
-    data_dir = Path(cfg.data.data_dir) if cfg.data.data_dir else SCRIPT_DIR
-    pushed_dir = data_dir / "seen_ids"
-    cutoff = time.time() - _WEEKLY_REPORT_WINDOW_DAYS * 86400
-    stats: list[dict] = []
-    subs = cfg.subscriptions or {}
-    for tg_id, raw_users in subs.items():
-        for u in raw_users or []:
-            username = u.get("name", str(u)) if isinstance(u, dict) else str(u)
-            history = load_push_history(pushed_dir, tg_id, username)
-            stats.append(
-                {
-                    "username": username,
-                    "tg_id": tg_id,
-                    "pushes_7d": sum(1 for ts in history.values() if ts >= cutoff),
-                    "last_push_ts": max(history.values(), default=None),
-                }
-            )
-    stats.sort(key=lambda s: s["username"].lower())
-    return stats
-
-
-def _format_last_push_date(last_push_ts: float | None) -> str:
-    if last_push_ts is None:
-        return "无记录"
-    return datetime.fromtimestamp(last_push_ts, tz=timezone.utc).strftime("%Y-%m-%d")
-
-
-def _build_weekly_report(
-    scan_stats: dict[str, int],
-    creator_stats: list[dict],
-    recon_last_success: str | None,
-    *,
-    now: datetime | None = None,
-) -> str:
-    """Assemble the weekly report message (pure function; unit-tested).
-
-    ``creator_stats`` entries: {"username", "pushes_7d", "last_push_ts"}.
-    Subscriptions with no push in the last 14 days (or none on record) get
-    the ⚠️ marker — that is exactly the silent-stall signal a human must
-    confirm (possible upstream stop or mirror failure).
-    """
-    if now is None:
-        now = datetime.now(timezone.utc)
-    week_start = now - timedelta(days=_WEEKLY_REPORT_WINDOW_DAYS)
-    lines = [
-        "📅 每周监控日报",
-        f"统计区间: {week_start.strftime('%Y-%m-%d')} ~ {now.strftime('%Y-%m-%d')} (UTC)",
-        "",
-        "🗂 扫描健康（过去 7 天）",
-        f"✅ 成功: {scan_stats.get('success', 0)} 次",
-        f"❌ 失败: {scan_stats.get('failure', 0)} 次",
-        f"⏭️ 跳过: {scan_stats.get('skipped', 0)} 次",
-        "",
-        "👥 订阅活跃度（近 7 天推送数 / 最近推送）",
-    ]
-    if not creator_stats:
-        lines.append("• （当前无订阅）")
-    for s in creator_stats:
-        last_ts = s.get("last_push_ts")
-        stale = last_ts is None or (
-            now.timestamp() - last_ts > _WEEKLY_REPORT_STALE_DAYS * 86400
-        )
-        flag = " ⚠️ 超过 14 天未推送（可能上游停更或镜像失效，请人工确认）" if stale else ""
-        lines.append(
-            f"• @{s['username']}: 近 7 天 {s.get('pushes_7d', 0)} 条，"
-            f"最近推送 {_format_last_push_date(last_ts)}{flag}"
-        )
-    lines.append("")
-    lines.append("🔄 深度对账")
-    if recon_last_success:
-        lines.append(f"最近成功: {recon_last_success}")
-    else:
-        lines.append("最近成功: 无记录 ⚠️")
-    return "\n".join(lines)
+    return _cron.collect_weekly_creator_stats(_bot(), cfg)
 
 
 async def _send_weekly_report() -> bool:
-    """Build + send the weekly report. Returns True when a send was recorded.
-
-    Telegram-side failures never propagate: per-chat failures are logged,
-    and only a fully undelivered report returns False so the cron retries
-    on the next tick instead of losing the week's report silently.
-    """
-    bot = _alert_bot
-    if bot is None or not _ADMIN_CHAT_IDS:
-        log.debug("Weekly report skipped (no bot/admin chats configured)")
-        return False
-    cfg = read_config()
-    creator_stats = _collect_weekly_creator_stats(cfg)
-    recon_date = _load_reconciliation_last_success(cfg)
-    text = _build_weekly_report(dict(_scan_stats), creator_stats, recon_date)
-    delivered = 0
-    for cid in _ADMIN_CHAT_IDS:
-        try:
-            await bot.send_message(chat_id=cid, text=text)
-            delivered += 1
-        except Exception:
-            log.warning("Failed to deliver weekly report to admin %s", cid, exc_info=True)
-    if delivered == 0:
-        log.warning("Weekly report could not be delivered to any admin; will retry")
-        return False
-    return True
+    return await _cron.send_weekly_report(_bot())
 
 
 async def scheduled_weekly_report_cron() -> None:
-    """Send the weekly activity report every Sunday at/after 21:00 UTC.
+    await _cron.scheduled_weekly_report_cron(_bot())
 
-    Mirrors the reconciliation cron's scheduling shape: a 30s polling loop
-    that checks a time condition plus a "sent today" marker. Send failures
-    never propagate — the loop just retries on the next tick.
-    """
-    global _weekly_report_last_sent_date
-    try:
-        while not _shutdown_requested:
-            now = datetime.now(timezone.utc)
-            if _weekly_report_due(now, _weekly_report_last_sent_date):
-                try:
-                    sent = await _send_weekly_report()
-                except Exception:
-                    # A broken report must never take down the cron loop.
-                    log.exception("Weekly report send failed; will retry next tick")
-                else:
-                    if sent:
-                        _weekly_report_last_sent_date = now.strftime("%Y-%m-%d")
-                        _reset_scan_stats()
-                        log.info("Weekly report sent; scan counters reset")
-            if _shutdown_requested:
-                break
-            await asyncio.sleep(30)
-    finally:
-        log.info("Weekly report cron stopped.")
+
+async def scheduled_scan_cron() -> None:
+    await _cron.scheduled_scan_cron(_bot())
 
 
 async def scheduled_reconciliation_cron() -> None:
-    """Run daily deep reconciliation as a background task.
+    await _cron.scheduled_reconciliation_cron(_bot())
 
-    Triggers once per day at or after configured time (default 03:30 local)
-    when today's run has not succeeded yet.
-    Runs monitor.py in --mode reconcile.
-    """
-    global _current_recon_proc
-    proc: asyncio.subprocess.Process | None = None
-    retry_date: str | None = None
-    daily_retry_count: int = 0
-    MAX_DAILY_RETRIES = 10
 
-    try:
-        while not _shutdown_requested:
-            cfg = read_config()
-            recon_cfg = getattr(cfg, "reconciliation", None)
-            if recon_cfg is None or not recon_cfg.enabled:
-                await asyncio.sleep(60)
-                continue
+async def _check_auth(update: Update) -> bool:
+    return await _commands.check_auth(_bot(), update)
 
-            time_str = recon_cfg.time or "03:30"
-            try:
-                target_hour, target_minute = [int(x) for x in time_str.split(":", 1)]
-            except ValueError:
-                target_hour, target_minute = 3, 30
-            # "25:00"/"03:60" parse as ints but would blow up datetime.replace
-            # *outside* the try above and kill the whole cron coroutine.
-            if not (0 <= target_hour <= 23 and 0 <= target_minute <= 59):
-                log.warning(
-                    "Invalid reconciliation time %r (need HH:MM, 00-23:00-59); falling back to 03:30",
-                    time_str,
-                )
-                target_hour, target_minute = 3, 30
 
-            now = datetime.now(timezone.utc)
-            today_str = now.strftime("%Y-%m-%d")
-            target_dt = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
-            last_success = _load_reconciliation_last_success(cfg)
+@rate_limit(min_interval=3.0)
+async def cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _commands.cmd_help(_bot(), update, _ctx)
 
-            if now >= target_dt and last_success != today_str:
-                if retry_date != today_str:
-                    retry_date = today_str
-                    daily_retry_count = 0
 
-                if daily_retry_count >= MAX_DAILY_RETRIES:
-                    log.warning(
-                        "Daily reconciliation exceeded max retries (%d) today (%s), skipping until tomorrow",
-                        daily_retry_count, today_str,
-                    )
-                    await asyncio.sleep(60)
-                    continue
+@rate_limit(min_interval=3.0)
+async def cmd_add(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _commands.cmd_add(_bot(), update, _ctx)
 
-                active_backfills = _load_active_backfills()
-                if active_backfills:
-                    log.info("Daily reconciliation skipped: active backfill(s) %s", list(active_backfills.keys()))
-                    await asyncio.sleep(60)
-                    continue
 
-                try:
-                    log.info("Daily deep reconciliation starting (%02d:%02d target)...", target_hour, target_minute)
-                    proc = await asyncio.create_subprocess_exec(
-                        sys.executable, str(MONITOR_SCRIPT),
-                        "--mode", "reconcile",
-                        cwd=str(SCRIPT_DIR),
-                    )
-                    _current_recon_proc = proc
-                    rc = await proc.wait() if proc is not None else None
-                    _current_recon_proc = None
-                    if _shutdown_requested:
-                        break
-                    returncode = int(rc) if rc is not None else -1
-                    if returncode == 0:
-                        log.info("Daily deep reconciliation completed successfully")
-                        _save_reconciliation_last_success(today_str, cfg)
-                        daily_retry_count = 0
-                        await _report_cron_outcome("reconciliation", failing=False)
-                    elif returncode == 75:
-                        log.info("Daily reconciliation skipped: monitor lock held (will retry in 60s)")
-                        await asyncio.sleep(60)
-                        continue
-                    else:
-                        log.warning("Daily reconciliation finished with code %d (will retry)", returncode)
-                        daily_retry_count += 1
-                        await _report_cron_outcome(
-                            "reconciliation",
-                            failing=True,
-                            detail=(
-                                f"reconcile 非零退出（exit {returncode}），"
-                                f"今日第 {daily_retry_count}/{MAX_DAILY_RETRIES} 次重试"
-                            ),
-                        )
-                        await asyncio.sleep(60)
-                        continue
-                except Exception as e:
-                    log.exception("Daily reconciliation error: %s", e)  # noqa: TRY401
-                    _current_recon_proc = None
-                    daily_retry_count += 1
-                    await _report_cron_outcome(
-                        "reconciliation",
-                        failing=True,
-                        detail=f"对账调度异常：{type(e).__name__}: {e}（今日第 {daily_retry_count} 次重试）",
-                    )
-                    await asyncio.sleep(60)
-                    continue
+@rate_limit(min_interval=3.0)
+async def cmd_remove(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _commands.cmd_remove(_bot(), update, _ctx)
 
-            if _shutdown_requested:
-                break
-            await asyncio.sleep(30)
-    finally:
-        if proc is not None and proc.returncode is None:
-            log.info("Shutdown: stopping current reconciliation scan...")
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=30)
-            except (RuntimeError, asyncio.TimeoutError):
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-        _current_recon_proc = None
-        log.info("Daily reconciliation cron stopped.")
+
+async def _show_remove_list(message, telegram_user_id: int, page: int = 0) -> None:
+    await _commands.show_remove_list(_bot(), message, telegram_user_id, page)
+
+
+@rate_limit(min_interval=3.0)
+async def cmd_remove_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _commands.cmd_remove_callback(_bot(), update, _ctx)
+
+
+async def _render_remove_page(query, users: list[str], page: int) -> None:
+    await _commands.render_remove_page(_bot(), query, users, page)
+
+
+@rate_limit(min_interval=3.0)
+async def cmd_list(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _commands.cmd_list(_bot(), update, _ctx)
+
+
+@rate_limit(min_interval=3.0)
+async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _commands.cmd_status(_bot(), update, _ctx)
+
+
+async def cmd_mode(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _commands.cmd_mode(_bot(), update, _ctx)
+
+
+async def cmd_nsfw(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _commands.cmd_nsfw(_bot(), update, _ctx)
+
+
+async def cmd_cleanup(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _commands.cmd_cleanup(_bot(), update, _ctx)
+
+
+@rate_limit(min_interval=10.0)
+async def cmd_scan(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _commands.cmd_scan(_bot(), update, _ctx)
+
+
+async def cmd_interval(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _commands.cmd_interval(_bot(), update, _ctx)
+
+
+async def cmd_stop(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _commands.cmd_stop(_bot(), update, _ctx)
+
+
+@rate_limit(min_interval=10.0)
+async def cmd_backfill(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _commands.cmd_backfill(_bot(), update, _ctx)
+
+
+async def _show_backfill_list(message, telegram_user_id: int, page: int = 0) -> None:
+    await _commands.show_backfill_list(_bot(), message, telegram_user_id, page)
+
+
+@rate_limit(min_interval=3.0)
+async def cmd_backfill_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _commands.cmd_backfill_callback(_bot(), update, _ctx)
+
+
+async def _run_backfill(username: str, tg_uid: int) -> subprocess.CompletedProcess | None | str:
+    return await _commands.run_backfill(_bot(), username, tg_uid)
+
+
+def _resume_stale_backfills(application: Application) -> None:
+    _commands.resume_stale_backfills(_bot(), application)
+
+
+async def _resume_backfill_task(application: Application, tg_id: str, username: str) -> None:
+    await _commands.resume_backfill_task(_bot(), application, tg_id, username)
+
+
+async def _render_backfill_page(query, users: list[str], page: int) -> None:
+    await _commands.render_backfill_page(_bot(), query, users, page)
 
 
 async def post_init(application: Application) -> None:
-    global _alert_bot
-    _alert_bot = application.bot
-    commands = [
-        BotCommand("add", "增加监控对象（支持用户名/链接/@）"),
-        BotCommand("remove", "取消监控对象（按钮选择）"),
-        BotCommand("list", "查看当前监控列表"),
-        BotCommand("status", "查看运行状态"),
-        BotCommand("mode", "切换运行模式 incremental|full"),
-        BotCommand("nsfw", "切换NSFW过滤 sfw_only|nsfw_only|both"),
-        BotCommand("cleanup", "清理N天前的缓存图片"),
-        BotCommand("scan", "立即执行一次增量扫描"),
-        BotCommand("interval", "设置扫描间隔（分钟）"),
-        BotCommand("stop", "终止当前定时扫描，释放锁以便回填"),
-        BotCommand("backfill", "全量回填某个用户的作品"),
-        BotCommand("help", "显示所有命令说明"),
-    ]
-    await application.bot.set_my_commands(commands)
-    # Auto-resume any backfills that were interrupted by a previous shutdown
-    _resume_stale_backfills(application)
-    # Start periodic scan as background task (PTBUserWarning is harmless).
-    # Attach a done-callback so any unhandled exception inside the cron loop
-    # is logged loudly instead of being swallowed by the event loop.
-    def _on_cron_done(task: asyncio.Task) -> None:
-        if task.cancelled():
-            log.info("Scheduled scan task cancelled (clean shutdown)")
-            return
-        exc = task.exception()
-        if exc is not None:
-            log.error("Scheduled scan task crashed: %s", exc, exc_info=exc)
-
-    scan_task = _track_task(asyncio.create_task(scheduled_scan_cron()))
-    scan_task.add_done_callback(_on_cron_done)
-    recon_task = _track_task(asyncio.create_task(scheduled_reconciliation_cron()))
-    recon_task.add_done_callback(_on_cron_done)
-    weekly_task = _track_task(asyncio.create_task(scheduled_weekly_report_cron()))
-    weekly_task.add_done_callback(_on_cron_done)
-    log.info(f"Slash commands registered. Scheduled scan every {_scan_interval//60}min. Ready.")
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+    await _commands.post_init(_bot(), application)
 
 
 def main() -> None:
-    global AUTHORIZED_USER_IDS
-
-    cfg = read_config()
-    global _scan_interval
-    _scan_interval = _load_interval()
-    token = cfg.telegram.bot_token or os.environ.get("CIVITAI_BOT_TOKEN", "")
-    if not token or token == "UNSET":
-        log.error("telegram.bot_token not found in config.yaml")
-        sys.exit(1)
-
-    # Resolve authorised users from config
-    raw_ids = cfg.authorized_users or []
-    if not raw_ids:
-        # Fallback to telegram.chat_id for backward compatibility
-        fallback = cfg.telegram.chat_id
-        if fallback:
-            try:
-                AUTHORIZED_USER_IDS = {int(fallback)}
-            except ValueError:
-                pass
-    else:
-        for uid in raw_ids:
-            try:
-                AUTHORIZED_USER_IDS.add(int(uid))
-            except (ValueError, TypeError):
-                pass
-
-    if not AUTHORIZED_USER_IDS:
-        log.error("No authorized users configured (set authorized_users or telegram.chat_id)")
-        sys.exit(1)
-
-    log.info("Authorised %d user(s) configured", len(AUTHORIZED_USER_IDS))
-
-    # Admins to notify on unhandled errors (resolved from config above).
-    global _ADMIN_CHAT_IDS
-    _ADMIN_CHAT_IDS = sorted(AUTHORIZED_USER_IDS)
-
-    api_base = cfg.telegram.api_base_url or "https://api.telegram.org"
-    log.info("Telegram API base: %s", api_base.rstrip("/"))
-    app = (
-        _application_builder_for_config(token, api_base)
-        .post_init(post_init)
-        .post_shutdown(_shutdown_background_tasks)
-        .build()
-    )
-
-    # Global error handler so exceptions in update handlers are logged loudly
-    # instead of being silently swallowed ("No error handlers are registered").
-    app.add_error_handler(_error_handler)
-
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("add", cmd_add))
-    app.add_handler(CommandHandler("remove", cmd_remove))
-    app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("mode", cmd_mode))
-    app.add_handler(CommandHandler("nsfw", cmd_nsfw))
-    app.add_handler(CommandHandler("cleanup", cmd_cleanup))
-    app.add_handler(CommandHandler("scan", cmd_scan))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("backfill", cmd_backfill))
-    app.add_handler(CommandHandler("interval", cmd_interval))
-
-    # Button callbacks
-    app.add_handler(CallbackQueryHandler(cmd_remove_callback, pattern="^rem"))
-    app.add_handler(CallbackQueryHandler(cmd_backfill_callback, pattern="^bf"))
-
-    log.info("Civitai Admin Bot starting...")
-    app.run_polling(allowed_updates=["message", "callback_query"])
+    _commands.run_bot_main(_bot())
 
 
 if __name__ == "__main__":
