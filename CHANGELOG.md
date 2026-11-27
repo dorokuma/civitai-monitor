@@ -2,6 +2,17 @@
 
 This file follows the [Keep a Changelog](https://keepachangelog.com/) format, and version numbers follow [SemVer](https://semver.org/).
 
+## [1.8.1] - 2026-11-27
+
+### Changed
+- **Modular package split**: extracted domain logic from monolithic `civitai-bot.py` and `monitor.py` into focused modules under `civitai_monitor/` while preserving CLI entrypoints and backward-compatible facade attributes; documented the new layout in `README.md` and `README.zh-CN.md`.
+
+### Security
+- **Strict B2 CDN hostname check**: replaced substring matching in `civitai_monitor/media_download.py` with `urllib.parse.urlparse(b2_url).hostname == "image-b2.civitai.com"` to eliminate incomplete URL substring sanitization.
+
+### Fixed
+- **Entrypoint & facade regression coverage**: added `tests/test_cli_smoke.py` verifying out-of-repo-CWD CLI execution and AST parity between `civitai_monitor/` attributes and the top-level entrypoints.
+
 ## [1.8.0] - 2026-11-22
 
 ### Changed
